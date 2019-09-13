@@ -121,6 +121,12 @@ int TestStringPrintf(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     return REDISMODULE_OK;
 }
 
+/* TEST.REPLY.WITH.SS.OK -- Test Reply with RM_ReplyWithSimpleString. */
+int TestReplyWithSimpleString(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+    return RedisModule_ReplyWithSimpleString(ctx,"OK");
+}
+
 int failTest(RedisModuleCtx *ctx, const char *msg) {
     RedisModule_ReplyWithError(ctx, msg);
     return REDISMODULE_ERR;
@@ -444,6 +450,10 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx,"test.it",
         TestIt,"readonly",1,1,1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"test.reply.with.ss.ok",
+        TestReplyWithSimpleString,"readonly",1,1,1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
     RedisModule_SubscribeToKeyspaceEvents(ctx,
