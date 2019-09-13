@@ -325,7 +325,6 @@ int ThreadMain_WrongArity(void *arg) {
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
     // Crash due to access on (char*)ctx->client->argv[0]->ptr)
     RedisModule_WrongArity(ctx);
-    // RedisModule_ReplyWithSimpleString((char*)ctx->client->argv[0]->ptr);
     RedisModule_FreeThreadSafeContext(ctx);
     RedisModule_UnblockClient(bc,NULL);
     return NULL;
