@@ -325,6 +325,7 @@ int ThreadMain_WrongArity(void *arg) {
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
     // Crash due to access on (char*)ctx->client->argv[0]->ptr)
     RedisModule_WrongArity(ctx);
+    // RedisModule_ReplyWithSimpleString((char*)ctx->client->argv[0]->ptr);
     RedisModule_FreeThreadSafeContext(ctx);
     RedisModule_UnblockClient(bc,NULL);
     return NULL;
@@ -332,8 +333,6 @@ int ThreadMain_WrongArity(void *arg) {
 
 /* TEST.REPLY.WITH.ERR.WRONGARITY -- Test reply with wrong arity ERR. */
 int TestReplyWithErrWrongArity(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    REDISMODULE_NOT_USED(argv);
-    REDISMODULE_NOT_USED(argc);
     pthread_t tid;
 
     /* Note that when blocking the client we do not set any callback: no
