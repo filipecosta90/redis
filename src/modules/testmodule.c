@@ -317,13 +317,13 @@ end:
     return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
 
-/* Reply callback for blocking command HELLO.BLOCK */
+/* Worker thread for blocking command TEST.REPLY.WITH.ERR.WRONGARITY
+ * which accumulates a reply for when the client will be unblocked
+ * */
 int ThreadMain_WrongArity(void *arg) {
     RedisModuleBlockedClient *bc = arg;
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
-    // Any other replies work
-    //RedisModule_ReplyWithSimpleString(ctx,"OK");
-    // Crash
+    // Crash due to access on (char*)ctx->client->argv[0]->ptr)
     RedisModule_WrongArity(ctx);
     RedisModule_FreeThreadSafeContext(ctx);
     RedisModule_UnblockClient(bc,NULL);
