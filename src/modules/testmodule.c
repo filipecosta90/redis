@@ -317,6 +317,42 @@ end:
     return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
 
+/* Reply callback for blocking command HELLO.BLOCK */
+int ThreadMain_WrongArity(void *arg) {
+    RedisModuleBlockedClient *bc = arg;
+    RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
+    // Any other replies work
+    //RedisModule_ReplyWithSimpleString(ctx,"OK");
+    // Crash
+    RedisModule_WrongArity(ctx);
+    RedisModule_FreeThreadSafeContext(ctx);
+    RedisModule_UnblockClient(bc,NULL);
+    return NULL;
+}
+
+/* TEST.REPLY.WITH.ERR.WRONGARITY -- Test reply with wrong arity ERR. */
+int TestReplyWithErrWrongArity(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+    pthread_t tid;
+
+    /* Note that when blocking the client we do not set any callback: no
+     * timeout is possible since we passed '0', nor we need a reply callback
+     * because we'll use the thread safe context to accumulate a reply. */
+    RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx,NULL,NULL,NULL,0);
+
+    /* Now that we setup a blocking client, we need to pass the control
+     * to the thread. However we need to pass arguments to the thread:
+     * the reference to the blocked client handle. */
+    if (pthread_create(&tid,NULL,ThreadMain_WrongArity,bc) != 0) {
+        RedisModule_AbortBlock(bc);
+        return RedisModule_ReplyWithError(ctx,"-ERR Can't start thread");
+    }
+
+    return REDISMODULE_OK;
+
+}
+
 /* ----------------------------- Test framework ----------------------------- */
 
 /* Return 1 if the reply matches the specified string, otherwise log errors
@@ -325,7 +361,7 @@ int TestAssertStringReply(RedisModuleCtx *ctx, RedisModuleCallReply *reply, char
     RedisModuleString *mystr, *expected;
 
     if (RedisModule_CallReplyType(reply) != REDISMODULE_REPLY_STRING) {
-        RedisModule_Log(ctx,"warning","Unexpected reply type %d",
+        RedisModule_Log(ctx,"warning","Unexpected reply type %l",
             RedisModule_CallReplyType(reply));
         return 0;
     }
@@ -436,6 +472,10 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx,"test.ctxflags",
         TestCtxFlags,"readonly",1,1,1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+    
+    if (RedisModule_CreateCommand(ctx,"test.reply.with.err.wrongarity",
+        TestReplyWithErrWrongArity,"readonly",1,1,1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"test.unlink",
