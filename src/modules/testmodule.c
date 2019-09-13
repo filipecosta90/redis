@@ -321,9 +321,6 @@ end:
 int ThreadMain_WrongArity(void *arg) {
     RedisModuleBlockedClient *bc = arg;
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
-    // Any other replies work
-    //RedisModule_ReplyWithSimpleString(ctx,"OK");
-    // Crash
     RedisModule_WrongArity(ctx);
     RedisModule_FreeThreadSafeContext(ctx);
     RedisModule_UnblockClient(bc,NULL);
