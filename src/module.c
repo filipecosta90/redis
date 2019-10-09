@@ -168,10 +168,10 @@ typedef struct RedisModuleCtx RedisModuleCtx;
 struct RedisModuleKey {
     RedisModuleCtx *ctx;
     redisDb *db;
-    robj *key;      /* Key name object. */
-    robj *value;    /* Value object, or NULL if the key was not found. */
-    void *iter;     /* Iterator. */
-    int mode;       /* Opening mode. */
+    robj *key;              /* Key name object. */
+    robj *value;            /* Value object, or NULL if the key was not found. */
+    void *iter;             /* Iterator. */
+    int mode;               /* Opening mode. */
 
     /* Zset iterator. */
     uint32_t ztype;         /* REDISMODULE_ZSET_RANGE_* */
@@ -1622,6 +1622,42 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
     return (retval == C_OK) ? REDISMODULE_OK : REDISMODULE_ERR;
 }
 
+/* Creates an handle that will be used to store the representation of a Redis key 
+ * This is usefull when for one RedisModule command you need to handle several keys 
+ * reducing the amount of allocated handles to 1 when used with RM_OpenKeyWithHandle  */
+void RM_CreateKeyHandler(RedisModuleCtx *ctx, RedisModuleKey **kp, int mode){
+    /* Setup the key handle if required. */
+    if ((*kp) == NULL || !(mode & REDISMODULE_REUSE_KEYHANDLER)){
+        (*kp) = zmalloc(sizeof(**kp));
+        (*kp)->ctx = ctx;
+        (*kp)->value = NULL;
+    }
+}
+
+void *RM_OpenKeyWithHandle(RedisModuleCtx *ctx, RedisModuleKey **kp, robj *keyname, int mode) {
+    robj *value;
+
+    if (mode & REDISMODULE_WRITE) {
+        value = lookupKeyWrite(ctx->client->db,keyname);
+    } else {
+        value = lookupKeyRead(ctx->client->db,keyname);
+        if (value == NULL) {
+            return NULL;
+        }
+    }
+
+    RM_CreateKeyHandler(ctx, kp,mode);
+    (*kp)->ctx = ctx;
+    (*kp)->db = ctx->client->db;
+    (*kp)->key = keyname;
+    incrRefCount(keyname);
+    (*kp)->value = value;
+    (*kp)->iter = NULL;
+    (*kp)->mode = mode;
+    zsetKeyReset(*kp);
+    return (*kp);
+}
+
 /* Return an handle representing a Redis key, so that it is possible
  * to call other APIs with the key handle as argument to perform
  * operations on the key.
@@ -1636,31 +1672,12 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
  * key does not exist, NULL is returned. However it is still safe to
  * call RedisModule_CloseKey() and RedisModule_KeyType() on a NULL
  * value. */
+
+
+
 void *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
-    RedisModuleKey *kp;
-    robj *value;
-
-    if (mode & REDISMODULE_WRITE) {
-        value = lookupKeyWrite(ctx->client->db,keyname);
-    } else {
-        value = lookupKeyRead(ctx->client->db,keyname);
-        if (value == NULL) {
-            return NULL;
-        }
-    }
-
-    /* Setup the key handle. */
-    kp = zmalloc(sizeof(*kp));
-    kp->ctx = ctx;
-    kp->db = ctx->client->db;
-    kp->key = keyname;
-    incrRefCount(keyname);
-    kp->value = value;
-    kp->iter = NULL;
-    kp->mode = mode;
-    zsetKeyReset(kp);
-    autoMemoryAdd(ctx,REDISMODULE_AM_KEY,kp);
-    return (void*)kp;
+    RedisModuleKey *kp = NULL; 
+    return RM_OpenKeyWithHandle(ctx,&kp,keyname,mode);
 }
 
 /* Close a key handle. */
@@ -1670,8 +1687,10 @@ void RM_CloseKey(RedisModuleKey *key) {
     /* TODO: if (key->iter) RM_KeyIteratorStop(kp); */
     RM_ZsetRangeStop(key);
     decrRefCount(key->key);
-    autoMemoryFreed(key->ctx,REDISMODULE_AM_KEY,key);
-    zfree(key);
+    if (!(key->mode & REDISMODULE_REUSE_KEYHANDLER)) {
+        autoMemoryFreed(key->ctx,REDISMODULE_AM_KEY,key);
+        zfree(key);
+    }
 }
 
 /* Return the type of the key. If the key pointer is NULL then
