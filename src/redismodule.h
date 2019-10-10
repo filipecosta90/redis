@@ -345,7 +345,7 @@ int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldCString)(RedisModuleInfoCtx *ct
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldDouble)(RedisModuleInfoCtx *ctx, char *field, double value);
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldLongLong)(RedisModuleInfoCtx *ctx, char *field, long long value);
 int REDISMODULE_API_FUNC(RedisModule_InfoAddFieldULongLong)(RedisModuleInfoCtx *ctx, char *field, unsigned long long value);
-void *REDISMODULE_API_FUNC(RedisModule_OpenKeyWithHandle)(RedisModuleCtx *ctx, RedisModuleKey *kp, RedisModuleString *keyname, int mode);
+void *REDISMODULE_API_FUNC(RedisModule_OpenKeyWithHandle)(RedisModuleCtx *ctx, RedisModuleKey **kp, RedisModuleString *keyname, int mode);
 
 /* Experimental APIs */
 #ifdef REDISMODULE_EXPERIMENTAL_API
