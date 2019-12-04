@@ -242,6 +242,8 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CLIENT_TRACKING (1<<31) /* Client enabled keys tracking in order to
                                    perform client side caching. */
 #define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<32) /* Target client is invalid. */
+#define CLIENT_MONITOR_ERRORS (1ULL<<33) /* This client is a slave monitor
+                                   with Error Tracking, see MONITOR */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -833,7 +835,7 @@ struct sharedObjectsStruct {
     *integers[OBJ_SHARED_INTEGERS],
     *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
     *bulkhdr[OBJ_SHARED_BULKHDR_LEN];  /* "$<value>\r\n" */
-    sds minstring, maxstring;
+    sds minstring, maxstring, allsimplerror;
 };
 
 /* ZSETs use a specialized version of Skiplists */
@@ -999,6 +1001,7 @@ struct redisServer {
     dict *commands;             /* Command table */
     dict *orig_commands;        /* Command table before command renaming. */
     aeEventLoop *el;
+    dict *errors;               /* Errors table */
     _Atomic unsigned int lruclock; /* Clock for LRU eviction */
     int shutdown_asap;          /* SHUTDOWN needed ASAP */
     int activerehashing;        /* Incremental rehash in serverCron() */
@@ -1406,6 +1409,11 @@ struct redisCommand {
                    bit set in the bitmap of allowed commands. */
 };
 
+struct redisError {
+    char *name;
+    long long calls;
+};
+
 struct redisFunctionSym {
     char *name;
     unsigned long pointer;
@@ -1716,6 +1724,7 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t buflen);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
+void replicationFeedErrorMonitors(client *c, list *monitors, int dictid, const char* cmdname, const char* error);
 void updateSlavesWaitingBgsave(int bgsaveerr, int type);
 void replicationCron(void);
 void replicationHandleMasterDisconnection(void);
@@ -1906,8 +1915,12 @@ void usage(void);
 void updateDictResizePolicy(void);
 int htNeedsResize(dict *dict);
 void populateCommandTable(void);
+void populateErrorTable(void);
 void resetCommandTableStats(void);
+void resetErrorTableStats(void);
 void adjustOpenFilesLimit(void);
+struct redisError *lookupError(sds name);
+struct redisError *lookupErrorByCString(char *s);
 void closeListeningSockets(int unlink_unix_socket);
 void updateCachedTime(int update_daylight_info);
 void resetServerStats(void);

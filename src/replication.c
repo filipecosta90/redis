@@ -340,6 +340,36 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     decrRefCount(cmdobj);
 }
 
+void replicationFeedErrorMonitors(client *c, list *monitors, int dictid, const char* cmdname, const char* error) {
+    listNode *ln;
+    listIter li;
+    sds cmdrepr = sdsnew("+");
+    robj *cmdobj;
+    struct timeval tv;
+
+    gettimeofday(&tv,NULL);
+    cmdrepr = sdscatprintf(cmdrepr,"%ld.%06ld ",(long)tv.tv_sec,(long)tv.tv_usec);
+    if (c->flags & CLIENT_LUA) {
+        cmdrepr = sdscatprintf(cmdrepr,"[%d lua] ",dictid);
+    } else if (c->flags & CLIENT_UNIX_SOCKET) {
+        cmdrepr = sdscatprintf(cmdrepr,"[%d unix:%s] ",dictid,server.unixsocket);
+    } else {
+        cmdrepr = sdscatprintf(cmdrepr,"[%d %s] ",dictid,getClientPeerId(c));
+    }
+    cmdrepr = sdscatprintf(cmdrepr,"[(error) ERR %s] after processing the command %s", error,cmdname);
+    cmdrepr = sdscatlen(cmdrepr,"\r\n",2);
+    cmdobj = createObject(OBJ_STRING,cmdrepr);
+
+    listRewind(monitors,&li);
+    while((ln = listNext(&li))) {
+        client *monitor = ln->value;
+        if (monitor->flags & CLIENT_MONITOR_ERRORS){
+            addReply(monitor,cmdobj);
+        }
+    }
+    decrRefCount(cmdobj);
+}
+
 /* Feed the slave 'c' with the replication backlog starting from the
  * specified 'offset' up to the end of the backlog. */
 long long addReplyReplicationBacklog(client *c, long long offset) {

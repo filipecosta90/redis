@@ -356,6 +356,9 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
     addReplyProto(c,s,len);
     addReplyProto(c,"\r\n",2);
 
+    struct redisError *err = lookupError(shared.allsimplerror);
+    err->calls++;
+
     /* Sometimes it could be normal that a slave replies to a master with
      * an error and this function gets called. Actually the error will never
      * be sent because addReply*() against master clients has no effect...
@@ -373,6 +376,15 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
         serverLog(LL_WARNING,"== CRITICAL == This %s is sending an error "
                              "to its %s: '%s' after processing the command "
                              "'%s'", from, to, s, cmdname);
+    }
+
+    /* Sent the Command and Error to clients in MONITOR mode, only if the commands are
+    * not generated from reading an AOF. */
+    if (listLength(server.monitors) &&
+        !server.loading)
+    {
+        const char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
+        replicationFeedErrorMonitors(c,server.monitors,c->db->id,cmdname,s);
     }
 }
 
