@@ -4533,11 +4533,14 @@ void monitorCommand(client *c) {
     c->flags |= (CLIENT_SLAVE|CLIENT_MONITOR);
 
     /* option to monitor commands that resulted in ERR */
-    if(c->argc >= 2 && !strcasecmp(errors,"errors")){
-        c->flags |= CLIENT_MONITOR_ERRORS;
-    }else{
-        addReplyErrorFormat(c,"only ERRORS allowed as optional argument for '%s' command. Ignoring extra argument.",
-                      c->cmd->name);
+    if(c->argc >= 2){
+        if(!strcasecmp(errors,"errors") ){
+            c->flags |= CLIENT_MONITOR_ERRORS;
+        }
+        else{
+            addReplyErrorFormat(c,"only ERRORS allowed as optional argument for '%s' command. Ignoring extra argument.",
+                                c->cmd->name);
+        }
     }
     listAddNodeTail(server.monitors,c);
     addReply(c,shared.ok);
