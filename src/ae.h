@@ -34,6 +34,7 @@
 #define __AE_H__
 
 #include <time.h>
+#include "async.h"
 
 #define AE_OK 0
 #define AE_ERR -1
@@ -130,5 +131,6 @@ void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 void aeSetDontWait(aeEventLoop *eventLoop, int noWait);
+static int redisAeAttach(aeEventLoop *loop, redisAsyncContext *ac);
 
 #endif

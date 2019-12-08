@@ -45,6 +45,7 @@
 #include <sds.h> /* Use hiredis sds. */
 #include "ae.h"
 #include "hiredis.h"
+#include "async.h"
 #include "adlist.h"
 #include "dict.h"
 #include "zmalloc.h"
@@ -90,6 +91,7 @@ static struct config {
     int csv;
     int loop;
     int idlemode;
+    int subscribermode;
     int dbnum;
     sds dbnumstr;
     char *tests;
@@ -117,6 +119,7 @@ static struct config {
 
 typedef struct _client {
     redisContext *context;
+    redisAsyncContext *asyncContext;
     sds obuf;
     char **randptr;         /* Pointers to :rand: strings inside the command buf */
     size_t randlen;         /* Number of pointers in client->randptr */
@@ -417,6 +420,17 @@ static void clientDone(client c) {
     }
 }
 
+void subCallback(redisAsyncContext *c, void *r, void *privdata) {
+    redisReply *reply= r;
+    if (r == NULL) return;
+
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        for (int j = 0; j < reply->elements; j++) {
+            printf("%u) %s\n", j, reply->element[j]->str);
+        }
+    }
+}
+
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     void *reply = NULL;
@@ -557,6 +571,20 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+
+void cmdCallback(redisAsyncContext *c, void *r, void *cmd) {
+    redisReply *reply = r;
+    if (reply == NULL) {
+        printf("Redis Async Command Error: Reply is null, [%s]\n", (char*)cmd);
+        return;
+    }
+    if (reply->type == REDIS_REPLY_ERROR) {
+        printf("Redis Async Command Error: %s, [%s]\n", reply->str, (char*)cmd);
+        return;
+    }
+    printf("%s -> %s\n", cmd, reply->str);
+}
+
 /* Create a benchmark client, configured to send the command passed as 'cmd' of
  * 'len' bytes.
  *
@@ -602,7 +630,11 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
             port = node->port;
             c->cluster_node = node;
         }
-        c->context = redisConnectNonBlock(ip,port);
+        if(!config.subscribermode){
+            c->context = redisConnectNonBlock(ip,port);
+        }else{
+            c->asyncContext = redisAsyncConnect(ip,port);
+        }
     } else {
         c->context = redisConnectUnixNonBlock(config.hostsocket);
     }
@@ -616,7 +648,8 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     }
     c->thread_id = thread_id;
     /* Suppress hiredis cleanup of unused buffers for max speed. */
-    c->context->reader->maxbuf = 0;
+    if(!config.subscribermode)
+        c->context->reader->maxbuf = 0;
 
     /* Build the request buffer:
      * Queue N requests accordingly to the pipeline size, or simply clone
@@ -734,13 +767,17 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
         benchmarkThread *thread = config.threads[thread_id];
         el = thread->el;
     }
-    if (config.idlemode == 0)
+    if (config.idlemode == 0 && config.subscribermode == 0)
         aeCreateFileEvent(el,c->context->fd,AE_WRITABLE,writeHandler,c);
+    if (config.subscribermode)
+        redisAeAttach(el, c->asyncContext);
+        redisAsyncFormattedCommand(c->asyncContext, cmdCallback, cmd, cmd,len );
     listAddNodeTail(config.clients,c);
     atomicIncr(config.liveclients, 1);
     atomicGet(config.slots_last_update, c->slots_last_update);
     return c;
 }
+
 
 static void createMissingClients(client c) {
     int n = 0;
@@ -863,6 +900,28 @@ static void startBenchmarkThreads() {
 }
 
 static void benchmark(char *title, char *cmd, int len) {
+    client c;
+
+    config.title = title;
+    config.requests_issued = 0;
+    config.requests_finished = 0;
+
+    if (config.num_threads) initBenchmarkThreads();
+
+    int thread_id = config.num_threads > 0 ? 0 : -1;
+    c = createClient(cmd,len,NULL,thread_id);
+    createMissingClients(c);
+    config.start = mstime();
+    if (!config.num_threads) aeMain(config.el);
+    else startBenchmarkThreads();
+    config.totlatency = mstime()-config.start;
+
+    showLatencyReport();
+    freeAllClients();
+    if (config.threads) freeBenchmarkThreads();
+}
+
+static void benchmarkSubscriber(char *title, char *cmd, int len) {
     client c;
 
     config.title = title;
@@ -1327,6 +1386,8 @@ int parseOptions(int argc, const char **argv) {
             config.loop = 1;
         } else if (!strcmp(argv[i],"-I")) {
             config.idlemode = 1;
+        } else if (!strcmp(argv[i],"-S")) {
+            config.subscribermode = 1;
         } else if (!strcmp(argv[i],"-e")) {
             config.showerrors = 1;
         } else if (!strcmp(argv[i],"-t")) {
@@ -1498,6 +1559,7 @@ int main(int argc, const char **argv) {
     config.csv = 0;
     config.loop = 0;
     config.idlemode = 0;
+    config.subscribermode = 0;
     config.latency = NULL;
     config.clients = listCreate();
     config.hostip = "127.0.0.1";
@@ -1596,6 +1658,13 @@ int main(int argc, const char **argv) {
         if (use_threads) startBenchmarkThreads();
         else aeMain(config.el);
         /* and will wait for every */
+    }
+
+    if (config.subscribermode) {
+        printf("Creating %d blocking connections connections and waiting for reply (Ctrl+C when done)\n", config.numclients);
+        len = redisFormatCommand(&cmd,"SUBSCRIBE mychannel");
+        benchmark("SUBSCRIBE",cmd,len);
+        free(cmd);
     }
 
     /* Run benchmark with command in the remainder of the arguments. */
@@ -1737,6 +1806,13 @@ int main(int argc, const char **argv) {
             }
             len = redisFormatCommandArgv(&cmd,21,argv,NULL);
             benchmark("MSET (10 keys)",cmd,len);
+            free(cmd);
+        }
+
+        if (test_is_selected("publish")) {
+            len = redisFormatCommand(&cmd,
+                                     "PUBLISH mychannel %s",data);
+            benchmark("PUBLISH",cmd,len);
             free(cmd);
         }
 
