@@ -2560,6 +2560,30 @@ int RM_HashGet(RedisModuleKey *key, int flags, ...) {
     return REDISMODULE_OK;
 }
 
+int RM_HashGetFromRedisModuleStrings(RedisModuleKey *key, RedisModuleString **fields, RedisModuleString ***valuesptr, int fieldc ) {
+    if (key->value && key->value->type != OBJ_HASH) return REDISMODULE_ERR;
+
+    for (int i = 0; i < fieldc; i++) {
+        RedisModuleString *field, **valueptr;
+        field = fields[i];
+        if (field == NULL) break;
+        valueptr = valuesptr[i];
+        if (key->value) {
+            *valueptr = hashTypeGetValueObject(key->value,field->ptr);
+            if (*valueptr) {
+                robj *decoded = getDecodedObject(*valueptr);
+                decrRefCount(*valueptr);
+                *valueptr = decoded;
+            }
+            if (*valueptr)
+                autoMemoryAdd(key->ctx,REDISMODULE_AM_STRING,*valueptr);
+        } else {
+            *valueptr = NULL;
+        }
+    }
+    return REDISMODULE_OK;
+}
+
 /* --------------------------------------------------------------------------
  * Redis <-> Modules generic Call() API
  * -------------------------------------------------------------------------- */
@@ -5545,6 +5569,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(ZsetRangeEndReached);
     REGISTER_API(HashSet);
     REGISTER_API(HashGet);
+    REGISTER_API(HashGetFromRedisModuleStrings);
     REGISTER_API(IsKeysPositionRequest);
     REGISTER_API(KeyAtPos);
     REGISTER_API(GetClientId);
