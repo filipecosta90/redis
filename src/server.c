@@ -629,7 +629,7 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"auth",authCommand,-2,
-     "no-script ok-loading ok-stale fast no-monitor no-slowlog @connection",
+     "no-auth no-script ok-loading ok-stale fast no-monitor no-slowlog @connection",
      0,NULL,0,0,0,0,0,0},
 
     /* We don't allow PING during loading since in Redis PING is used as
@@ -824,7 +824,7 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"hello",helloCommand,-2,
-     "no-script fast no-monitor no-slowlog @connection",
+     "no-auth no-script fast no-monitor no-slowlog @connection",
      0,NULL,0,0,0,0,0,0},
 
     /* EVAL can modify the dataset, however it is not flagged as a write
@@ -999,7 +999,7 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"acl",aclCommand,-2,
-     "admin no-script ok-loading ok-stale",
+     "admin no-script no-slowlog ok-loading ok-stale",
      0,NULL,0,0,0,0,0,0}
 };
 
@@ -1942,7 +1942,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* Show information about connected clients */
     if (!server.sentinel_mode) {
         run_with_period(5000) {
-            serverLog(LL_VERBOSE,
+            serverLog(LL_DEBUG,
                 "%lu clients connected (%lu replicas), %zu bytes in use",
                 listLength(server.clients)-listLength(server.slaves),
                 listLength(server.slaves),
@@ -2244,6 +2244,8 @@ void createSharedObjects(void) {
     shared.rpoplpush = createStringObject("RPOPLPUSH",9);
     shared.zpopmin = createStringObject("ZPOPMIN",7);
     shared.zpopmax = createStringObject("ZPOPMAX",7);
+    shared.multi = createStringObject("MULTI",5);
+    shared.exec = createStringObject("EXEC",4);
     for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
         shared.integers[j] =
             makeObjectShared(createObject(OBJ_STRING,(void*)(long)j));
@@ -2271,6 +2273,10 @@ void initServerConfig(void) {
     server.runid[CONFIG_RUN_ID_SIZE] = '\0';
     changeReplicationId();
     clearReplicationId2();
+    server.hz = CONFIG_DEFAULT_HZ; /* Initialize it ASAP, even if it may get
+                                      updated later after loading the config.
+                                      This value may be used before the server
+                                      is initialized. */
     server.timezone = getTimeZone(); /* Initialized by tzset(). */
     server.configfile = NULL;
     server.executable = NULL;
@@ -2368,6 +2374,7 @@ void initServerConfig(void) {
     server.pexpireCommand = lookupCommandByCString("pexpire");
     server.xclaimCommand = lookupCommandByCString("xclaim");
     server.xgroupCommand = lookupCommandByCString("xgroup");
+    server.rpoplpushCommand = lookupCommandByCString("rpoplpush");
 
     /* Debugging */
     server.assert_failed = "<no assertion failed>";
@@ -2921,6 +2928,8 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
             c->flags |= CMD_ASKING;
         } else if (!strcasecmp(flag,"fast")) {
             c->flags |= CMD_FAST | CMD_CATEGORY_FAST;
+        } else if (!strcasecmp(flag,"no-auth")) {
+            c->flags |= CMD_NO_AUTH;
         } else {
             /* Parse ACL categories here if the flag name starts with @. */
             uint64_t catflag;
@@ -3266,6 +3275,18 @@ void call(client *c, int flags) {
         redisOp *rop;
 
         if (flags & CMD_CALL_PROPAGATE) {
+            int multi_emitted = 0;
+            /* Wrap the commands in server.also_propagate array,
+             * but don't wrap it if we are already in MULIT context,
+             * in case the nested MULIT/EXEC.
+             *
+             * And if the array contains only one command, no need to
+             * wrap it, since the single command is atomic. */
+            if (server.also_propagate.numops > 1 && !(c->flags & CLIENT_MULTI)) {
+                execCommandPropagateMulti(c);
+                multi_emitted = 1;
+            }
+
             for (j = 0; j < server.also_propagate.numops; j++) {
                 rop = &server.also_propagate.ops[j];
                 int target = rop->target;
@@ -3274,6 +3295,10 @@ void call(client *c, int flags) {
                 if (!(flags&CMD_CALL_PROPAGATE_REPL)) target &= ~PROPAGATE_REPL;
                 if (target)
                     propagate(rop->cmd,rop->dbid,rop->argv,rop->argc,target);
+            }
+
+            if (multi_emitted) {
+                execCommandPropagateExec(c);
             }
         }
         redisOpArrayFree(&server.also_propagate);
@@ -3341,8 +3366,9 @@ int processCommand(client *c) {
                            DefaultUser->flags & USER_FLAG_DISABLED) &&
                         !c->authenticated;
     if (auth_required) {
-        /* AUTH and HELLO are valid even in non authenticated state. */
-        if (c->cmd->proc != authCommand && c->cmd->proc != helloCommand) {
+        /* AUTH and HELLO and no auth modules are valid even in
+         * non-authenticated state. */
+        if (!(c->cmd->flags & CMD_NO_AUTH)) {
             flagTransaction(c);
             addReply(c,shared.noautherr);
             return C_OK;
@@ -3551,6 +3577,8 @@ int prepareForShutdown(int flags) {
     int nosave = flags & SHUTDOWN_NOSAVE;
 
     serverLog(LL_WARNING,"User requested shutdown...");
+    if (server.supervised_mode == SUPERVISED_SYSTEMD)
+        redisCommunicateSystemd("STOPPING=1\n");
 
     /* Kill all the Lua debugger forked sessions. */
     ldbKillForkedSessions();
@@ -3592,6 +3620,8 @@ int prepareForShutdown(int flags) {
     /* Create a new RDB file before exiting. */
     if ((server.saveparamslen > 0 && !nosave) || save) {
         serverLog(LL_NOTICE,"Saving the final RDB snapshot before exiting.");
+        if (server.supervised_mode == SUPERVISED_SYSTEMD)
+            redisCommunicateSystemd("STATUS=Saving the final RDB snapshot\n");
         /* Snapshotting. Perform a SYNC SAVE and exit */
         rdbSaveInfo rsi, *rsiptr;
         rsiptr = rdbPopulateSaveInfo(&rsi);
@@ -3602,6 +3632,8 @@ int prepareForShutdown(int flags) {
              * saving aborted, handling special stuff like slaves pending for
              * synchronization... */
             serverLog(LL_WARNING,"Error trying to save the DB, can't exit.");
+            if (server.supervised_mode == SUPERVISED_SYSTEMD)
+                redisCommunicateSystemd("STATUS=Error trying to save the DB, can't exit.\n");
             return C_ERR;
         }
     }
@@ -4767,61 +4799,19 @@ int redisSupervisedUpstart(void) {
     return 1;
 }
 
-int redisSupervisedSystemd(void) {
+int redisCommunicateSystemd(const char *sd_notify_msg) {
     const char *notify_socket = getenv("NOTIFY_SOCKET");
-    int fd = 1;
-    struct sockaddr_un su;
-    struct iovec iov;
-    struct msghdr hdr;
-    int sendto_flags = 0;
-
     if (!notify_socket) {
         serverLog(LL_WARNING,
                 "systemd supervision requested, but NOTIFY_SOCKET not found");
-        return 0;
     }
 
-    if ((strchr("@/", notify_socket[0])) == NULL || strlen(notify_socket) < 2) {
-        return 0;
-    }
-
-    serverLog(LL_NOTICE, "supervised by systemd, will signal readiness");
-    if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
-        serverLog(LL_WARNING,
-                "Can't connect to systemd socket %s", notify_socket);
-        return 0;
-    }
-
-    memset(&su, 0, sizeof(su));
-    su.sun_family = AF_UNIX;
-    strncpy (su.sun_path, notify_socket, sizeof(su.sun_path) -1);
-    su.sun_path[sizeof(su.sun_path) - 1] = '\0';
-
-    if (notify_socket[0] == '@')
-        su.sun_path[0] = '\0';
-
-    memset(&iov, 0, sizeof(iov));
-    iov.iov_base = "READY=1";
-    iov.iov_len = strlen("READY=1");
-
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.msg_name = &su;
-    hdr.msg_namelen = offsetof(struct sockaddr_un, sun_path) +
-        strlen(notify_socket);
-    hdr.msg_iov = &iov;
-    hdr.msg_iovlen = 1;
-
-    unsetenv("NOTIFY_SOCKET");
-#ifdef HAVE_MSG_NOSIGNAL
-    sendto_flags |= MSG_NOSIGNAL;
-#endif
-    if (sendmsg(fd, &hdr, sendto_flags) < 0) {
-        serverLog(LL_WARNING, "Can't send notification to systemd");
-        close(fd);
-        return 0;
-    }
-    close(fd);
-    return 1;
+    #ifdef HAVE_LIBSYSTEMD
+    (void) sd_notify(0, sd_notify_msg);
+    #else
+    UNUSED(sd_notify_msg);
+    #endif
+    return 0;
 }
 
 int redisIsSupervised(int mode) {
@@ -4832,12 +4822,17 @@ int redisIsSupervised(int mode) {
         if (upstart_job) {
             redisSupervisedUpstart();
         } else if (notify_socket) {
-            redisSupervisedSystemd();
+            server.supervised_mode = SUPERVISED_SYSTEMD;
+            serverLog(LL_WARNING,
+                "WARNING auto-supervised by systemd - you MUST set appropriate values for TimeoutStartSec and TimeoutStopSec in your service unit.");
+            return redisCommunicateSystemd("STATUS=Redis is loading...\n");
         }
     } else if (mode == SUPERVISED_UPSTART) {
         return redisSupervisedUpstart();
     } else if (mode == SUPERVISED_SYSTEMD) {
-        return redisSupervisedSystemd();
+        serverLog(LL_WARNING,
+            "WARNING supervised by systemd - you MUST set appropriate values for TimeoutStartSec and TimeoutStopSec in your service unit.");
+        return redisCommunicateSystemd("STATUS=Redis is loading...\n");
     }
 
     return 0;
@@ -5030,6 +5025,14 @@ int main(int argc, char **argv) {
             serverLog(LL_NOTICE,"Ready to accept connections");
         if (server.sofd > 0)
             serverLog(LL_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
+        if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+            if (!server.masterhost) {
+                redisCommunicateSystemd("STATUS=Ready to accept connections\n");
+                redisCommunicateSystemd("READY=1\n");
+            } else {
+                redisCommunicateSystemd("STATUS=Waiting for MASTER <-> REPLICA sync\n");
+            }
+        }
     } else {
         InitServerLast();
         sentinelIsRunning();

@@ -50,6 +50,10 @@
 #include <lua.h>
 #include <signal.h>
 
+#ifdef HAVE_LIBSYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
+
 typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
 
@@ -166,33 +170,34 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CMD_SKIP_SLOWLOG (1ULL<<12)    /* "no-slowlog" flag */
 #define CMD_ASKING (1ULL<<13)          /* "cluster-asking" flag */
 #define CMD_FAST (1ULL<<14)            /* "fast" flag */
+#define CMD_NO_AUTH (1ULL<<15)         /* "no-auth" flag */
 
 /* Command flags used by the module system. */
-#define CMD_MODULE_GETKEYS (1ULL<<15)  /* Use the modules getkeys interface. */
-#define CMD_MODULE_NO_CLUSTER (1ULL<<16) /* Deny on Redis Cluster. */
+#define CMD_MODULE_GETKEYS (1ULL<<16)  /* Use the modules getkeys interface. */
+#define CMD_MODULE_NO_CLUSTER (1ULL<<17) /* Deny on Redis Cluster. */
 
 /* Command flags that describe ACLs categories. */
-#define CMD_CATEGORY_KEYSPACE (1ULL<<17)
-#define CMD_CATEGORY_READ (1ULL<<18)
-#define CMD_CATEGORY_WRITE (1ULL<<19)
-#define CMD_CATEGORY_SET (1ULL<<20)
-#define CMD_CATEGORY_SORTEDSET (1ULL<<21)
-#define CMD_CATEGORY_LIST (1ULL<<22)
-#define CMD_CATEGORY_HASH (1ULL<<23)
-#define CMD_CATEGORY_STRING (1ULL<<24)
-#define CMD_CATEGORY_BITMAP (1ULL<<25)
-#define CMD_CATEGORY_HYPERLOGLOG (1ULL<<26)
-#define CMD_CATEGORY_GEO (1ULL<<27)
-#define CMD_CATEGORY_STREAM (1ULL<<28)
-#define CMD_CATEGORY_PUBSUB (1ULL<<29)
-#define CMD_CATEGORY_ADMIN (1ULL<<30)
-#define CMD_CATEGORY_FAST (1ULL<<31)
-#define CMD_CATEGORY_SLOW (1ULL<<32)
-#define CMD_CATEGORY_BLOCKING (1ULL<<33)
-#define CMD_CATEGORY_DANGEROUS (1ULL<<34)
-#define CMD_CATEGORY_CONNECTION (1ULL<<35)
-#define CMD_CATEGORY_TRANSACTION (1ULL<<36)
-#define CMD_CATEGORY_SCRIPTING (1ULL<<37)
+#define CMD_CATEGORY_KEYSPACE (1ULL<<18)
+#define CMD_CATEGORY_READ (1ULL<<19)
+#define CMD_CATEGORY_WRITE (1ULL<<20)
+#define CMD_CATEGORY_SET (1ULL<<21)
+#define CMD_CATEGORY_SORTEDSET (1ULL<<22)
+#define CMD_CATEGORY_LIST (1ULL<<23)
+#define CMD_CATEGORY_HASH (1ULL<<24)
+#define CMD_CATEGORY_STRING (1ULL<<25)
+#define CMD_CATEGORY_BITMAP (1ULL<<26)
+#define CMD_CATEGORY_HYPERLOGLOG (1ULL<<27)
+#define CMD_CATEGORY_GEO (1ULL<<28)
+#define CMD_CATEGORY_STREAM (1ULL<<29)
+#define CMD_CATEGORY_PUBSUB (1ULL<<30)
+#define CMD_CATEGORY_ADMIN (1ULL<<31)
+#define CMD_CATEGORY_FAST (1ULL<<32)
+#define CMD_CATEGORY_SLOW (1ULL<<33)
+#define CMD_CATEGORY_BLOCKING (1ULL<<34)
+#define CMD_CATEGORY_DANGEROUS (1ULL<<35)
+#define CMD_CATEGORY_CONNECTION (1ULL<<36)
+#define CMD_CATEGORY_TRANSACTION (1ULL<<37)
+#define CMD_CATEGORY_SCRIPTING (1ULL<<38)
 
 /* AOF states */
 #define AOF_OFF 0             /* AOF is off */
@@ -239,7 +244,7 @@ typedef long long ustime_t; /* microsecond time type. */
                                           we return single threaded that the
                                           client has already pending commands
                                           to be executed. */
-#define CLIENT_TRACKING (1<<31) /* Client enabled keys tracking in order to
+#define CLIENT_TRACKING (1ULL<<31) /* Client enabled keys tracking in order to
                                    perform client side caching. */
 #define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<32) /* Target client is invalid. */
 
@@ -479,6 +484,11 @@ typedef void (*moduleTypeRewriteFunc)(struct RedisModuleIO *io, struct redisObje
 typedef void (*moduleTypeDigestFunc)(struct RedisModuleDigest *digest, void *value);
 typedef size_t (*moduleTypeMemUsageFunc)(const void *value);
 typedef void (*moduleTypeFreeFunc)(void *value);
+
+/* A callback that is called when the client authentication changes. This
+ * needs to be exposed since you can't cast a function pointer to (void *) */
+typedef void (*RedisModuleUserChangedFunc) (uint64_t client_id, void *privdata);
+
 
 /* The module type, which is referenced in each value of a given type, defines
  * the methods and links to the module exporting the type. */
@@ -798,6 +808,15 @@ typedef struct client {
     list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
     sds peerid;             /* Cached peer ID. */
     listNode *client_list_node; /* list node in client list */
+    RedisModuleUserChangedFunc auth_callback; /* Module callback to execute
+                                               * when the authenticated user
+                                               * changes. */
+    void *auth_callback_privdata; /* Private data that is passed when the auth
+                                   * changed callback is executed. Opaque for 
+                                   * Redis Core. */
+    void *auth_module;      /* The module that owns the callback, which is used
+                             * to disconnect the client if the module is 
+                             * unloaded for cleanup. Opaque for Redis Core.*/
 
     /* If this client is in tracking mode and this field is non zero,
      * invalidation messages for keys fetched by this client will be send to
@@ -829,6 +848,7 @@ struct sharedObjectsStruct {
     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
     *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
     *rpop, *lpop, *lpush, *rpoplpush, *zpopmin, *zpopmax, *emptyscan,
+    *multi, *exec,
     *select[PROTO_SHARED_SELECT_CMDS],
     *integers[OBJ_SHARED_INTEGERS],
     *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
@@ -1064,7 +1084,7 @@ struct redisServer {
                         *lpopCommand, *rpopCommand, *zpopminCommand,
                         *zpopmaxCommand, *sremCommand, *execCommand,
                         *expireCommand, *pexpireCommand, *xclaimCommand,
-                        *xgroupCommand;
+                        *xgroupCommand, *rpoplpushCommand;
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
@@ -1334,6 +1354,8 @@ struct redisServer {
                                       to set in order to suppress certain
                                       native Redis Cluster features. Check the
                                       REDISMODULE_CLUSTER_FLAG_*. */
+    int cluster_allow_reads_when_down; /* Are reads allowed when the cluster
+                                        is down? */
     /* Scripting */
     lua_State *lua; /* The Lua interpreter. We use just one for all clients */
     client *lua_client;   /* The "fake client" to query Redis from Lua */
@@ -1516,6 +1538,7 @@ void processModuleLoadingProgressEvent(int is_aof);
 int moduleTryServeClientBlockedOnKey(client *c, robj *key);
 void moduleUnblockClient(client *c);
 int moduleClientIsBlockedOnKeys(client *c);
+void moduleNotifyUserChanged(client *c);
 
 /* Utils */
 long long ustime(void);
@@ -1526,6 +1549,7 @@ uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l);
 void exitFromChild(int retcode);
 size_t redisPopcount(void *s, long count);
 void redisSetProcTitle(char *title);
+int redisCommunicateSystemd(const char *sd_notify_msg);
 
 /* networking.c -- Networking and Client related operations */
 client *createClient(connection *conn);
@@ -1657,6 +1681,7 @@ void touchWatchedKeysOnFlush(int dbid);
 void discardTransaction(client *c);
 void flagTransaction(client *c);
 void execCommandPropagateMulti(client *c);
+void execCommandPropagateExec(client *c);
 
 /* Redis object implementation */
 void decrRefCount(robj *o);
@@ -1809,6 +1834,8 @@ int ACLLoadConfiguredUsers(void);
 sds ACLDescribeUser(user *u);
 void ACLLoadUsersAtStartup(void);
 void addReplyCommandCategories(client *c, struct redisCommand *cmd);
+user *ACLCreateUnlinkedUser();
+void ACLFreeUserAndKillClients(user *u);
 
 /* Sorted sets data type */
 
@@ -2005,6 +2032,7 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
 #define LOOKUP_NOTOUCH (1<<0)
 void dbAdd(redisDb *db, robj *key, robj *val);
 void dbOverwrite(redisDb *db, robj *key, robj *val);
+void genericSetKey(redisDb *db, robj *key, robj *val, int keepttl);
 void setKey(redisDb *db, robj *key, robj *val);
 int dbExists(redisDb *db, robj *key);
 robj *dbRandomKey(redisDb *db);
