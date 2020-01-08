@@ -33,8 +33,6 @@
 #include "bio.h"
 #include "latency.h"
 #include "atomicvar.h"
-#include "hdr_histogram.h"
-
 
 #include <time.h>
 #include <signal.h>
@@ -4451,39 +4449,35 @@ sds genRedisInfoString(const char *section) {
         while((de = dictNext(di)) != NULL) {
             c = (struct redisCommand *) dictGetVal(de);
             if (!c->calls) continue;
-            int64_t min = hdr_min(c->histogram);
-            double q25 = hdr_value_at_percentile(c->histogram, 25.0 );
-            double q50 = hdr_mean(c->histogram);
-            double q75 = hdr_value_at_percentile(c->histogram, 75.0 );
-            double q90 = hdr_value_at_percentile(c->histogram, 90.0 );
-            double q95 = hdr_value_at_percentile(c->histogram, 95.0 );
-            double q99 = hdr_value_at_percentile(c->histogram, 99.0 );
-            double q999 = hdr_value_at_percentile(c->histogram, 99.9 );
-            int64_t max = hdr_max(c->histogram);
+            if(c->flags & CMD_CATEGORY_READ){
 
+            }
+            if(c->flags & CMD_CATEGORY_WRITE){
+
+            }
             info = sdscatprintf(info,
             "extended_cmdstat_%s:"
             "calls=%lld,"
             "min_usec=%ld,"
-            "q25_usec=%.2f,"
-            "q50_usec=%.2f,"
-            "q75_usec=%.2f,"
-            "q90_usec=%.2f,"
-            "q95_usec=%.2f,"
-            "q99_usec=%.2f,"
-            "q999_usec=%.2f,"
+            "q25_usec=%ld,"
+            "q50_usec=%ld,"
+            "q75_usec=%ld,"
+            "q90_usec=%ld,"
+            "q95_usec=%ld,"
+            "q99_usec=%ld,"
+            "q999_usec=%ld,"
             "max_usec=%ld\r\n",
             c->name, 
             c->calls,
-            min,
-            q25,
-            q50,
-            q75,
-            q90,
-            q95,
-            q99,
-            q999,
-            max
+            hdr_min(c->histogram),
+            hdr_value_at_percentile(c->histogram, 25.0 ),
+            hdr_value_at_percentile(c->histogram, 50.0 ),
+            hdr_value_at_percentile(c->histogram, 75.0 ),
+            hdr_value_at_percentile(c->histogram, 90.0 ),
+            hdr_value_at_percentile(c->histogram, 95.0 ),
+            hdr_value_at_percentile(c->histogram, 99.0 ),
+            hdr_value_at_percentile(c->histogram, 99.9 ),
+            hdr_max(c->histogram)
             );
             
         }

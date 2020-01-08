@@ -114,8 +114,8 @@ typedef long long ustime_t; /* microsecond time type. */
 #define NET_PEER_ID_LEN (NET_IP_STR_LEN+32) /* Must be enough for ip:port */
 #define CONFIG_BINDADDR_MAX 16
 #define CONFIG_MIN_RESERVED_FDS 32
-#define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE (1000*1000*1)          /* 1 secs(us precision) */
-#define CONFIG_LATENCY_HISTOGRAM_PRECISION 3
+#define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 1000000L          /* 1 secs(us precision) */
+#define CONFIG_LATENCY_HISTOGRAM_PRECISION 4
 
 #define ACTIVE_EXPIRE_CYCLE_SLOW 0
 #define ACTIVE_EXPIRE_CYCLE_FAST 1
