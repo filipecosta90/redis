@@ -33,6 +33,8 @@
 #include "bio.h"
 #include "latency.h"
 #include "atomicvar.h"
+#include "hdr_histogram.h"
+
 
 #include <time.h>
 #include <signal.h>
@@ -2960,6 +2962,21 @@ void populateCommandTable(void) {
         struct redisCommand *c = redisCommandTable+j;
         int retval1, retval2;
 
+        // track and analyze the counts of 
+        // observed integer values between 1 us and 30000000 us ( 30 secs ) 
+        // while maintaining a value precision of 3 significant digits across that range,
+        // translating to a value resolution of :
+        //   - 1 microsecond up to 1 millisecond, 
+        //   - 1 millisecond (or better) up to one second, 
+        //   - 1 second (or better) up to it's maximum tracked value ( 30 seconds ).
+        // Initialise the histogram
+        //  Value quantization within the range will thus be no larger than 1/1,000th (or 0.1%) of any value.
+        hdr_init(
+        1,  // Minimum value
+        CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
+        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        &c->histogram);  // Pointer to initialise
+
         /* Translate the command string flags description into an actual
          * set of flags. */
         if (populateCommandTableParseFlags(c,c->sflags) == C_ERR)
@@ -2984,6 +3001,7 @@ void resetCommandTableStats(void) {
         c = (struct redisCommand *) dictGetVal(de);
         c->microseconds = 0;
         c->calls = 0;
+        hdr_reset(c->histogram);
     }
     dictReleaseIterator(di);
 
@@ -3227,6 +3245,10 @@ void call(client *c, int flags) {
          * EXPIRE, GEOADD, etc. */
         real_cmd->microseconds += duration;
         real_cmd->calls++;
+        hdr_record_value(
+            real_cmd->histogram,  // Histogram to record to
+            (duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE) ? duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
+
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -4413,6 +4435,57 @@ sds genRedisInfoString(const char *section) {
                 "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
                 c->name, c->calls, c->microseconds,
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* Extended Command statistics */
+    if (allsections || !strcasecmp(section,"extendedcommandstats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Extended Commandstats\r\n");
+
+        struct redisCommand *c;
+        dictEntry *de;
+        dictIterator *di;
+        di = dictGetSafeIterator(server.commands);
+        while((de = dictNext(di)) != NULL) {
+            c = (struct redisCommand *) dictGetVal(de);
+            if (!c->calls) continue;
+            int64_t min = hdr_min(c->histogram);
+            double q25 = hdr_value_at_percentile(c->histogram, 25.0 );
+            double q50 = hdr_mean(c->histogram);
+            double q75 = hdr_value_at_percentile(c->histogram, 75.0 );
+            double q90 = hdr_value_at_percentile(c->histogram, 90.0 );
+            double q95 = hdr_value_at_percentile(c->histogram, 95.0 );
+            double q99 = hdr_value_at_percentile(c->histogram, 99.0 );
+            double q999 = hdr_value_at_percentile(c->histogram, 99.9 );
+            int64_t max = hdr_max(c->histogram);
+
+            info = sdscatprintf(info,
+            "extended_cmdstat_%s:"
+            "calls=%lld,"
+            "min_usec=%ld,"
+            "q25_usec=%.2f,"
+            "q50_usec=%.2f,"
+            "q75_usec=%.2f,"
+            "q90_usec=%.2f,"
+            "q95_usec=%.2f,"
+            "q99_usec=%.2f,"
+            "q999_usec=%.2f,"
+            "max_usec=%ld\r\n",
+            c->name, 
+            c->calls,
+            min,
+            q25,
+            q50,
+            q75,
+            q90,
+            q95,
+            q99,
+            q999,
+            max
+            );
+            
         }
         dictReleaseIterator(di);
     }

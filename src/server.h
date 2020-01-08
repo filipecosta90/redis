@@ -34,7 +34,7 @@
 #include "config.h"
 #include "solarisfixes.h"
 #include "rio.h"
-
+#include "hdr_histogram.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,6 +114,8 @@ typedef long long ustime_t; /* microsecond time type. */
 #define NET_PEER_ID_LEN (NET_IP_STR_LEN+32) /* Must be enough for ip:port */
 #define CONFIG_BINDADDR_MAX 16
 #define CONFIG_MIN_RESERVED_FDS 32
+#define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE (1000*1000*1)          /* 1 secs(us precision) */
+#define CONFIG_LATENCY_HISTOGRAM_PRECISION 3
 
 #define ACTIVE_EXPIRE_CYCLE_SLOW 0
 #define ACTIVE_EXPIRE_CYCLE_FAST 1
@@ -1427,6 +1429,8 @@ struct redisCommand {
                    ACLs. A connection is able to execute a given command if
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
+    struct hdr_histogram* histogram;
+
 };
 
 struct redisFunctionSym {
