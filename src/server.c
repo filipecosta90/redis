@@ -4488,15 +4488,15 @@ sds genRedisInfoString(const char *section) {
             info = sdscatprintf(info,
             "tdigest_extended_cmdstat_%s:"
             "calls=%lld,"
-            "min_usec=%ld,"
-            "q25_usec=%ld,"
-            "q50_usec=%ld,"
-            "q75_usec=%ld,"
-            "q90_usec=%ld,"
-            "q95_usec=%ld,"
-            "q99_usec=%ld,"
-            "q999_usec=%ld,"
-            "max_usec=%ld\r\n",
+            "min_usec=%.f,"
+            "q25_usec=%.f,"
+            "q50_usec=%.f,"
+            "q75_usec=%.f,"
+            "q90_usec=%.f,"
+            "q95_usec=%.f,"
+            "q99_usec=%.f,"
+            "q999_usec=%.f,"
+            "max_usec=%.f\r\n",
             c->name, 
             c->calls,
             tdigestQuantile(c->tdigest, 0.00),
