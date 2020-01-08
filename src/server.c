@@ -2675,6 +2675,7 @@ void resetServerStats(void) {
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
     server.aof_delayed_fsync = 0;
+    hdr_reset(server.queue_time_histogram);
 }
 
 void initServer(void) {
@@ -3183,7 +3184,7 @@ void preventCommandReplication(client *c) {
  */
 void call(client *c, int flags) {
     long long dirty;
-    ustime_t start, duration;
+    ustime_t start, duration, queue_duration, end;
     int client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->cmd;
 
@@ -3209,9 +3210,8 @@ void call(client *c, int flags) {
     updateCachedTime(0);
     start = server.ustime;
     c->cmd->proc(c);
-    ustime_t now = ustime();
     duration = ustime()-start;
-    ustime_t queue_time = ustime()-c->lasteventtime;
+    queue_duration = start-c->lasteventtime;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
 
@@ -3238,6 +3238,10 @@ void call(client *c, int flags) {
         latencyAddSampleIfNeeded(latency_event,duration/1000);
         slowlogPushEntryIfNeeded(c,c->argv,c->argc,duration);
     }
+
+     hdr_record_value(
+            server.queue_time_histogram,  // Histogram to record to
+            (long)queue_duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)queue_duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
 
     if (flags & CMD_CALL_STATS) {
         /* use the real command that was executed (cmd and lastamc) may be
@@ -4460,6 +4464,7 @@ sds genRedisInfoString(const char *section) {
             info = sdscatprintf(info,
             "extended_cmdstat_%s:"
             "calls=%lld,"
+            "usec_per_call=%.2f,"
             "min_usec=%ld,"
             "q25_usec=%ld,"
             "q50_usec=%ld,"
@@ -4473,6 +4478,7 @@ sds genRedisInfoString(const char *section) {
             "max_usec=%ld\r\n",
             c->name, 
             c->calls,
+            hdr_mean(c->histogram),
             hdr_min(c->histogram),
             hdr_value_at_percentile(c->histogram, 25.0 ),
             hdr_value_at_percentile(c->histogram, 50.0 ),
@@ -4485,9 +4491,82 @@ sds genRedisInfoString(const char *section) {
             hdr_value_at_percentile(c->histogram, 99.999 ),
             hdr_max(c->histogram)
             );
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* Queue statistics Exported*/
+    /* Extended Command statistics */
+    if (allsections || !strcasecmp(section,"extendedcommandstats_export")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Extended Commandstats Exporter\r\n");
+
+        struct redisCommand *c;
+        dictEntry *de;
+        dictIterator *di;
+        di = dictGetSafeIterator(server.commands);
+        while((de = dictNext(di)) != NULL) {
+            c = (struct redisCommand *) dictGetVal(de);
+            if (!c->calls) continue;
+            if(c->flags & CMD_CATEGORY_READ){
+
+            }
+            if(c->flags & CMD_CATEGORY_WRITE){
+
+            }
+            info = sdscatprintf(info,
+            "extended_cmdstat_exporter_%s:%s\r\n",
+            c->name, 
+            "TODO"
+            );
             
         }
         dictReleaseIterator(di);
+    }
+
+    /* Queue statistics */
+    if (allsections || !strcasecmp(section,"queuestats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Queuestats\r\n");
+        info = sdscatprintf(info,
+        "queuestats:"
+        "calls=%ld,"
+        "avg_usec=%.2f,"
+        "min_usec=%ld,"
+        "q25_usec=%ld,"
+        "q50_usec=%ld,"
+        "q75_usec=%ld,"
+        "q90_usec=%ld,"
+        "q95_usec=%ld,"
+        "q99_usec=%ld,"
+        "q999_usec=%ld,"
+        "q9999_usec=%ld,"
+        "q99999_usec=%ld,"
+        "max_usec=%ld\r\n",
+        server.queue_time_histogram->total_count,
+        hdr_mean(server.queue_time_histogram),
+        hdr_min(server.queue_time_histogram),
+        hdr_value_at_percentile(server.queue_time_histogram, 25.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 50.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 75.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 90.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 95.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 99.0 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 99.9 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 99.99 ),
+        hdr_value_at_percentile(server.queue_time_histogram, 99.999 ),
+        hdr_max(server.queue_time_histogram)
+        );
+    }
+
+    /* Queue statistics Exported*/
+    if (allsections || !strcasecmp(section,"queuestats_export")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Queuestats Export\r\n");
+        info = sdscatprintf(info,
+        "queuestats_export:%s\r\n",
+        "TODO"
+        );
     }
 
     /* Cluster */
@@ -4951,6 +5030,21 @@ int main(int argc, char **argv) {
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
+
+    // track and analyze the counts of 
+        // observed integer values between 1 us and 30000000 us ( 30 secs ) 
+        // while maintaining a value precision of 3 significant digits across that range,
+        // translating to a value resolution of :
+        //   - 1 microsecond up to 1 millisecond, 
+        //   - 1 millisecond (or better) up to one second, 
+        //   - 1 second (or better) up to it's maximum tracked value ( 30 seconds ).
+        // Initialise the histogram
+        //  Value quantization within the range will thus be no larger than 1/1,000th (or 0.1%) of any value.
+        hdr_init(
+        1,  // Minimum value
+        CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
+        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        &server.queue_time_histogram);  // Pointer to initialise
 
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
