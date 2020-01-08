@@ -33,6 +33,8 @@
 #include "bio.h"
 #include "latency.h"
 #include "atomicvar.h"
+#include "hdr_histogram.h"
+
 
 #include <time.h>
 #include <signal.h>
@@ -2959,6 +2961,21 @@ void populateCommandTable(void) {
     for (j = 0; j < numcommands; j++) {
         struct redisCommand *c = redisCommandTable+j;
         int retval1, retval2;
+
+        // This example Histogram could be used to track and analyze the counts of 
+// observed integer values between 0 us and 30000000 us ( 30 secs ) 
+// while maintaining a value precision of 3 significant digits across that range,
+// translating to a value resolution of :
+//   - 1 microsecond up to 1 millisecond, 
+//   - 1 millisecond (or better) up to one second, 
+//   - 1 second (or better) up to it's maximum tracked value ( 30 seconds ).
+// Initialise the histogram
+//  Value quantization within the range will thus be no larger than 1/1,000th (or 0.1%) of any value.
+hdr_init(
+    1,  // Minimum value
+    INT64_C(30000000),  // Maximum value
+    3,  // Number of significant figures
+    &c->histogram);  // Pointer to initialise
 
         /* Translate the command string flags description into an actual
          * set of flags. */
