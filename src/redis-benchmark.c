@@ -45,18 +45,22 @@
 #include <sds.h> /* Use hiredis sds. */
 #include "ae.h"
 #include "hiredis.h"
-#include "async.h"
 #include "adlist.h"
 #include "dict.h"
 #include "zmalloc.h"
 #include "atomicvar.h"
 #include "crc16_slottable.h"
+#include "util.h"
+#include "hdr_histogram.h"
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 #define MAX_LATENCY_PRECISION 3
 #define MAX_THREADS 500
 #define CLUSTER_SLOTS 16384
+/* Error codes */
+#define C_OK                    0
+#define C_ERR                   -1
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
@@ -72,9 +76,9 @@ static struct config {
     const char *hostsocket;
     int numclients;
     int liveclients;
-    int requests;
-    int requests_issued;
-    int requests_finished;
+    long requests;
+    long requests_issued;
+    long requests_finished;
     int keysize;
     int datasize;
     int randomkeys;
@@ -84,6 +88,7 @@ static struct config {
     int showerrors;
     long long start;
     long long totlatency;
+    struct hdr_histogram* histogram;
     long long *latency;
     const char *title;
     list *clients;
@@ -91,11 +96,13 @@ static struct config {
     int csv;
     int loop;
     int idlemode;
-    int subscribermode;
+    int subscriber_mode;
+    int publisher_mode;
     int dbnum;
     sds dbnumstr;
     char *tests;
     char *auth;
+    char *channel_name;
     int precision;
     int num_threads;
     struct benchmarkThread **threads;
@@ -119,14 +126,19 @@ static struct config {
 
 typedef struct _client {
     redisContext *context;
-    redisAsyncContext *asyncContext;
     sds obuf;
     char **randptr;         /* Pointers to :rand: strings inside the command buf */
     size_t randlen;         /* Number of pointers in client->randptr */
     size_t randfree;        /* Number of unused pointers in client->randptr */
+    
     char **stagptr;         /* Pointers to slot hashtags (cluster mode only) */
     size_t staglen;         /* Number of pointers in client->stagptr */
     size_t stagfree;        /* Number of unused pointers in client->stagptr */
+
+    char **pubsubptr;       /* Pointers to :mstime: strings inside the command buf */
+    size_t pubsublen;       /* Number of pointers in client->pubsubptr */
+    size_t pubsubfree;      /* Number of unused pointers in client->pubsubptr */
+
     size_t written;         /* Bytes of 'obuf' already written */
     long long start;        /* Start time of a request */
     long long latency;      /* Request latency */
@@ -176,7 +188,9 @@ typedef struct redisConfig {
 } redisConfig;
 
 /* Prototypes */
+static void pubsubwriteHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void pubsubreadHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void createMissingClients(client c);
 static benchmarkThread *createBenchmarkThread(int index);
 static void freeBenchmarkThread(benchmarkThread *thread);
@@ -355,6 +369,23 @@ static void resetClient(client c) {
     c->pending = config.pipeline;
 }
 
+static void mstimePubSubMessage(client c) {
+    size_t i;
+    char buf[64];
+    int len;
+
+    for (i = 0; i < c->pubsublen; i++) {
+        long long t = mstime();
+        char *p = c->pubsubptr[i]+12;
+        size_t j;
+        len = ll2string(buf,64,t);
+        for (j = 0; j < 13; j++) {
+            *p = buf[12-j];
+            p--;
+        }
+    }
+}
+
 static void randomizeClientKey(client c) {
     size_t i;
 
@@ -420,13 +451,101 @@ static void clientDone(client c) {
     }
 }
 
-void subCallback(redisAsyncContext *c, void *r, void *privdata) {
-    redisReply *reply= r;
-    if (r == NULL) return;
+static void pubsubreadHandler(aeEventLoop *el, int fd, void *privdata, int mask)
+{
+    client c = privdata;
+    void *reply = NULL;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
 
-    if (reply->type == REDIS_REPLY_ARRAY) {
-        for (int j = 0; j < reply->elements; j++) {
-            printf("%u) %s\n", j, reply->element[j]->str);
+    if (redisBufferRead(c->context) != REDIS_OK)
+    {
+        fprintf(stderr,"Error on redisBufferRead: %s\n",c->context->errstr);
+        exit(1);
+    }
+    else
+    {
+        /* Enforce upper bound to number of requests. */
+        while (config.requests_finished < config.requests)
+        {
+
+            if (redisGetReply(c->context, &reply) != REDIS_OK)
+            {
+                fprintf(stderr, "Error reading pubsub reply: %s\n", c->context->errstr);
+                if (c->context->err == REDIS_ERR_IO &&
+                    (errno == ECONNRESET || errno == EPIPE))
+                {
+                    continue;
+                }
+                else
+                {
+                    exit(1);
+                }
+            }
+
+            if (reply != NULL)
+            {
+                if (reply == (void *)REDIS_REPLY_ERROR)
+                {
+                    fprintf(stderr, "Unexpected error reply, exiting...\n");
+                    exit(1);
+                }
+                redisReply *r = reply;
+                int is_err = (r->type == REDIS_REPLY_ERROR);
+
+                if (is_err && config.showerrors)
+                {
+                    /* TODO: static lasterr_time not thread-safe */
+                    static time_t lasterr_time = 0;
+                    time_t now = time(NULL);
+                    if (lasterr_time != now)
+                    {
+                        lasterr_time = now;
+                        if (c->cluster_node)
+                        {
+                            printf("Error from server %s:%d: %s\n",
+                                   c->cluster_node->ip,
+                                   c->cluster_node->port,
+                                   r->str);
+                        }
+                        else
+                            printf("Error from server: %s\n", r->str);
+                    }
+                }
+
+                if (c->prefix_pending > 0)
+                {
+                    c->prefix_pending--;
+                    if (reply)
+                        freeReplyObject(reply);
+                    continue;
+                }
+
+                if (r->type != REDIS_REPLY_ARRAY || r->elements < 3)
+                {
+                    if (reply)
+                        freeReplyObject(reply);
+                    break;
+                }
+                // TODO: calculate element length
+                // r->element[2]->len
+
+                int requests_finished = 0;
+                atomicGetIncr(config.requests_finished, requests_finished, 1);
+//                if (requests_finished < config.requests)
+//                    config.latency[requests_finished] = 0.01;
+
+                if (config.requests_finished >= config.requests)
+                {
+                    clientDone(c);
+                    break;
+                }
+            }
+            else
+            {
+                break;
+            }
         }
     }
 }
@@ -517,8 +636,12 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
                 int requests_finished = 0;
                 atomicGetIncr(config.requests_finished, requests_finished, 1);
-                if (requests_finished < config.requests)
-                    config.latency[requests_finished] = c->latency;
+                hdr_record_value(
+                        config.histogram,  // Histogram to record to
+                        c->latency);  // Value to record
+
+//                if (requests_finished < config.requests)
+//                    config.latency[requests_finished] = c->latency;
                 c->pending--;
                 if (c->pending == 0) {
                     clientDone(c);
@@ -527,6 +650,34 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             } else {
                 break;
             }
+        }
+    }
+}
+
+static void pubsubwriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    client c = privdata;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    /* Initialize request when nothing was written. */
+    if (c->written == 0) {
+        c->start = ustime();
+        c->latency = -1;
+    }
+    if (sdslen(c->obuf) > c->written) {
+        void *ptr = c->obuf+c->written;
+        ssize_t nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
+        if (nwritten == -1) {
+            if (errno != EPIPE)
+                fprintf(stderr, "Writing to socket: %s\n", strerror(errno));
+            freeClient(c);
+            return;
+        }
+        c->written += nwritten;
+        if (sdslen(c->obuf) == c->written) {
+            aeDeleteFileEvent(el,c->context->fd,AE_WRITABLE);
+            aeCreateFileEvent(el,c->context->fd,AE_READABLE,pubsubreadHandler,c);
         }
     }
 }
@@ -554,6 +705,8 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         c->start = ustime();
         c->latency = -1;
     }
+    if (config.publisher_mode) mstimePubSubMessage(c);
+
     if (sdslen(c->obuf) > c->written) {
         void *ptr = c->obuf+c->written;
         ssize_t nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
@@ -571,19 +724,6 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
-
-void cmdCallback(redisAsyncContext *c, void *r, void *cmd) {
-    redisReply *reply = r;
-    if (reply == NULL) {
-        printf("Redis Async Command Error: Reply is null, [%s]\n", (char*)cmd);
-        return;
-    }
-    if (reply->type == REDIS_REPLY_ERROR) {
-        printf("Redis Async Command Error: %s, [%s]\n", reply->str, (char*)cmd);
-        return;
-    }
-    printf("%s -> %s\n", cmd, reply->str);
-}
 
 /* Create a benchmark client, configured to send the command passed as 'cmd' of
  * 'len' bytes.
@@ -630,11 +770,7 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
             port = node->port;
             c->cluster_node = node;
         }
-        if(!config.subscribermode){
-            c->context = redisConnectNonBlock(ip,port);
-        }else{
-            c->asyncContext = redisAsyncConnect(ip,port);
-        }
+        c->context = redisConnectNonBlock(ip,port);
     } else {
         c->context = redisConnectUnixNonBlock(config.hostsocket);
     }
@@ -648,8 +784,7 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     }
     c->thread_id = thread_id;
     /* Suppress hiredis cleanup of unused buffers for max speed. */
-    if(!config.subscribermode)
-        c->context->reader->maxbuf = 0;
+    c->context->reader->maxbuf = 0;
 
     /* Build the request buffer:
      * Queue N requests accordingly to the pipeline size, or simply clone
@@ -664,6 +799,10 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
         int len = redisFormatCommand(&buf, "AUTH %s", config.auth);
         c->obuf = sdscatlen(c->obuf, buf, len);
         free(buf);
+        c->prefix_pending++;
+    }
+
+    if (config.subscriber_mode){
         c->prefix_pending++;
     }
 
@@ -727,10 +866,30 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
                 }
                 c->randptr[c->randlen++] = p;
                 c->randfree--;
-                p += 12; /* 12 is strlen("__rand_int__). */
+                p += 12; /* 12 is strlen("__rand_int__"). */
             }
         }
     }
+    if(config.publisher_mode){
+        char *p = c->obuf;
+
+        c->pubsublen = 0;
+        c->pubsubfree = RANDPTR_INITIAL_SIZE;
+        c->pubsubptr = zmalloc(sizeof(char*)*c->pubsubfree);
+        
+        while ((p = strstr(p,"___ms_time___")) != NULL) {
+            if (c->pubsubfree == 0) {
+                c->pubsubptr = zrealloc(c->pubsubptr,sizeof(char*)*c->pubsublen*2);
+                c->pubsubfree += c->pubsublen;
+            }
+            c->pubsubptr[c->pubsublen++] = p;
+            c->pubsubfree--;
+            p += 13; /* 13 is strlen("___ms_time___"). */
+        }
+
+    }
+    
+
     /* If cluster mode is enabled, set slot hashtags pointers. */
     if (config.cluster_mode) {
         if (from) {
@@ -757,7 +916,7 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
                 }
                 c->stagptr[c->staglen++] = p;
                 c->stagfree--;
-                p += 5; /* 12 is strlen("{tag}"). */
+                p += 5; /* 5 is strlen("{tag}"). */
             }
         }
     }
@@ -767,11 +926,10 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
         benchmarkThread *thread = config.threads[thread_id];
         el = thread->el;
     }
-    if (config.idlemode == 0 && config.subscribermode == 0)
+    if (config.idlemode == 0 && config.subscriber_mode == 0)
         aeCreateFileEvent(el,c->context->fd,AE_WRITABLE,writeHandler,c);
-    if (config.subscribermode)
-        redisAeAttach(el, c->asyncContext);
-        redisAsyncFormattedCommand(c->asyncContext, cmdCallback, cmd, cmd,len );
+    if (config.subscriber_mode)
+        aeCreateFileEvent(el,c->context->fd,AE_WRITABLE,pubsubwriteHandler,c);
     listAddNodeTail(config.clients,c);
     atomicIncr(config.liveclients, 1);
     atomicGet(config.slots_last_update, c->slots_last_update);
@@ -817,7 +975,7 @@ static void showLatencyReport(void) {
     reqpersec = (float)config.requests_finished/((float)config.totlatency/1000);
     if (!config.quiet && !config.csv) {
         printf("====== %s ======\n", config.title);
-        printf("  %d requests completed in %.2f seconds\n", config.requests_finished,
+        printf("  %ld requests completed in %.2f seconds\n", config.requests_finished,
             (float)config.totlatency/1000);
         printf("  %d parallel clients\n", config.numclients);
         printf("  %d bytes payload\n", config.datasize);
@@ -849,25 +1007,25 @@ static void showLatencyReport(void) {
 
         printf("\n");
 
-        qsort(config.latency,config.requests,sizeof(long long),compareLatency);
-        for (i = 0; i < config.requests; i++) {
-            if (config.latency[i]/usbetweenlat != curlat ||
-                i == (config.requests-1))
-            {
-                /* After the 2 milliseconds latency to have percentages split
-                 * by decimals will just add a lot of noise to the output. */
-                if (config.latency[i] >= 2000) {
-                    config.precision = 0;
-                    usbetweenlat = ipow(10,
-                        MAX_LATENCY_PRECISION-config.precision);
-                }
-
-                curlat = config.latency[i]/usbetweenlat;
-                perc = ((float)(i+1)*100)/config.requests;
-                printf("%.2f%% <= %.*f milliseconds\n", perc, config.precision,
-                    curlat/pow(10.0, config.precision));
-            }
-        }
+//        qsort(config.latency,config.requests,sizeof(long long),compareLatency);
+//        for (i = 0; i < config.requests; i++) {
+//            if (config.latency[i]/usbetweenlat != curlat ||
+//                i == (config.requests-1))
+//            {
+//                /* After the 2 milliseconds latency to have percentages split
+//                 * by decimals will just add a lot of noise to the output. */
+//                if (config.latency[i] >= 2000) {
+//                    config.precision = 0;
+//                    usbetweenlat = ipow(10,
+//                        MAX_LATENCY_PRECISION-config.precision);
+//                }
+//
+//                curlat = config.latency[i]/usbetweenlat;
+//                perc = ((float)(i+1)*100)/config.requests;
+//                printf("%.2f%% <= %.*f milliseconds\n", perc, config.precision,
+//                    curlat/pow(10.0, config.precision));
+//            }
+//        }
         printf("%.2f requests per second\n\n", reqpersec);
     } else if (config.csv) {
         printf("\"%s\",\"%.2f\"\n", config.title, reqpersec);
@@ -915,29 +1073,8 @@ static void benchmark(char *title, char *cmd, int len) {
     if (!config.num_threads) aeMain(config.el);
     else startBenchmarkThreads();
     config.totlatency = mstime()-config.start;
-
-    showLatencyReport();
-    freeAllClients();
-    if (config.threads) freeBenchmarkThreads();
-}
-
-static void benchmarkSubscriber(char *title, char *cmd, int len) {
-    client c;
-
-    config.title = title;
-    config.requests_issued = 0;
-    config.requests_finished = 0;
-
-    if (config.num_threads) initBenchmarkThreads();
-
-    int thread_id = config.num_threads > 0 ? 0 : -1;
-    c = createClient(cmd,len,NULL,thread_id);
-    createMissingClients(c);
-
-    config.start = mstime();
-    if (!config.num_threads) aeMain(config.el);
-    else startBenchmarkThreads();
-    config.totlatency = mstime()-config.start;
+    printf("                                                                                                                                          \r");
+    fflush(stdout);
 
     showLatencyReport();
     freeAllClients();
@@ -1386,8 +1523,12 @@ int parseOptions(int argc, const char **argv) {
             config.loop = 1;
         } else if (!strcmp(argv[i],"-I")) {
             config.idlemode = 1;
-        } else if (!strcmp(argv[i],"-S")) {
-            config.subscribermode = 1;
+        } else if (!strcmp(argv[i],"--subscriber")) {
+            config.subscriber_mode = 1;
+        } else if (!strcmp(argv[i],"--channel_name")) {
+            config.channel_name = (char*)argv[++i];
+        } else if (!strcmp(argv[i],"--publisher")) {
+            config.publisher_mode = 1;
         } else if (!strcmp(argv[i],"-e")) {
             config.showerrors = 1;
         } else if (!strcmp(argv[i],"-t")) {
@@ -1495,8 +1636,10 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
     UNUSED(clientData);
     int liveclients = 0;
     int requests_finished = 0;
+    int requests_total = 0;
     atomicGet(config.liveclients, liveclients);
     atomicGet(config.requests_finished, requests_finished);
+    atomicGet(config.requests, requests_total);
 
     if (liveclients == 0 && requests_finished != config.requests) {
         fprintf(stderr,"All clients disconnected... aborting.\n");
@@ -1514,7 +1657,18 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
     }
     float dt = (float)(mstime()-config.start)/1000.0;
     float rps = (float)requests_finished/dt;
-    printf("%s: %.2f\r", config.title, rps);
+    char buf[4];
+    char bufrps[9];
+
+    float percent = (float)requests_finished/(float)requests_total * 100.0f;
+//    config.histogram
+    gcvt(percent, 4, buf);
+    gcvt(rps, 12, bufrps);
+
+    double p50 = hdr_value_at_percentile(config.histogram, 50.0 );
+
+    fflush(stdout);
+    printf("%-20s [progress %-4s %%]: %-12s\r", config.title, buf, bufrps );
     fflush(stdout);
     return 250; /* every 250ms */
 }
@@ -1559,8 +1713,10 @@ int main(int argc, const char **argv) {
     config.csv = 0;
     config.loop = 0;
     config.idlemode = 0;
-    config.subscribermode = 0;
-    config.latency = NULL;
+    config.subscriber_mode = 0;
+    config.publisher_mode = 0;
+    config.channel_name = "mychannel";
+//    config.latency = NULL;
     config.clients = listCreate();
     config.hostip = "127.0.0.1";
     config.hostport = 6379;
@@ -1579,12 +1735,17 @@ int main(int argc, const char **argv) {
     config.is_updating_slots = 0;
     config.slots_last_update = 0;
     config.enable_tracking = 0;
+    hdr_init(
+    1,  // Minimum value
+    INT64_C(30000000),  // Maximum value
+    2,  // Number of significant figures
+    &config.histogram);  // Pointer to initialise
 
     i = parseOptions(argc,argv);
     argc -= i;
     argv += i;
 
-    config.latency = zmalloc(sizeof(long long)*config.requests);
+//    config.latency = zmalloc(sizeof(long long)*config.requests);
 
     if (config.cluster_mode) {
         /* Fetch cluster configuration. */
@@ -1660,11 +1821,30 @@ int main(int argc, const char **argv) {
         /* and will wait for every */
     }
 
-    if (config.subscribermode) {
-        printf("Creating %d blocking connections connections and waiting for reply (Ctrl+C when done)\n", config.numclients);
-        len = redisFormatCommand(&cmd,"SUBSCRIBE mychannel");
-        benchmark("SUBSCRIBE",cmd,len);
-        free(cmd);
+    if (config.subscriber_mode) {
+        do {
+            printf("Creating %d blocking connections and waiting for replies to the subscribed channel %s\n", config.numclients, config.channel_name);
+            printf("Adjusting the request number to %d (clients) x %ld = %ld\n", config.numclients, config.requests, config.numclients * config.requests);
+            atomicSet(config.requests, config.numclients * config.requests);
+//                config.latency = zrealloc(config.latency,sizeof(long long)*config.requests);
+            len = redisFormatCommand(&cmd,"SUBSCRIBE %s",config.channel_name);
+            benchmark("SUBSCRIBE",cmd,len);
+            free(cmd);
+        } while(config.loop);
+
+        if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
+        return 0;
+    }
+
+    if (config.publisher_mode) {
+        do {
+            len = redisFormatCommand(&cmd,"PUBLISH %s ___ms_time___",config.channel_name);
+            benchmark("PUBLISH",cmd,len);
+            free(cmd);
+        } while(config.loop);
+
+        if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
+        return 0;
     }
 
     /* Run benchmark with command in the remainder of the arguments. */
@@ -1810,8 +1990,7 @@ int main(int argc, const char **argv) {
         }
 
         if (test_is_selected("publish")) {
-            len = redisFormatCommand(&cmd,
-                                     "PUBLISH mychannel %s",data);
+            len = redisFormatCommand(&cmd,"PUBLISH %s %s",config.channel_name, data);
             benchmark("PUBLISH",cmd,len);
             free(cmd);
         }
