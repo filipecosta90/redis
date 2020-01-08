@@ -3209,7 +3209,9 @@ void call(client *c, int flags) {
     updateCachedTime(0);
     start = server.ustime;
     c->cmd->proc(c);
+    ustime_t now = ustime();
     duration = ustime()-start;
+    ustime_t queue_time = ustime()-c->lasteventtime;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
 
@@ -3245,7 +3247,7 @@ void call(client *c, int flags) {
         real_cmd->calls++;
         hdr_record_value(
             real_cmd->histogram,  // Histogram to record to
-            (duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE) ? duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
+            (long)duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
 
     }
 
@@ -4466,6 +4468,8 @@ sds genRedisInfoString(const char *section) {
             "q95_usec=%ld,"
             "q99_usec=%ld,"
             "q999_usec=%ld,"
+            "q9999_usec=%ld,"
+            "q99999_usec=%ld,"
             "max_usec=%ld\r\n",
             c->name, 
             c->calls,
@@ -4477,6 +4481,8 @@ sds genRedisInfoString(const char *section) {
             hdr_value_at_percentile(c->histogram, 95.0 ),
             hdr_value_at_percentile(c->histogram, 99.0 ),
             hdr_value_at_percentile(c->histogram, 99.9 ),
+            hdr_value_at_percentile(c->histogram, 99.99 ),
+            hdr_value_at_percentile(c->histogram, 99.999 ),
             hdr_max(c->histogram)
             );
             
