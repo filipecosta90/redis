@@ -393,7 +393,7 @@ int hdr_percentiles_print(
 
 
 
-sds hdr_percentiles_print_prometheus(
+sds hdr_percentiles_sdsprint(
         struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
         double value_scale, char* metric_name);
 

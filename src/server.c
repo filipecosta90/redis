@@ -4473,8 +4473,6 @@ sds genRedisInfoString(const char *section) {
             "q95_usec=%ld,"
             "q99_usec=%ld,"
             "q999_usec=%ld,"
-            "q9999_usec=%ld,"
-            "q99999_usec=%ld,"
             "max_usec=%ld\r\n",
             c->name, 
             c->calls,
@@ -4487,8 +4485,6 @@ sds genRedisInfoString(const char *section) {
             hdr_value_at_percentile(c->histogram, 95.0 ),
             hdr_value_at_percentile(c->histogram, 99.0 ),
             hdr_value_at_percentile(c->histogram, 99.9 ),
-            hdr_value_at_percentile(c->histogram, 99.99 ),
-            hdr_value_at_percentile(c->histogram, 99.999 ),
             hdr_max(c->histogram)
             );
         }
@@ -4540,8 +4536,6 @@ sds genRedisInfoString(const char *section) {
         "q95_usec=%ld,"
         "q99_usec=%ld,"
         "q999_usec=%ld,"
-        "q9999_usec=%ld,"
-        "q99999_usec=%ld,"
         "max_usec=%ld\r\n",
         server.queue_time_histogram->total_count,
         hdr_mean(server.queue_time_histogram),
@@ -4553,8 +4547,6 @@ sds genRedisInfoString(const char *section) {
         hdr_value_at_percentile(server.queue_time_histogram, 95.0 ),
         hdr_value_at_percentile(server.queue_time_histogram, 99.0 ),
         hdr_value_at_percentile(server.queue_time_histogram, 99.9 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.99 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.999 ),
         hdr_max(server.queue_time_histogram)
         );
     }
@@ -4562,10 +4554,17 @@ sds genRedisInfoString(const char *section) {
     /* Queue statistics Exported*/
     if (allsections || !strcasecmp(section,"queuestats_export")) {
         if (sections++) info = sdscat(info,"\r\n");
+        // Print out the values of the histogram
+        sds histogram_sds = hdr_percentiles_sdsprint(
+            server.queue_time_histogram,
+            stdout,            // File to write to
+            1,                 // Granularity of printed values
+            1.0,               // Multiplier for results
+            "queuestats"); // metric name
         info = sdscatprintf(info, "# Queuestats Export\r\n");
         info = sdscatprintf(info,
         "queuestats_export:%s\r\n",
-        "TODO"
+        histogram_sds
         );
     }
 

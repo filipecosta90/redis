@@ -71,7 +71,7 @@ int main()
     int rc = 0;
 
     // Print out the values of the histogram
-    sds mystring = hdr_percentiles_print_prometheus(
+    sds mystring = hdr_percentiles_sdsprint(
         histogram,
         stdout,            // File to write to
         1,                 // Granularity of printed values
