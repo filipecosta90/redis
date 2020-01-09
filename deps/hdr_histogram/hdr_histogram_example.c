@@ -1,5 +1,6 @@
 #include "hdr_histogram.h"
 #include "hdr_histogram_log.h"
+#include "sds.h" 
 
 #include <stdio.h>
 
@@ -71,6 +72,10 @@ hdr_percentiles_print(
             size_t encoded_len = 0;
 
     int rc = 0;
+
+sds mystring = sdsnew("Hello World!");
+printf("%s\n", mystring);
+sdsfree(mystring);
 
 
 // Print out the values of the histogram

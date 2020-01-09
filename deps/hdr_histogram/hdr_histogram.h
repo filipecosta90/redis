@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "sds.h"
 
 struct hdr_histogram
 {
