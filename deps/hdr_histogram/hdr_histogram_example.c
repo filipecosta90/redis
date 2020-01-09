@@ -52,20 +52,17 @@ int main()
         CLASSIC); // Format CLASSIC/CSV supported.
 
     int64_t min = hdr_min(histogram);
-    long p25 = hdr_value_at_percentile(histogram, 25.0);
-    double mean = hdr_mean(histogram);
-    long p75 = hdr_value_at_percentile(histogram, 75.0);
-    long p90 = hdr_value_at_percentile(histogram, 90.0);
-    long p95 = hdr_value_at_percentile(histogram, 95.0);
-    long p99 = hdr_value_at_percentile(histogram, 99.0);
-    long p999 = hdr_value_at_percentile(histogram, 99.9);
-    long p9999 = hdr_value_at_percentile(histogram, 99.99);
-    long p99999 = hdr_value_at_percentile(histogram, 99.999);
-    long p999999 = hdr_value_at_percentile(histogram, 99.9999);
+    int64_t p25 = hdr_value_at_percentile(histogram, 25.0);
+    int64_t p50 = hdr_value_at_percentile(histogram, 50.0);
+    int64_t p75 = hdr_value_at_percentile(histogram, 75.0);
+    int64_t p90 = hdr_value_at_percentile(histogram, 90.0);
+    int64_t p95 = hdr_value_at_percentile(histogram, 95.0);
+    int64_t p99 = hdr_value_at_percentile(histogram, 99.0);
+    int64_t p999 = hdr_value_at_percentile(histogram, 99.9);
     int64_t max = hdr_max(histogram);
     printf("Min %ld\n", min);
-    printf("p25 %f p50 %f p75 %f p90 %f p95 %f p99 %f p999 %ld p9999 %ld p99999 %f p999999 %f\n", p25, mean, p75, p90, p95, p99, p999, p9999, p99999, p999999);
-    printf("Max %   ld\n", max);
+    printf("p25 %ld p50 %ld p75 %ld p90 %ld p95 %ld p99 %ld p999 %ld \n", p25, p50, p75, p90, p95, p99, p999);
+    printf("Max %ld\n", max);
 
     uint8_t *buffer = NULL;
     size_t len = 0;
