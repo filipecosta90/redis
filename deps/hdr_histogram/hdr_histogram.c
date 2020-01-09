@@ -998,6 +998,63 @@ static const char CLASSIC_FOOTER[] =
     "#[Max     = %12.3f, Total count    = %12" PRIu64 "]\n"
     "#[Buckets = %12d, SubBuckets     = %12d]\n";
 
+
+int hdr_percentiles_print_prometheus(
+        struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
+        double value_scale, char* metric_name)
+{
+    const char* head_format;
+    int rc = 0;
+    struct hdr_iter iter;
+    struct hdr_iter_percentiles * percentiles;
+
+    hdr_iter_log_init(&iter, h, ticks_per_half_distance,2);
+
+    if (fprintf(
+            stream, "# TYPE %s histogram\n",
+            metric_name) < 0)
+    {
+        rc = EIO;
+        goto cleanup;
+    }
+    percentiles = &iter.specifics.percentiles;
+    while (hdr_iter_next(&iter))
+    {
+        const double  value               = iter.highest_equivalent_value / value_scale;
+        const int64_t total_count         = iter.cumulative_count;
+        // if(total_count < h->total_count){
+             if (fprintf(
+                stream, "%s_bucket{le=\"%0.2f\"} %ld\n", metric_name, value, total_count) < 0)
+        {
+            rc = EIO;
+            goto cleanup;
+        }
+        // }
+       
+
+       
+    }
+
+  if (fprintf(
+                stream, "%s_bucket{le=\"+Inf\"} %ld\n", metric_name, h->total_count) < 0)
+        {
+            rc = EIO;
+            goto cleanup;
+        }
+    if (fprintf(
+            stream, "%s_sum Nan\n%s_count %ld\n",
+            metric_name, metric_name, h->total_count) < 0)
+    {
+        rc = EIO;
+        goto cleanup;
+    }
+
+
+
+    cleanup:
+    return rc;
+}
+
 int hdr_percentiles_print(
         struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
         double value_scale, format_type format)

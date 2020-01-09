@@ -390,6 +390,12 @@ int hdr_percentiles_print(
     struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
     double value_scale, format_type format);
 
+
+
+int hdr_percentiles_print_prometheus(
+        struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
+        double value_scale, char* metric_name);
+
 /**
 * Internal allocation methods, used by hdr_dbl_histogram.
 */
