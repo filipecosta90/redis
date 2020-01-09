@@ -2676,6 +2676,8 @@ void resetServerStats(void) {
     server.stat_net_output_bytes = 0;
     server.aof_delayed_fsync = 0;
     hdr_reset(server.queue_time_histogram);
+    hdr_reset(server.write_time_histogram);
+    hdr_reset(server.read_time_histogram);
 }
 
 void initServer(void) {
@@ -3252,7 +3254,16 @@ void call(client *c, int flags) {
         hdr_record_value(
             real_cmd->histogram,  // Histogram to record to
             (long)duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
-
+        if (real_cmd->flags & CMD_CATEGORY_WRITE) {
+            hdr_record_value(
+                server.write_time_histogram,  // Histogram to record to
+                (long)duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record  
+        }
+        if (real_cmd->flags & CMD_CATEGORY_READ) {
+            hdr_record_value(
+                server.read_time_histogram,  // Histogram to record to
+                (long)duration<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)duration : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record  
+        }
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -3891,6 +3902,37 @@ void bytesToHuman(char *s, unsigned long long n) {
     }
 }
 
+sds printHistogram(sds info, struct hdr_histogram *histogram) {
+    return info = sdscatprintf(info,
+    "calls=%ld,"
+    "avg_usec=%.2f,"
+    "min_usec=%ld,"
+    "q25_usec=%ld,"
+    "q50_usec=%ld,"
+    "q75_usec=%ld,"
+    "q90_usec=%ld,"
+    "q95_usec=%ld,"
+    "q99_usec=%ld,"
+    "q999_usec=%ld,"
+    "q9999_usec=%ld,"
+    "q99999_usec=%ld,"
+    "max_usec=%ld\r\n",
+    histogram->total_count,
+    hdr_mean(histogram),
+    hdr_min(histogram),
+    hdr_value_at_percentile(histogram, 25.0 ),
+    hdr_value_at_percentile(histogram, 50.0 ),
+    hdr_value_at_percentile(histogram, 75.0 ),
+    hdr_value_at_percentile(histogram, 90.0 ),
+    hdr_value_at_percentile(histogram, 95.0 ),
+    hdr_value_at_percentile(histogram, 99.0 ),
+    hdr_value_at_percentile(histogram, 99.9 ),
+    hdr_value_at_percentile(histogram, 99.99 ),
+    hdr_value_at_percentile(histogram, 99.999 ),
+    hdr_max(histogram)
+    );
+}
+
 /* Create the string returned by the INFO command. This is decoupled
  * by the INFO command itself as we need to report the same information
  * on memory corruption problems. */
@@ -4455,44 +4497,20 @@ sds genRedisInfoString(const char *section) {
         while((de = dictNext(di)) != NULL) {
             c = (struct redisCommand *) dictGetVal(de);
             if (!c->calls) continue;
-            if(c->flags & CMD_CATEGORY_READ){
-
-            }
-            if(c->flags & CMD_CATEGORY_WRITE){
-
-            }
-            info = sdscatprintf(info,
-            "extended_cmdstat_%s:"
-            "calls=%lld,"
-            "usec_per_call=%.2f,"
-            "min_usec=%ld,"
-            "q25_usec=%ld,"
-            "q50_usec=%ld,"
-            "q75_usec=%ld,"
-            "q90_usec=%ld,"
-            "q95_usec=%ld,"
-            "q99_usec=%ld,"
-            "q999_usec=%ld,"
-            "q9999_usec=%ld,"
-            "q99999_usec=%ld,"
-            "max_usec=%ld\r\n",
-            c->name, 
-            c->calls,
-            hdr_mean(c->histogram),
-            hdr_min(c->histogram),
-            hdr_value_at_percentile(c->histogram, 25.0 ),
-            hdr_value_at_percentile(c->histogram, 50.0 ),
-            hdr_value_at_percentile(c->histogram, 75.0 ),
-            hdr_value_at_percentile(c->histogram, 90.0 ),
-            hdr_value_at_percentile(c->histogram, 95.0 ),
-            hdr_value_at_percentile(c->histogram, 99.0 ),
-            hdr_value_at_percentile(c->histogram, 99.9 ),
-            hdr_value_at_percentile(c->histogram, 99.99 ),
-            hdr_value_at_percentile(c->histogram, 99.999 ),
-            hdr_max(c->histogram)
-            );
+            info = sdscatprintf(info, "extended_cmdstat_%s:", c->name);
+            info = printHistogram(info, c->histogram);
         }
         dictReleaseIterator(di);
+    }
+
+    /* Extended Command statistics */
+    if (allsections || !strcasecmp(section,"readwritestats")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# ReadWriteCommandstats\r\n");
+        info = sdscatprintf(info, "readstats:");
+        info = printHistogram(info, server.read_time_histogram);
+        info = sdscatprintf(info, "writestats:");
+        info = printHistogram(info, server.write_time_histogram);
     }
 
     /* Queue statistics Exported*/
@@ -4528,35 +4546,7 @@ sds genRedisInfoString(const char *section) {
     if (allsections || !strcasecmp(section,"queuestats")) {
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Queuestats\r\n");
-        info = sdscatprintf(info,
-        "queuestats:"
-        "calls=%ld,"
-        "avg_usec=%.2f,"
-        "min_usec=%ld,"
-        "q25_usec=%ld,"
-        "q50_usec=%ld,"
-        "q75_usec=%ld,"
-        "q90_usec=%ld,"
-        "q95_usec=%ld,"
-        "q99_usec=%ld,"
-        "q999_usec=%ld,"
-        "q9999_usec=%ld,"
-        "q99999_usec=%ld,"
-        "max_usec=%ld\r\n",
-        server.queue_time_histogram->total_count,
-        hdr_mean(server.queue_time_histogram),
-        hdr_min(server.queue_time_histogram),
-        hdr_value_at_percentile(server.queue_time_histogram, 25.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 50.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 75.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 90.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 95.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.0 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.9 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.99 ),
-        hdr_value_at_percentile(server.queue_time_histogram, 99.999 ),
-        hdr_max(server.queue_time_histogram)
-        );
+        info = printHistogram(info, server.queue_time_histogram);
     }
 
     /* Queue statistics Exported*/
@@ -5045,6 +5035,18 @@ int main(int argc, char **argv) {
         CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
         CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
         &server.queue_time_histogram);  // Pointer to initialise
+
+        hdr_init(
+        1,  // Minimum value
+        CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
+        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        &server.write_time_histogram);  // Pointer to initialise
+
+        hdr_init(
+        1,  // Minimum value
+        CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
+        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        &server.read_time_histogram);  // Pointer to initialise
 
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
