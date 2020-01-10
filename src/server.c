@@ -4555,15 +4555,17 @@ sds genRedisInfoString(const char *section) {
     if (allsections || !strcasecmp(section,"queuestats_export")) {
         if (sections++) info = sdscat(info,"\r\n");
         // Print out the values of the histogram
-        sds histogram_sds = hdr_percentiles_sdsprint(
+        sds histogram_sds = hdr_histograms_sdsprint(
             server.queue_time_histogram,
-            stdout,            // File to write to
-            1,                 // Granularity of printed values
+            LINEAR,            // File to write to
+            100,                 // Granularity of printed values
             1.0,               // Multiplier for results
-            "queuestats"); // metric name
+            "queuestats", // metric name
+            "The queue latency from event pool to call"
+            ); 
         info = sdscatprintf(info, "# Queuestats Export\r\n");
         info = sdscatprintf(info,
-        "queuestats_export:%s\r\n",
+        "%s\r\n",
         histogram_sds
         );
     }

@@ -71,15 +71,15 @@ int main()
     int rc = 0;
 
     // Print out the values of the histogram
-    sds mystring = hdr_percentiles_sdsprint(
+    sds hsds = hdr_histograms_sdsprint(
         histogram,
         stdout,            // File to write to
-        1,                 // Granularity of printed values
+        1,                 // Gredis-server --protected-mode no --save "" --appendonly noranularity of printed values
         1.0,               // Multiplier for results
-        "test_histogram"); // metric name
+        "test_histogram", "help"); // metric name
 
-    printf("%s\n", mystring);
-    sdsfree(mystring);
+    printf("%s\n", hsds);
+    sdsfree(hsds);
 
     return 0;
 }
