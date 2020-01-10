@@ -779,6 +779,7 @@ typedef struct client {
                                buffer or object being sent. */
     time_t ctime;           /* Client creation time. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
+    ustime_t lasteventtime; /* Time of the last event start, used for queue statistics */
     time_t obuf_soft_limit_reached_time;
     uint64_t flags;         /* Client flags: CLIENT_* macros. */
     int authenticated;      /* Needed when the default user requires auth. */
@@ -1088,6 +1089,7 @@ struct redisServer {
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
+    long long stat_queueing_delay_total_us; /* Commands overall queueing delay us */
     long long stat_numconnections;  /* Number of connections received */
     long long stat_expiredkeys;     /* Number of expired keys */
     double stat_expired_stale_perc; /* Percentage of keys probably expired */

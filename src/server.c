@@ -2647,6 +2647,7 @@ void resetServerStats(void) {
 
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
+    server.stat_queueing_delay_total_us = 0;
     server.stat_expiredkeys = 0;
     server.stat_expired_stale_perc = 0;
     server.stat_expired_time_cap_reached_count = 0;
@@ -3167,7 +3168,6 @@ void preventCommandReplication(client *c) {
  */
 void call(client *c, int flags) {
     long long dirty;
-    ustime_t start, duration;
     int client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->cmd;
 
@@ -3191,9 +3191,11 @@ void call(client *c, int flags) {
     /* Call the command. */
     dirty = server.dirty;
     updateCachedTime(0);
-    start = server.ustime;
+    const ustime_t start = server.ustime;
     c->cmd->proc(c);
-    duration = ustime()-start;
+    const ustime_t duration = ustime()-start;
+    const ustime_t queue_delay = start - c->lasteventtime;
+    server.stat_queueing_delay_total_us+=queue_delay;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
 
@@ -4400,7 +4402,12 @@ sds genRedisInfoString(const char *section) {
     /* Command statistics */
     if (allsections || !strcasecmp(section,"commandstats")) {
         if (sections++) info = sdscat(info,"\r\n");
-        info = sdscatprintf(info, "# Commandstats\r\n");
+        info = sdscatprintf(info,
+        "# Commandstats\r\n"
+        "queue_delay_stat_overall:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
+        server.stat_numcommands, server.stat_queueing_delay_total_us,
+        (server.stat_numcommands == 0) ? 0 : ((float)server.stat_queueing_delay_total_us/server.stat_numcommands)
+        );
 
         struct redisCommand *c;
         dictEntry *de;
