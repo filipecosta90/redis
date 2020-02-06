@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "sds.h"
 
 struct hdr_histogram
 {
@@ -374,6 +375,15 @@ typedef enum
     CSV
 } format_type;
 
+
+typedef enum
+{
+    LINEAR,
+    LOG2,
+    RECORDED
+
+} hdr_iterator_type;
+
 /**
  * Print out a percentile based histogram to the supplied stream.  Note that
  * this call will not flush the FILE, this is left up to the user.
@@ -389,6 +399,12 @@ typedef enum
 int hdr_percentiles_print(
     struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
     double value_scale, format_type format);
+
+
+
+sds hdr_histograms_sdsprint(
+        struct hdr_histogram* h, hdr_iterator_type itt_type, int32_t ticks_per_half_distance,
+        double value_scale, char* metric_name, char* help );
 
 /**
 * Internal allocation methods, used by hdr_dbl_histogram.

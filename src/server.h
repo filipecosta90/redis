@@ -1406,6 +1406,8 @@ struct redisServer {
     redisTLSContextConfig tls_ctx_config;
 
     struct hdr_histogram* queue_time_histogram;
+    struct hdr_histogram* read_time_histogram;
+    struct hdr_histogram* write_time_histogram;
 };
 
 typedef struct pubsubPattern {

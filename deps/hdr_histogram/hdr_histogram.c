@@ -998,6 +998,45 @@ static const char CLASSIC_FOOTER[] =
     "#[Max     = %12.3f, Total count    = %12" PRIu64 "]\n"
     "#[Buckets = %12d, SubBuckets     = %12d]\n";
 
+// https://github.com/prometheus/docs/blob/master/content/docs/instrumenting/exposition_formats.md#histograms-and-summaries
+sds hdr_histograms_sdsprint(
+        struct hdr_histogram* h, hdr_iterator_type itt_type, int32_t ticks_per_half_distance,
+        double value_scale, char* metric_name, char* help )
+{
+    struct hdr_iter iter;
+    struct hdr_iter_percentiles * percentiles;
+     switch (itt_type)
+    {
+        case LINEAR:
+    hdr_iter_linear_init(&iter, h, ticks_per_half_distance);
+        case LOG2:
+    hdr_iter_log_init(&iter, h, ticks_per_half_distance,2);
+        case RECORDED:
+        default:
+    hdr_iter_recorded_init(&iter, h);
+    }
+
+
+    sds mystring = sdsnew("");
+    
+    mystring = sdscatprintf( mystring, "# HELP %s %s.\n", metric_name, help );
+    mystring = sdscatprintf( mystring, "# TYPE %s histogram\n", metric_name );
+
+    percentiles = &iter.specifics.percentiles;
+    int64_t previous_count = 0;
+    while (hdr_iter_next(&iter))
+    {
+        const double value = iter.highest_equivalent_value / value_scale;
+        const int64_t total_count = iter.cumulative_count - previous_count;
+        previous_count += iter.cumulative_count;
+        mystring = sdscatprintf(mystring, "%s_bucket{le=\"%0.2f\"} %ld\n", metric_name, value, total_count);
+    }
+    mystring = sdscatprintf(mystring, "%s_bucket{le=\"+Inf\"} %ld\n", metric_name,h->total_count - previous_count);
+    mystring = sdscatprintf(mystring, "%s_sum Nan\n%s_count %ld\n", metric_name, metric_name, h->total_count);
+
+    return mystring;
+}
+
 int hdr_percentiles_print(
         struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
         double value_scale, format_type format)
@@ -1055,28 +1094,3 @@ int hdr_percentiles_print(
     cleanup:
     return rc;
 }
-
-// int hdr_percentiles_process(
-//         struct hdr_histogram* h, int32_t ticks_per_half_distance,
-//         int count, 
-//         double value_scale, double** values, double** percentiles, int64_t** total_counts )
-// {
-//     int rc = 0;
-//     struct hdr_iter iter;
-//     struct hdr_iter_percentiles * percentiles;
-//     hdr_iter_percentile_init(&iter, h, ticks_per_half_distance);
-
-//     percentiles = &iter.specifics.percentiles;
-//     while (hdr_iter_next(&iter))
-//     {
-//         double  value               = iter.highest_equivalent_value / value_scale;
-//         double  percentile          = percentiles->percentile / 100.0;
-//         int64_t total_count         = iter.cumulative_count;
-//         double  inverted_percentile = (1.0 / (1.0 - percentile));
-
-        
-//     }
-
-//     cleanup:
-//     return rc;
-// }
