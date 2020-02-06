@@ -2978,6 +2978,9 @@ void populateCommandTable(void) {
         CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
         &c->histogram);  // Pointer to initialise
 
+        // tdigest quantile estimator
+        c->tdigest = tdigestNew(CONFIG_TDIGEST_BUCKETS);
+
         /* Translate the command string flags description into an actual
          * set of flags. */
         if (populateCommandTableParseFlags(c,c->sflags) == C_ERR)
@@ -3003,6 +3006,8 @@ void resetCommandTableStats(void) {
         c->microseconds = 0;
         c->calls = 0;
         hdr_reset(c->histogram);
+        tdigestFree(c->tdigest);
+        c->tdigest = tdigestNew(CONFIG_TDIGEST_BUCKETS);
     }
     dictReleaseIterator(di);
 
@@ -3212,8 +3217,9 @@ void call(client *c, int flags) {
     updateCachedTime(0);
     start = server.ustime;
     c->cmd->proc(c);
+    ustime_t now = ustime();
     duration = ustime()-start;
-    queue_duration = start-c->lasteventtime;
+    ustime_t queue_time = ustime()-c->lasteventtime;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
 
@@ -4538,6 +4544,30 @@ sds genRedisInfoString(const char *section) {
             "TODO"
             );
             
+            info = sdscatprintf(info,
+            "tdigest_extended_cmdstat_%s:"
+            "calls=%lld,"
+            "min_usec=%.f,"
+            "q25_usec=%.f,"
+            "q50_usec=%.f,"
+            "q75_usec=%.f,"
+            "q90_usec=%.f,"
+            "q95_usec=%.f,"
+            "q99_usec=%.f,"
+            "q999_usec=%.f,"
+            "max_usec=%.f\r\n",
+            c->name, 
+            c->calls,
+            tdigestQuantile(c->tdigest, 0.00),
+            tdigestQuantile(c->tdigest, 0.25),
+            tdigestQuantile(c->tdigest, 0.50),
+            tdigestQuantile(c->tdigest, 0.75),
+            tdigestQuantile(c->tdigest, 0.90),
+            tdigestQuantile(c->tdigest, 0.95),
+            tdigestQuantile(c->tdigest, 0.99),
+            tdigestQuantile(c->tdigest, 0.999),
+            tdigestQuantile(c->tdigest, 1.000)
+            );
         }
         dictReleaseIterator(di);
     }

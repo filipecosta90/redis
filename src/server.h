@@ -35,6 +35,7 @@
 #include "solarisfixes.h"
 #include "rio.h"
 #include "hdr_histogram.h"
+#include "tdigest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,11 +117,12 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CONFIG_MIN_RESERVED_FDS 32
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 1000000L          /* 1 secs(us precision) */
 #define CONFIG_LATENCY_HISTOGRAM_PRECISION 4
+#define CONFIG_TDIGEST_BUCKETS 400
 
 #define ACTIVE_EXPIRE_CYCLE_SLOW 0
 #define ACTIVE_EXPIRE_CYCLE_FAST 1
 
-/* Children process will exit with this status code to signal that the
+/* Children process will exit with this status code to signal that the#include "tdigest.h"
  * process terminated without an error: this is useful in order to kill
  * a saving child (RDB or AOF one), without triggering in the parent the
  * write protection that is normally turned on on write errors.
@@ -1436,7 +1438,7 @@ struct redisCommand {
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
     struct hdr_histogram* histogram;
-
+    struct tdigest *tdigest;
 };
 
 struct redisFunctionSym {
