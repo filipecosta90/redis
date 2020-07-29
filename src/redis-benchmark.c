@@ -812,12 +812,12 @@ static void createMissingClients(client c) {
 
 static void showLatencyReport(void) {
 
-    const float reqpersec = (float)config.requests_finished/((float)config.totlatency/1000);
-    const float q0 = ((float) hdr_min(config.latency_histogram))/1000;
-    const float q50 = hdr_value_at_percentile(config.latency_histogram, 50.0 )/1000;
-    const float q95 = hdr_value_at_percentile(config.latency_histogram, 95.0 )/1000;
-    const float q99 = hdr_value_at_percentile(config.latency_histogram, 99.0 )/1000;
-    const float q100 = ((float) hdr_max(config.latency_histogram))/1000;
+    const float reqpersec = (float)config.requests_finished/((float)config.totlatency/1000.0f);
+    const float q0 = ((float) hdr_min(config.latency_histogram))/1000.0f;
+    const float q50 = hdr_value_at_percentile(config.latency_histogram, 50.0 )/1000.0f;
+    const float q95 = hdr_value_at_percentile(config.latency_histogram, 95.0 )/1000.0f;
+    const float q99 = hdr_value_at_percentile(config.latency_histogram, 99.0 )/1000.0f;
+    const float q100 = ((float) hdr_max(config.latency_histogram))/1000.0f;
 
     if (!config.quiet && !config.csv) {
         printf("====== %s ======\n", config.title);
