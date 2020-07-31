@@ -2,7 +2,7 @@ HdrHistogram_c v0.11.0
 
 ----------------------------------------------
 
-This port contains a subset of the 'C' port of High Dynamic Range (HDR) Histogram available at [github.com/HdrHistogram/HdrHistogram_c](https://github.com/HdrHistogram/HdrHistogram_c).
+This port contains a subset of the 'C' version of High Dynamic Range (HDR) Histogram available at [github.com/HdrHistogram/HdrHistogram_c](https://github.com/HdrHistogram/HdrHistogram_c).
 
 
 The code present on `hdr_histogram.c`, `hdr_histogram.h`, and `hdr_atomic.c` was Written by Gil Tene, Michael Barker,

@@ -89,7 +89,6 @@ static struct config {
     int keepalive;
     int pipeline;
     int showerrors;
-    
     long long start;
     long long totlatency;
     long long *latency;
@@ -111,7 +110,6 @@ static struct config {
     int cluster_node_count;
     struct clusterNode **cluster_nodes;
     struct redisConfig *redis_config;
-
     struct hdr_histogram* latency_histogram;
     struct hdr_histogram* current_sec_latency_histogram;
     int is_fetching_slots;
