@@ -13,7 +13,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include "sds.h"
 
 struct hdr_histogram
 {
@@ -400,11 +399,6 @@ int hdr_percentiles_print(
     struct hdr_histogram* h, FILE* stream, int32_t ticks_per_half_distance,
     double value_scale, format_type format);
 
-
-
-sds hdr_histograms_sdsprint(
-        struct hdr_histogram* h, hdr_iterator_type itt_type, int32_t ticks_per_half_distance,
-        double value_scale, char* metric_name, char* help );
 
 /**
 * Internal allocation methods, used by hdr_dbl_histogram.

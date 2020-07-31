@@ -88,6 +88,8 @@ static struct config {
     int keepalive;
     int pipeline;
     int showerrors;
+    int request_rate;
+    
     long long start;
     long long totlatency;
     long long *latency;
@@ -105,6 +107,7 @@ static struct config {
     int precision;
     int num_threads;
     struct benchmarkThread **threads;
+    double per_thread_throughput;
     int cluster_mode;
     int cluster_node_count;
     struct clusterNode **cluster_nodes;
@@ -544,14 +547,13 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 int requests_finished = 0;
                 atomicGetIncr(config.requests_finished, requests_finished, 1);
                 if (requests_finished < config.requests){
-                         hdr_record_value(
+                        hdr_record_value(
                         config.latency_histogram,  // Histogram to record to
                         (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
                         hdr_record_value(
                         config.current_sec_latency_histogram,  // Histogram to record to
                         (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
                 }
-                    // config.latency[requests_finished] = c->latency;
                 c->pending--;
                 if (c->pending == 0) {
                     clientDone(c);
@@ -1393,6 +1395,9 @@ int parseOptions(int argc, const char **argv) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
             config.dbnumstr = sdsfromlonglong(config.dbnum);
+        } else if (!strcmp(argv[i],"-r")) {
+            if (lastarg) goto invalid;
+            config.request_rate = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--precision")) {
             if (lastarg) goto invalid;
             config.precision = atoi(argv[++i]);
@@ -1438,6 +1443,7 @@ usage:
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 100000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
+" -r <rate>          command rate (throughput) in total requests/sec (default unlimited -1) \n"
 " --dbnum <db>       SELECT the specified db number (default 0)\n"
 " --threads <num>    Enable multi-thread mode.\n"
 " --cluster          Enable cluster mode.\n"
@@ -1556,7 +1562,6 @@ int main(int argc, const char **argv) {
     config.csv = 0;
     config.loop = 0;
     config.idlemode = 0;
-    config.latency = NULL;
     config.clients = listCreate();
     config.hostip = "127.0.0.1";
     config.hostport = 6379;
@@ -1565,6 +1570,7 @@ int main(int argc, const char **argv) {
     config.dbnum = 0;
     config.auth = NULL;
     config.precision = 1;
+    config.request_rate = -1;
     config.num_threads = 0;
     config.threads = NULL;
     config.cluster_mode = 0;
@@ -1579,8 +1585,6 @@ int main(int argc, const char **argv) {
     i = parseOptions(argc,argv);
     argc -= i;
     argv += i;
-
-    config.latency = zmalloc(sizeof(long long)*config.requests);
 
     if (config.cluster_mode) {
         /* Fetch cluster configuration. */
@@ -1627,7 +1631,12 @@ int main(int argc, const char **argv) {
         if (config.redis_config == NULL)
             fprintf(stderr, "WARN: could not fetch server CONFIG\n");
     }
-
+    if (config.request_rate > 0){
+        config.per_thread_throughput = (double)config.request_rate;
+        if(config.num_threads > 0){
+            config.per_thread_throughput /= (double)config.num_threads;
+        }
+    }
     if (config.num_threads > 0) {
         pthread_mutex_init(&(config.requests_issued_mutex), NULL);
         pthread_mutex_init(&(config.requests_finished_mutex), NULL);
