@@ -54,13 +54,13 @@
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
-#define MAX_LATENCY_PRECISION 3
+#define DEFAULT_LATENCY_PRECISION 3
+#define MAX_LATENCY_PRECISION 4
 #define MAX_THREADS 500
 #define CLUSTER_SLOTS 16384
 #define CONFIG_LATENCY_HISTOGRAM_MIN_VALUE 10L          /* >= 10 usecs */
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L          /* <= 30 secs(us precision) */
 #define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L   /* <= 3 secs(us precision) */
-#define CONFIG_LATENCY_HISTOGRAM_PRECISION 3
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
@@ -80,6 +80,7 @@ static struct config {
     int requests_issued;
     int requests_finished;
     int previous_requests_finished;
+    int last_printed_bytes;
     long long previous_tick;
     int keysize;
     int datasize;
@@ -88,7 +89,6 @@ static struct config {
     int keepalive;
     int pipeline;
     int showerrors;
-    int request_rate;
     
     long long start;
     long long totlatency;
@@ -107,7 +107,6 @@ static struct config {
     int precision;
     int num_threads;
     struct benchmarkThread **threads;
-    double per_thread_throughput;
     int cluster_mode;
     int cluster_node_count;
     struct clusterNode **cluster_nodes;
@@ -547,12 +546,21 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 int requests_finished = 0;
                 atomicGetIncr(config.requests_finished, requests_finished, 1);
                 if (requests_finished < config.requests){
-                        hdr_record_value(
-                        config.latency_histogram,  // Histogram to record to
-                        (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
-                        hdr_record_value(
-                        config.current_sec_latency_histogram,  // Histogram to record to
-                        (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
+                        if (config.num_threads == 0) {
+                            hdr_record_value(
+                            config.latency_histogram,  // Histogram to record to
+                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
+                            hdr_record_value(
+                            config.current_sec_latency_histogram,  // Histogram to record to
+                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
+                        } else {
+                            hdr_record_value_atomic(
+                            config.latency_histogram,  // Histogram to record to
+                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
+                            hdr_record_value_atomic(
+                            config.current_sec_latency_histogram,  // Histogram to record to
+                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
+                        }
                 }
                 c->pending--;
                 if (c->pending == 0) {
@@ -820,8 +828,10 @@ static void showLatencyReport(void) {
     const float q95 = hdr_value_at_percentile(config.latency_histogram, 95.0 )/1000.0f;
     const float q99 = hdr_value_at_percentile(config.latency_histogram, 99.0 )/1000.0f;
     const float q100 = ((float) hdr_max(config.latency_histogram))/1000.0f;
+    const float avg = hdr_mean(config.latency_histogram)/1000.0f;
 
     if (!config.quiet && !config.csv) {
+        printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
         printf("====== %s ======\n", config.title);
         printf("  %d requests completed in %.2f seconds\n", config.requests_finished,
             (float)config.totlatency/1000);
@@ -863,15 +873,17 @@ static void showLatencyReport(void) {
         {
             const double value = iter.highest_equivalent_value / 1000.0f;
             const double percentile = percentiles->percentile;
-            printf("%3.3f%% <= %.3f milliseconds\n", percentile, value);
+            const long long total_count = iter.cumulative_count;
+            printf("%3.3f%% <= %.3f milliseconds (cumulative count %lld)\n", percentile, value, total_count);
         }
         printf("\n");
         printf("throughput summary: %.2f requests per second\n", reqpersec);
-        printf("latency summary: q0=%.3f msec, q50=%.3f msec, q95=%.3f msec, q99=%.3f msec, q100=%.3f msec\n\n", q0,q50,q95,q99,q100);
+        printf("latency summary: min=%.3f msec, q50=%.3f msec, q95=%.3f msec, q99=%.3f msec, max=%.3f msec, avg=%.3f msec\n\n", q0, q50, q95, q99, q100, avg);
     } else if (config.csv) {
-        printf("\"%s\",\"%.2f\"\n", config.title, reqpersec);
+        printf("\"%s\",\"%.2f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\"\n", config.title, reqpersec, q0, q50, q95, q99, q100, avg);
     } else {
-        printf("%s: %.2f requests per second\n", config.title, reqpersec);    
+        printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
+        printf("%s: %.2f requests per second, q50=%.3f msec\n", config.title, reqpersec, q50);    
     }
 }
 
@@ -905,15 +917,16 @@ static void benchmark(char *title, char *cmd, int len) {
     config.requests_issued = 0;
     config.requests_finished = 0;
     config.previous_requests_finished = 0;
+    config.last_printed_bytes = 0;
     hdr_init(
         CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,  // Minimum value
         CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,  // Maximum value
-        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        config.precision,  // Number of significant figures
         &config.latency_histogram);  // Pointer to initialise
     hdr_init(
         CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,  // Minimum value
         CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE,  // Maximum value
-        CONFIG_LATENCY_HISTOGRAM_PRECISION,  // Number of significant figures
+        config.precision,  // Number of significant figures
         &config.current_sec_latency_histogram);  // Pointer to initialise
 
     if (config.num_threads) initBenchmarkThreads();
@@ -930,6 +943,9 @@ static void benchmark(char *title, char *cmd, int len) {
     showLatencyReport();
     freeAllClients();
     if (config.threads) freeBenchmarkThreads();
+    if (config.current_sec_latency_histogram) hdr_close(config.current_sec_latency_histogram);
+    if (config.latency_histogram) hdr_close(config.latency_histogram);
+
 }
 
 /* Thread functions. */
@@ -1395,13 +1411,10 @@ int parseOptions(int argc, const char **argv) {
             if (lastarg) goto invalid;
             config.dbnum = atoi(argv[++i]);
             config.dbnumstr = sdsfromlonglong(config.dbnum);
-        } else if (!strcmp(argv[i],"-r")) {
-            if (lastarg) goto invalid;
-            config.request_rate = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--precision")) {
             if (lastarg) goto invalid;
             config.precision = atoi(argv[++i]);
-            if (config.precision < 0) config.precision = 0;
+            if (config.precision < 0) config.precision = DEFAULT_LATENCY_PRECISION;
             if (config.precision > MAX_LATENCY_PRECISION) config.precision = MAX_LATENCY_PRECISION;
         } else if (!strcmp(argv[i],"--threads")) {
              if (lastarg) goto invalid;
@@ -1443,7 +1456,6 @@ usage:
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 100000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
-" -r <rate>          command rate (throughput) in total requests/sec (default unlimited -1) \n"
 " --dbnum <db>       SELECT the specified db number (default 0)\n"
 " --threads <num>    Enable multi-thread mode.\n"
 " --cluster          Enable cluster mode.\n"
@@ -1516,9 +1528,9 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
     const float instantaneous_rps = (float)(requests_finished-previous_requests_finished)/instantaneous_dt;
     config.previous_tick = current_tick;
     atomicSet(config.previous_requests_finished,requests_finished);
-    printf("%s: rps=%.1f (overall: %.1f) q50_msec=%.3f (overall: %.3f)\r", config.title, instantaneous_rps, rps, hdr_value_at_percentile(config.current_sec_latency_histogram, 50.0 )/1000.0f, hdr_value_at_percentile(config.latency_histogram, 50.0 )/1000.0f);
-    fflush(stdout);
+    config.last_printed_bytes = printf("%s: rps=%.1f (overall: %.1f) q50_msec=%.3f (overall: %.3f)\r", config.title, instantaneous_rps, rps, hdr_value_at_percentile(config.current_sec_latency_histogram, 50.0 )/1000.0f, hdr_value_at_percentile(config.latency_histogram, 50.0 )/1000.0f);
     hdr_reset(config.current_sec_latency_histogram);
+    fflush(stdout);
     return 250; /* every 250ms */
 }
 
@@ -1569,8 +1581,7 @@ int main(int argc, const char **argv) {
     config.tests = NULL;
     config.dbnum = 0;
     config.auth = NULL;
-    config.precision = 1;
-    config.request_rate = -1;
+    config.precision = DEFAULT_LATENCY_PRECISION;
     config.num_threads = 0;
     config.threads = NULL;
     config.cluster_mode = 0;
@@ -1631,12 +1642,6 @@ int main(int argc, const char **argv) {
         if (config.redis_config == NULL)
             fprintf(stderr, "WARN: could not fetch server CONFIG\n");
     }
-    if (config.request_rate > 0){
-        config.per_thread_throughput = (double)config.request_rate;
-        if(config.num_threads > 0){
-            config.per_thread_throughput /= (double)config.num_threads;
-        }
-    }
     if (config.num_threads > 0) {
         pthread_mutex_init(&(config.requests_issued_mutex), NULL);
         pthread_mutex_init(&(config.requests_finished_mutex), NULL);
@@ -1664,7 +1669,9 @@ int main(int argc, const char **argv) {
         else aeMain(config.el);
         /* and will wait for every */
     }
-
+    if(config.csv){
+        printf("\"test\",\"rps\",\"min_latency_ms\",\"q50_latency_ms\",\"q95_latency_ms\",\"q99_latency_ms\",\"max_latency_ms\",\"avg_latency_ms\"\n");
+    }
     /* Run benchmark with command in the remainder of the arguments. */
     if (argc) {
         sds title = sdsnew(argv[0]);
