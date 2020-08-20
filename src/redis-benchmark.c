@@ -42,6 +42,7 @@
 #include <math.h>
 #include <pthread.h>
 
+#include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
 #include <sds.h> /* Use hiredis sds. */
 #include "ae.h"
 #include "hiredis.h"
@@ -1483,7 +1484,8 @@ usage:
 " --cluster          Enable cluster mode.\n"
 " --enable-tracking  Send CLIENT TRACKING on before starting benchmark.\n"
 " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
-" -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD\n"
+" -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD,\n"
+"                    random members and scores for ZADD.\n"
 "  Using this option the benchmark will expand the string __rand_int__\n"
 "  inside an argument with a 12 digits number in the specified range\n"
 "  from 0 to keyspacelen-1. The substitution changes every time a command\n"
@@ -1780,7 +1782,7 @@ int main(int argc, const char **argv) {
 
         if (test_is_selected("hset")) {
             len = redisFormatCommand(&cmd,
-                "HSET myhash:{tag}:__rand_int__ element:__rand_int__ %s",data);
+                "HSET myhash:{tag} element:__rand_int__ %s",data);
             benchmark("HSET",cmd,len);
             free(cmd);
         }
@@ -1788,6 +1790,21 @@ int main(int argc, const char **argv) {
         if (test_is_selected("spop")) {
             len = redisFormatCommand(&cmd,"SPOP myset:{tag}");
             benchmark("SPOP",cmd,len);
+            free(cmd);
+        }
+
+        if (test_is_selected("zadd")) {
+            char *score = "0";
+            if (config.randomkeys) score = "__rand_int__";
+            len = redisFormatCommand(&cmd,
+                "ZADD myzset:{tag} %s element:__rand_int__",score);
+            benchmark("ZADD",cmd,len);
+            free(cmd);
+        }
+
+        if (test_is_selected("zpopmin")) {
+            len = redisFormatCommand(&cmd,"ZPOPMIN myzset:{tag}");
+            benchmark("ZPOPMIN",cmd,len);
             free(cmd);
         }
 

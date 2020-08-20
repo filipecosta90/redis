@@ -59,8 +59,6 @@ proc exec_instance {type cfgfile} {
 proc spawn_instance {type base_port count {conf {}}} {
     for {set j 0} {$j < $count} {incr j} {
         set port [find_available_port $base_port $::redis_port_count]
-        incr base_port
-        puts "Starting $type #$j at port $port"
 
         # Create a directory for this instance.
         set dirname "${type}_${j}"
@@ -93,12 +91,34 @@ proc spawn_instance {type base_port count {conf {}}} {
         close $cfg
 
         # Finally exec it and remember the pid for later cleanup.
-        set pid [exec_instance $type $cfgfile]
-        lappend ::pids $pid
+        set retry 100
+        while {$retry} {
+            set pid [exec_instance $type $cfgfile]
 
-        # Check availability
+            # Check availability
+            if {[server_is_up 127.0.0.1 $port 100] == 0} {
+                puts "Starting $type #$j at port $port failed, try another"
+                incr retry -1
+                set port [find_available_port $base_port $::redis_port_count]
+                set cfg [open $cfgfile a+]
+                if {$::tls} {
+                    puts $cfg "tls-port $port"
+                } else {
+                    puts $cfg "port $port"
+                }
+                close $cfg
+            } else {
+                puts "Starting $type #$j at port $port"
+                lappend ::pids $pid
+                break
+            }
+        }
+
+        # Check availability finally
         if {[server_is_up 127.0.0.1 $port 100] == 0} {
-            abort_sentinel_test "Problems starting $type #$j: ping timeout"
+            set logfile [file join $dirname log.txt]
+            puts [exec tail $logfile]
+            abort_sentinel_test "Problems starting $type #$j: ping timeout, maybe server start failed, check $logfile"
         }
 
         # Push the instance into the right list
@@ -475,12 +495,12 @@ proc kill_instance {type id} {
 
     # Wait for the port it was using to be available again, so that's not
     # an issue to start a new server ASAP with the same port.
-    set retry 10
+    set retry 100
     while {[incr retry -1]} {
-        set port_is_free [catch {set s [socket 127.0.01 $port]}]
+        set port_is_free [catch {set s [socket 127.0.0.1 $port]}]
         if {$port_is_free} break
         catch {close $s}
-        after 1000
+        after 100
     }
     if {$retry == 0} {
         error "Port $port does not return available after killing instance."
@@ -507,7 +527,9 @@ proc restart_instance {type id} {
 
     # Check that the instance is running
     if {[server_is_up 127.0.0.1 $port 100] == 0} {
-        abort_sentinel_test "Problems starting $type #$id: ping timeout"
+        set logfile [file join $dirname log.txt]
+        puts [exec tail $logfile]
+        abort_sentinel_test "Problems starting $type #$id: ping timeout, maybe server start failed, check $logfile"
     }
 
     # Connect with it with a fresh link
