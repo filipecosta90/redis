@@ -1126,6 +1126,37 @@ mstime_t mstime(void) {
     return ustime()/1000;
 }
 
+/* Return resource usage measures for who, which can be one
+of the following:
+
+RUSAGE_SELF
+        Return resource usage statistics for the calling process,
+        which is the sum of resources used by all threads in the
+        process.
+
+RUSAGE_CHILDREN
+        Return resource usage statistics for all children of the
+        calling process that have terminated and been waited for.
+        These statistics will include the resources used by
+        grandchildren, and further removed descendants, if all of the
+        intervening descendants waited on their terminated children.
+
+RUSAGE_THREAD (since Linux 2.6.26)
+        Return resource usage statistics for the calling thread.  The
+        _GNU_SOURCE feature test macro must be defined (before
+        including any header file) in order to obtain the definition
+        of this constant from <sys/resource.h>.
+*/
+long long getrusage_ustime(int who) {
+    struct rusage ru;
+    long long rusage_st;
+    getrusage(who,&ru);
+    rusage_st = ((long long) ru.ru_utime.tv_sec ) + ((long long) ru.ru_stime.tv_sec )*1000000;
+    rusage_st += ru.ru_stime.tv_usec;
+    rusage_st += ru.ru_utime.tv_usec;
+    return rusage_st;
+}
+
 /* After an RDB dump or AOF rewrite we exit from children using _exit() instead of
  * exit(), because the latter may interact with the same file objects used by
  * the parent process. However if we are testing the coverage normal exit() is
@@ -1856,6 +1887,37 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * handler if we don't return here fast enough. */
     if (server.watchdog_period) watchdogScheduleSignal(server.watchdog_period);
 
+    /* Resource usage watchdog: deliver the SIGALRM that will reach the 
+     * signal handler if we are using CPU above a certain threshold */
+    if (server.watchdog_rusage_self_cpu_enabled){
+        const long long current_rusage_ustime = getrusage_ustime(RUSAGE_SELF);
+        const time_t current_ustime = ustime();
+        const long long cpu_time = current_rusage_ustime - server.watchdog_previous_rusage_ustime;
+        double wall_time = current_ustime - server.watchdog_previous_ustime;
+        server.watchdog_previous_rusage_ustime = current_rusage_ustime;
+        server.watchdog_previous_ustime = current_ustime;
+        const double percentage = (double)cpu_time / (double)wall_time * 100.0;
+        if(percentage>=server.watchdog_rusage_self_cpu_min_percentage){
+            // serverLog(LL_WARNING,"CPU percentage %f signal:%s",percentage, server.watchdog_rusage_period > 0 ? "yes" : "no");
+            // Enabling watchdog on CPU
+            // sample cpu at the ~49HZ
+            if (!server.watchdog_rusage_period){
+                server.watchdog_rusage_period = 21;
+                enableWatchdog(server.watchdog_rusage_period);
+            }
+            if (server.watchdog_rusage_period && server.watchdog_rusage_schedulled == 0) {
+                watchdogScheduleSignal(server.watchdog_rusage_period); 
+            }
+        } else {
+            // Disable the watchdog if we are not using resources above threshold
+            if (server.watchdog_rusage_period){
+                disableWatchdog();
+                server.watchdog_rusage_period = 0;
+                server.watchdog_rusage_schedulled = 0;
+            }
+        }
+    }
+        
     /* Update the time cache. */
     updateCachedTime(1);
 
@@ -2443,6 +2505,11 @@ void initServerConfig(void) {
     server.assert_line = 0;
     server.bug_report_start = 0;
     server.watchdog_period = 0;
+    server.watchdog_previous_rusage_ustime = 0;
+    server.watchdog_previous_ustime = 0;
+    server.watchdog_rusage_self_cpu_stream_name = NULL;
+    server.watchdog_rusage_period = 0;
+    server.watchdog_rusage_schedulled = 0;
 
     /* By default we want scripts to be always replicated by effects
      * (single commands executed by the script), and not by sending the
@@ -2726,6 +2793,10 @@ void resetServerStats(void) {
     server.stat_sync_full = 0;
     server.stat_sync_partial_ok = 0;
     server.stat_sync_partial_err = 0;
+    server.stat_io_reads_processed = 0;
+    server.stat_total_reads_processed = 0;
+    server.stat_io_writes_processed = 0;
+    server.stat_total_writes_processed = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
         server.inst_metric[j].idx = 0;
         server.inst_metric[j].last_sample_time = mstime();
@@ -4071,7 +4142,8 @@ sds genRedisInfoString(const char *section) {
             "configured_hz:%i\r\n"
             "lru_clock:%u\r\n"
             "executable:%s\r\n"
-            "config_file:%s\r\n",
+            "config_file:%s\r\n"
+            "io_threads_active:%d\r\n",
             REDIS_VERSION,
             redisGitSHA1(),
             strtol(redisGitDirty(),NULL,10) > 0,
@@ -4095,7 +4167,8 @@ sds genRedisInfoString(const char *section) {
             server.config_hz,
             server.lruclock,
             server.executable ? server.executable : "",
-            server.configfile ? server.configfile : "");
+            server.configfile ? server.configfile : "",
+            server.io_threads_active);
     }
 
     /* Clients */
@@ -4367,7 +4440,11 @@ sds genRedisInfoString(const char *section) {
             "tracking_total_keys:%lld\r\n"
             "tracking_total_items:%lld\r\n"
             "tracking_total_prefixes:%lld\r\n"
-            "unexpected_error_replies:%lld\r\n",
+            "unexpected_error_replies:%lld\r\n"
+            "total_reads_processed:%lld\r\n"
+            "total_writes_processed:%lld\r\n"
+            "io_threaded_reads_processed:%lld\r\n"
+            "io_threaded_writes_processed:%lld\r\n",
             server.stat_numconnections,
             server.stat_numcommands,
             getInstantaneousMetric(STATS_METRIC_COMMAND),
@@ -4398,7 +4475,11 @@ sds genRedisInfoString(const char *section) {
             (unsigned long long) trackingGetTotalKeys(),
             (unsigned long long) trackingGetTotalItems(),
             (unsigned long long) trackingGetTotalPrefixes(),
-            server.stat_unexpected_error_replies);
+            server.stat_unexpected_error_replies,
+            server.stat_total_reads_processed,
+            server.stat_total_writes_processed,
+            server.stat_io_reads_processed,
+            server.stat_io_writes_processed);
     }
 
     /* Replication */

@@ -1669,6 +1669,7 @@ void serverLogHexDump(int level, char *descr, void *value, size_t len) {
 #include <sys/time.h>
 
 void watchdogSignalHandler(int sig, siginfo_t *info, void *secret) {
+    server.watchdog_rusage_schedulled = 0;
 #ifdef HAVE_BACKTRACE
     ucontext_t *uc = (ucontext_t*) secret;
 #else

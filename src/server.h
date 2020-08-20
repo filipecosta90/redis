@@ -1108,6 +1108,7 @@ struct redisServer {
                                    queries. Will still serve RESP2 queries. */
     int io_threads_num;         /* Number of IO threads to use. */
     int io_threads_do_reads;    /* Read and parse from IO threads? */
+    int io_threads_active;      /* Is IO threads currently active? */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
 
     /* RDB / AOF loading information */
@@ -1157,6 +1158,10 @@ struct redisServer {
     size_t stat_module_cow_bytes;   /* Copy on write bytes during module fork. */
     uint64_t stat_clients_type_memory[CLIENT_TYPE_COUNT];/* Mem usage by type */
     long long stat_unexpected_error_replies; /* Number of unexpected (aof-loading, replica to master, etc.) error replies */
+    long long stat_io_reads_processed; /* Number of read events processed by IO / Main threads */
+    long long stat_io_writes_processed; /* Number of write events processed by IO / Main threads */
+    _Atomic long long stat_total_reads_processed; /* Total number of read events processed */
+    _Atomic long long stat_total_writes_processed; /* Total number of write events processed */
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {
@@ -1439,6 +1444,14 @@ struct redisServer {
     int assert_line;
     int bug_report_start; /* True if bug report header was already logged. */
     int watchdog_period;  /* Software watchdog period in ms. 0 = off */
+    int watchdog_rusage_self_cpu_enabled;
+    double watchdog_rusage_self_cpu_min_percentage;
+    long long watchdog_previous_rusage_ustime;
+    time_t watchdog_previous_ustime;
+    sds watchdog_rusage_self_cpu_stream_name;
+    long long watchdog_rusage_self_cpu_stream_size;
+    int watchdog_rusage_period;
+    int watchdog_rusage_schedulled;
     /* System hardware info */
     size_t system_memory_size;  /* Total memory in system as reported by OS */
     /* TLS Configuration */

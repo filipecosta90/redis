@@ -732,6 +732,32 @@ void configSetCommand(client *c) {
 
         if (flags == -1) goto badfmt;
         server.notify_keyspace_events = flags;
+    } config_set_special_field("watchdog-rusage-self-cpu") {
+        int vlen;
+        sds *v = sdssplitlen(o->ptr,sdslen(o->ptr)," ",1,&vlen);
+        /* We need a vlen of 1 or 4: <enabled> <percentage> <name of stream to store stack traces> <max samples to store>*/
+        if (vlen != 4 && vlen !=1) {
+            sdsfreesplitres(v,vlen);
+            goto badfmt;
+        }
+        const int enabled = yesnotoi(v[0]);
+        if (vlen > 1){
+            const double min_percentage = strtof(v[1],NULL);
+            if (min_percentage >= 0.0 && min_percentage <= 100.0){
+                server.watchdog_rusage_self_cpu_enabled = enabled;
+                server.watchdog_rusage_self_cpu_min_percentage = min_percentage;
+                server.watchdog_rusage_self_cpu_stream_name = strdup(v[2]);
+                server.watchdog_rusage_self_cpu_stream_size = strtol(v[3],NULL,10);
+            } else {
+                goto badfmt;
+            }   
+        } else {
+            if (enabled){
+                addReplyErrorFormat(c,"watchdog-rusage-self-cpu requires 4 arguments for enabling it.");
+                return;
+            }
+            server.watchdog_rusage_self_cpu_enabled = 0;
+        }
     /* Numerical fields.
      * config_set_numerical_field(name,var,min,max) */
     } config_set_numerical_field(
@@ -919,6 +945,18 @@ void configGetCommand(client *c) {
         } else {
             addReplyBulkCString(c,"");
         }
+        matches++;
+    }
+     if (stringmatch(pattern,"watchdog-rusage-self-cpu",1)) {
+        sds buf = sdsempty();
+        buf = sdscatprintf(buf,"%s %.2f %s %lld",
+                    server.watchdog_rusage_self_cpu_enabled ? "yes" : "no",
+                    server.watchdog_rusage_self_cpu_min_percentage,
+                    server.watchdog_rusage_self_cpu_stream_name,
+                    server.watchdog_rusage_self_cpu_stream_size);
+        addReplyBulkCString(c,"watchdog-rusage-self-cpu");
+        addReplyBulkCString(c,buf);
+        sdsfree(buf);
         matches++;
     }
 
