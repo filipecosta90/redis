@@ -53,8 +53,10 @@ int cliSecureConnection(redisContext *c, cliSSLconfig config, const char **err) 
             *err = "Failed to create SSL_CTX";
             goto error;
         }
-        SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+        SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1);
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_max_proto_version(ssl_ctx,TLS1_2_VERSION);
+        SSL_CTX_set_min_proto_version(ssl_ctx,TLS1_2_VERSION);
 
         if (config.cacert || config.cacertdir) {
             if (!SSL_CTX_load_verify_locations(ssl_ctx, config.cacert, config.cacertdir)) {
