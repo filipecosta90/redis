@@ -33,7 +33,8 @@ jobs:
         terraform init
         terraform apply --auto-approve -var 'github_actor=${{ github.actor }}' \
                                        -var 'github_repo=${{ github.repository }}' \
-                                       -var 'github_sha=${{ github.sha }}'
+                                       -var 'github_sha=${{ github.sha }}' \
+                                       -var 'setup_name=oss-redis-standalone-small-${{ github.sha }}'
 
     - name: Tear down testing-infrastructure
       run: |
