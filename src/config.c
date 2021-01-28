@@ -2385,6 +2385,7 @@ standardConfig configs[] = {
     createBoolConfig("lazyfree-lazy-expire", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_expire, 0, NULL, NULL),
     createBoolConfig("lazyfree-lazy-server-del", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_server_del, 0, NULL, NULL),
     createBoolConfig("lazyfree-lazy-user-del", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_user_del , 0, NULL, NULL),
+    createBoolConfig("lazyfree-lazy-user-flush", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_user_flush , 0, NULL, NULL),
     createBoolConfig("repl-disable-tcp-nodelay", NULL, MODIFIABLE_CONFIG, server.repl_disable_tcp_nodelay, 0, NULL, NULL),
     createBoolConfig("repl-diskless-sync", NULL, MODIFIABLE_CONFIG, server.repl_diskless_sync, 0, NULL, NULL),
     createBoolConfig("gopher-enabled", NULL, MODIFIABLE_CONFIG, server.gopher_enabled, 0, NULL, NULL),
@@ -2424,6 +2425,7 @@ standardConfig configs[] = {
     createStringConfig("bio_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bio_cpulist, NULL, NULL, NULL),
     createStringConfig("aof_rewrite_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.aof_rewrite_cpulist, NULL, NULL, NULL),
     createStringConfig("bgsave_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bgsave_cpulist, NULL, NULL, NULL),
+    createStringConfig("ignore-warnings", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.ignore_warnings, "", NULL, NULL),
 
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
@@ -2546,12 +2548,17 @@ void configCommand(client *c) {
 
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
-"GET <pattern> -- Return parameters matching the glob-like <pattern> and their values.",
-"SET <parameter> <value> -- Set parameter to value.",
-"RESETSTAT -- Reset statistics reported by INFO.",
-"REWRITE -- Rewrite the configuration file.",
+"GET <pattern>",
+"    Return parameters matching the glob-like <pattern> and their values.",
+"SET <directive> <value>",
+"    Set the configuration <directive> to <value>.",
+"RESETSTAT",
+"    Reset statistics reported by the INFO command.",
+"REWRITE",
+"    Rewrite the configuration file.",
 NULL
         };
+
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"set") && c->argc == 4) {
         configSetCommand(c);
@@ -2560,6 +2567,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"resetstat") && c->argc == 2) {
         resetServerStats();
         resetCommandTableStats();
+        resetErrorTableStats();
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"rewrite") && c->argc == 2) {
         if (server.configfile == NULL) {
