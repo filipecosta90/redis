@@ -191,6 +191,20 @@ struct redisServer server; /* Server global state */
  *    specific data structures, such as: DEL, RENAME, MOVE, SELECT,
  *    TYPE, EXPIRE*, PEXPIRE*, TTL, PTTL, ...
  */
+struct redisLatencyHistogram latencyHistogramsTable[] = {
+    {"read",0,NULL},
+    {"write",0,NULL},
+    {"set",0,NULL},
+    {"sortedset",0,NULL},
+    {"list",0,NULL},
+    {"hash",0,NULL},
+    {"string",0,NULL},
+    {"bitmap",0,NULL},
+    {"hyperloglog",0,NULL},
+    {"stream",0,NULL},
+    {"pubsub",0,NULL},
+    {"geo",0,NULL},
+};
 
 struct redisCommand redisCommandTable[] = {
     {"module",moduleCommand,-2,
@@ -2605,6 +2619,15 @@ void createSharedObjects(void) {
     shared.maxstring = sdsnew("maxstring");
 }
 
+void initLatencyHistograms(void) {
+    int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
+    for (int j = 0; j < numhistograms; j++) {
+        struct redisLatencyHistogram *h = latencyHistogramsTable+j;
+        h->flag = ACLGetCommandCategoryFlagByName(h->category_name);
+        hdr_init(LATENCY_HISTOGRAM_MIN_VALUE,LATENCY_HISTOGRAM_MAX_VALUE,3,&(h->histogram));
+    }
+}
+
 void initServerConfig(void) {
     int j;
 
@@ -2709,6 +2732,7 @@ void initServerConfig(void) {
     R_NegInf = -1.0/R_Zero;
     R_Nan = R_Zero/R_Zero;
 
+    initLatencyHistograms();
     /* Command table -- we initialize it here as it is part of the
      * initial configuration, since command names may be changed via
      * redis.conf using the rename-command directive. */
@@ -3378,12 +3402,13 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
     return C_OK;
 }
 
+
 /* Populates the Redis Command Table starting from the hard coded list
  * we have on top of server.c file. */
 void populateCommandTable(void) {
     int j;
     int numcommands = sizeof(redisCommandTable)/sizeof(struct redisCommand);
-
+    const int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
     for (j = 0; j < numcommands; j++) {
         struct redisCommand *c = redisCommandTable+j;
         int retval1, retval2;
@@ -3394,6 +3419,22 @@ void populateCommandTable(void) {
             serverPanic("Unsupported command flag");
 
         c->id = ACLGetCommandID(c->name); /* Assign the ID used for ACL. */
+
+        c->latency_histograms = NULL; /* Assing the latency histograms
+                                        that this command belong to*/
+        c->num_latency_histograms = 0;
+        for (int j = 0; j < numhistograms; j++) {
+            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
+            if (c->flags & h->flag){
+                if(c->num_latency_histograms==0){
+                    c->latency_histograms = (struct hdr_histogram**)zmalloc(sizeof(struct hdr_histogram*));
+                } else {
+                    c->latency_histograms = (struct hdr_histogram**)zrealloc(c->latency_histograms,(c->num_latency_histograms+1)*sizeof(struct hdr_histogram*));
+                }
+                c->latency_histograms[c->num_latency_histograms] = h->histogram;
+                c->num_latency_histograms++;
+            }
+        }
         retval1 = dictAdd(server.commands, sdsnew(c->name), c);
         /* Populate an additional dictionary that will be unaffected
          * by rename-command statements in redis.conf. */
@@ -3706,6 +3747,14 @@ void call(client *c, int flags) {
          * EXPIRE, GEOADD, etc. */
         real_cmd->microseconds += duration;
         real_cmd->calls++;
+        int64_t duration_hist = duration;
+        if(duration_hist<LATENCY_HISTOGRAM_MIN_VALUE)
+            duration_hist=LATENCY_HISTOGRAM_MIN_VALUE;
+        if(duration_hist>LATENCY_HISTOGRAM_MAX_VALUE)
+            duration_hist=LATENCY_HISTOGRAM_MAX_VALUE;
+        for (size_t j = 0; j < real_cmd->num_latency_histograms; j++) {
+            hdr_record_value(real_cmd->latency_histograms[j],duration_hist);
+        }
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -4479,6 +4528,51 @@ void bytesToHuman(char *s, unsigned long long n) {
     }
 }
 
+
+/* An array of time buckets, each representing a latency range,
+ * between 1 microsecond and roughly 1 second.
+ * Each bucket covers twice the previous bucket’s range.
+ * Empty buckets are not printed.
+ * Everything above 1sec is considered +Inf. */
+sds fillCumulativeDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram){
+    info = sdscatprintf(info, "latencystat_hist_%s:calls=%ld,histogram=[",
+        histogram_name, histogram->total_count);
+    struct hdr_iter iter;
+    hdr_iter_log_init(&iter, histogram, 2,2);
+    size_t bucket_pos = 0;
+    int64_t previous_count = 0;
+    while (hdr_iter_next(&iter))
+    {
+        const int64_t micros = iter.highest_equivalent_value;
+        const int64_t cumulative_count = iter.cumulative_count;
+        if(cumulative_count > previous_count){
+            if (bucket_pos>0)
+                info = sdscatprintf(info,";");
+            info = sdscatprintf(info,"(%ld:%ld)",micros, cumulative_count);
+            bucket_pos++;
+        }
+        previous_count = cumulative_count;
+
+    }
+    info = sdscatprintf(info,"]\r\n");
+    return info;
+}
+
+/* Fill percentile distribution of latencies. */
+sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram){
+    info = sdscatprintf(info, "latencystat_percentiles_%s:p0=%.3f,p50=%.3f,p75=%.3f,p90=%.3f,p95=%.3f,p99=%.3f,p999=%.3f,p100=%.3f\r\n",
+        histogram_name,
+        ((double)hdr_min(histogram))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,50.0))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,75.0))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,90.0))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,95.0))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,99.0))/1.0f,
+        ((double)hdr_value_at_percentile(histogram,99.9))/1.0f,
+        ((double)hdr_max(histogram))/1.0f);
+    return info;
+}
+
 /* Create the string returned by the INFO command. This is decoupled
  * by the INFO command itself as we need to report the same information
  * on memory corruption problems. */
@@ -5131,6 +5225,29 @@ sds genRedisInfoString(const char *section) {
                 (int)ri.key_len, ri.key, e->count);
         }
         raxStop(&ri);
+    }
+
+    if (allsections || !strcasecmp(section,"latencystats")) {
+        /* Latency by percentile distribution per command category */
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Latencystats - latency by percentile distribution\r\n");
+        int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
+        for (int j = 0; j < numhistograms; j++) {
+            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
+            if (!h->histogram->total_count)
+                continue;
+            info = fillPercentileDistributionLatencies(info,h->category_name,h->histogram);
+        }
+
+        /* Per command category cumulative distribution of latencies */
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Latencystats - cumulative distribution of latencies\r\n");
+        for (int j = 0; j < numhistograms; j++) {
+            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
+            if (!h->histogram->total_count)
+                continue;
+            info = fillCumulativeDistributionLatencies(info,h->category_name,h->histogram);
+        }
     }
 
     /* Cluster */

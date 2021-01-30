@@ -50,6 +50,7 @@
 #include <sys/socket.h>
 #include <lua.h>
 #include <signal.h>
+#include "hdr_histogram.h"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -489,6 +490,10 @@ typedef enum {
 #define serverAssertWithInfo(_c,_o,_e) ((_e)?(void)0 : (_serverAssertWithInfo(_c,_o,#_e,__FILE__,__LINE__),redis_unreachable()))
 #define serverAssert(_e) ((_e)?(void)0 : (_serverAssert(#_e,__FILE__,__LINE__),redis_unreachable()))
 #define serverPanic(...) _serverPanic(__FILE__,__LINE__,__VA_ARGS__),redis_unreachable()
+
+/* latency histogram number of categories */
+#define LATENCY_HISTOGRAM_MIN_VALUE 1L        /* >= 1 usecs */
+#define LATENCY_HISTOGRAM_MAX_VALUE 1000000L  /* <= 1 secs */
 
 /*-----------------------------------------------------------------------------
  * Data types
@@ -1616,6 +1621,13 @@ typedef struct {
 
 typedef void redisCommandProc(client *c);
 typedef int redisGetKeysProc(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
+
+struct redisLatencyHistogram {
+    char *category_name;
+    uint64_t flag;
+    struct hdr_histogram *histogram;
+};
+
 struct redisCommand {
     char *name;
     redisCommandProc *proc;
@@ -1635,6 +1647,8 @@ struct redisCommand {
                    ACLs. A connection is able to execute a given command if
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
+    struct hdr_histogram** latency_histograms; /*points to the latency command categories histograms */
+    size_t num_latency_histograms;
 };
 
 struct redisError {
