@@ -4535,7 +4535,7 @@ void bytesToHuman(char *s, unsigned long long n) {
  * Empty buckets are not printed.
  * Everything above 1sec is considered +Inf. */
 sds fillCumulativeDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram){
-    info = sdscatprintf(info, "latencystat_hist_%s:calls=%ld,histogram=[",
+    info = sdscatprintf(info, "latencyhist_%s:calls=%ld,histogram=[",
         histogram_name, histogram->total_count);
     struct hdr_iter iter;
     hdr_iter_log_init(&iter, histogram, 2,2);
@@ -4560,7 +4560,7 @@ sds fillCumulativeDistributionLatencies(sds info, const char* histogram_name, st
 
 /* Fill percentile distribution of latencies. */
 sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram){
-    info = sdscatprintf(info, "latencystat_percentiles_%s:p0=%.3f,p50=%.3f,p75=%.3f,p90=%.3f,p95=%.3f,p99=%.3f,p999=%.3f,p100=%.3f\r\n",
+    info = sdscatprintf(info, "latencypercentiles_%s:p0=%.3f,p50=%.3f,p75=%.3f,p90=%.3f,p95=%.3f,p99=%.3f,p999=%.3f,p100=%.3f\r\n",
         histogram_name,
         ((double)hdr_min(histogram))/1.0f,
         ((double)hdr_value_at_percentile(histogram,50.0))/1.0f,
