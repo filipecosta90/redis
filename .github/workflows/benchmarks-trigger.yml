@@ -12,12 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Get git vars
-        id: get_git_vars
-        run: |
-            git_hash=$(git rev-parse --short "$GITHUB_SHA")
-            git_branch=${GITHUB_REF#refs/heads/}
-            echo "::set-output name=git_hash::$git_hash"
-            echo "::set-output name=git_branch::$git_branch"
+      id: get_git_vars
+      run: |
+          git_hash=$(git rev-parse --short "$GITHUB_SHA")
+          git_branch=${GITHUB_REF#refs/heads/}
+          echo "::set-output name=git_hash::$git_hash"
+          echo "::set-output name=git_branch::$git_branch"
 
     - name: Trigger redis/redis
       id: api_trigger
