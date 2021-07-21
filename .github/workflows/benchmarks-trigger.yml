@@ -11,6 +11,8 @@ jobs:
   deployment:
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v2
+
     - name: Get git vars
       id: get_git_vars
       run: |
@@ -19,7 +21,7 @@ jobs:
           echo "::set-output name=git_hash::$git_hash"
           echo "::set-output name=git_branch::$git_branch"
 
-    - name: Trigger redis/redis
+    - name: Trigger api/gh/redis/redis/commits
       id: api_trigger
       uses: fjogeleit/http-request-action@master
       with:
