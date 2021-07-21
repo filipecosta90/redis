@@ -29,7 +29,7 @@ jobs:
         method: 'POST'
         username: ${{ secrets.BENCHMARKS_API_GH_USER }}
         password: ${{ secrets.BENCHMARKS_API_GH_PASSWORD }}
-        data: '{"git_hash": ${{steps.get_git_vars.outputs.git_hash}}, "git_branch": ${{steps.get_git_vars.outputs.git_branch}} }'
+        data: '{"git_hash": "${{steps.get_git_vars.outputs.git_hash}}", "git_branch": "${{steps.get_git_vars.outputs.git_branch}}" }'
     
     - name: Show Response
       run: echo ${{ steps.api_trigger.outputs.response }}
