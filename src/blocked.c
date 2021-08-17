@@ -111,9 +111,7 @@ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us){
         duration_hist=LATENCY_HISTOGRAM_MIN_VALUE;
     if(duration_hist>LATENCY_HISTOGRAM_MAX_VALUE)
         duration_hist=LATENCY_HISTOGRAM_MAX_VALUE;
-    for (size_t j = 0; j < c->lastcmd->num_latency_histograms; j++) {
-        hdr_record_value(c->lastcmd->latency_histograms[j],duration_hist);
-    }
+    hdr_record_value(c->lastcmd->latency_histogram,duration_hist);
     /* Log the command into the Slow log if needed. */
     if (!(c->lastcmd->flags & CMD_SKIP_SLOWLOG)) {
         slowlogPushEntryIfNeeded(c,c->argv,c->argc,total_cmd_duration);

@@ -21,6 +21,12 @@
  * with other types of time.*/
 typedef uint64_t monotime;
 
+/* A counter in nano-seconds.  The 'monotime' type is provided for variables
+ * holding a monotonic time.  This will help distinguish & document that the
+ * variable is associated with the monotonic clock and should not be confused
+ * with other types of time.*/
+typedef uint64_t monotime_nano;
+
 /* Retrieve counter of micro-seconds relative to an arbitrary point in time.  */
 extern monotime (*getMonotonicUs)(void);
 
@@ -43,6 +49,14 @@ static inline void elapsedStart(monotime *start_time) {
 
 static inline uint64_t elapsedUs(monotime start_time) {
     return getMonotonicUs() - start_time;
+}
+
+static inline void elapsedStartNs(monotime_nano *start_time) {
+    *start_time = getMonotonicUs()*1000;
+}
+
+static inline uint64_t elapsedNs(monotime_nano start_time) {
+    return getMonotonicUs()*1000 - start_time;
 }
 
 static inline uint64_t elapsedMs(monotime start_time) {

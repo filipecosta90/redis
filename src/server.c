@@ -191,20 +191,6 @@ struct redisServer server; /* Server global state */
  *    specific data structures, such as: DEL, RENAME, MOVE, SELECT,
  *    TYPE, EXPIRE*, PEXPIRE*, TTL, PTTL, ...
  */
-struct redisLatencyHistogram latencyHistogramsTable[] = {
-    {"read",0,NULL},
-    {"write",0,NULL},
-    {"set",0,NULL},
-    {"sortedset",0,NULL},
-    {"list",0,NULL},
-    {"hash",0,NULL},
-    {"string",0,NULL},
-    {"bitmap",0,NULL},
-    {"hyperloglog",0,NULL},
-    {"stream",0,NULL},
-    {"pubsub",0,NULL},
-    {"geo",0,NULL},
-};
 
 struct redisCommand redisCommandTable[] = {
     {"module",moduleCommand,-2,
@@ -2619,15 +2605,6 @@ void createSharedObjects(void) {
     shared.maxstring = sdsnew("maxstring");
 }
 
-void initLatencyHistograms(void) {
-    int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
-    for (int j = 0; j < numhistograms; j++) {
-        struct redisLatencyHistogram *h = latencyHistogramsTable+j;
-        h->flag = ACLGetCommandCategoryFlagByName(h->category_name);
-        hdr_init(LATENCY_HISTOGRAM_MIN_VALUE,LATENCY_HISTOGRAM_MAX_VALUE,3,&(h->histogram));
-    }
-}
-
 void initServerConfig(void) {
     int j;
 
@@ -2732,7 +2709,6 @@ void initServerConfig(void) {
     R_NegInf = -1.0/R_Zero;
     R_Nan = R_Zero/R_Zero;
 
-    initLatencyHistograms();
     /* Command table -- we initialize it here as it is part of the
      * initial configuration, since command names may be changed via
      * redis.conf using the rename-command directive. */
@@ -3408,7 +3384,6 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
 void populateCommandTable(void) {
     int j;
     int numcommands = sizeof(redisCommandTable)/sizeof(struct redisCommand);
-    const int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
     for (j = 0; j < numcommands; j++) {
         struct redisCommand *c = redisCommandTable+j;
         int retval1, retval2;
@@ -3420,21 +3395,8 @@ void populateCommandTable(void) {
 
         c->id = ACLGetCommandID(c->name); /* Assign the ID used for ACL. */
 
-        c->latency_histograms = NULL; /* Assing the latency histograms
-                                        that this command belong to*/
-        c->num_latency_histograms = 0;
-        for (int j = 0; j < numhistograms; j++) {
-            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
-            if (c->flags & h->flag){
-                if(c->num_latency_histograms==0){
-                    c->latency_histograms = (struct hdr_histogram**)zmalloc(sizeof(struct hdr_histogram*));
-                } else {
-                    c->latency_histograms = (struct hdr_histogram**)zrealloc(c->latency_histograms,(c->num_latency_histograms+1)*sizeof(struct hdr_histogram*));
-                }
-                c->latency_histograms[c->num_latency_histograms] = h->histogram;
-                c->num_latency_histograms++;
-            }
-        }
+        hdr_init(LATENCY_HISTOGRAM_MIN_VALUE,LATENCY_HISTOGRAM_MAX_VALUE,3,&(c->latency_histogram));
+
         retval1 = dictAdd(server.commands, sdsnew(c->name), c);
         /* Populate an additional dictionary that will be unaffected
          * by rename-command statements in redis.conf. */
@@ -3455,6 +3417,7 @@ void resetCommandTableStats(void) {
         c->calls = 0;
         c->rejected_calls = 0;
         c->failed_calls = 0;
+        hdr_reset(c->latency_histogram);
     }
     dictReleaseIterator(di);
 
@@ -3661,7 +3624,7 @@ void preventCommandReplication(client *c) {
  */
 void call(client *c, int flags) {
     long long dirty;
-    monotime call_timer;
+    monotime_nano call_timer;
     int client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->cmd;
     static long long prev_err_count;
@@ -3687,9 +3650,9 @@ void call(client *c, int flags) {
     dirty = server.dirty;
     prev_err_count = server.stat_total_error_replies;
     updateCachedTime(0);
-    elapsedStart(&call_timer);
+    elapsedStartNs(&call_timer);
     c->cmd->proc(c);
-    const long duration = elapsedUs(call_timer);
+    const long duration = elapsedNs(call_timer);
     c->duration = duration;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
@@ -3745,16 +3708,14 @@ void call(client *c, int flags) {
         /* use the real command that was executed (cmd and lastamc) may be
          * different, in case of MULTI-EXEC or re-written commands such as
          * EXPIRE, GEOADD, etc. */
-        real_cmd->microseconds += duration;
+        real_cmd->microseconds += (duration/1000);
         real_cmd->calls++;
         int64_t duration_hist = duration;
         if(duration_hist<LATENCY_HISTOGRAM_MIN_VALUE)
             duration_hist=LATENCY_HISTOGRAM_MIN_VALUE;
         if(duration_hist>LATENCY_HISTOGRAM_MAX_VALUE)
             duration_hist=LATENCY_HISTOGRAM_MAX_VALUE;
-        for (size_t j = 0; j < real_cmd->num_latency_histograms; j++) {
-            hdr_record_value(real_cmd->latency_histograms[j],duration_hist);
-        }
+        hdr_record_value(real_cmd->latency_histogram,duration_hist);
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -4530,7 +4491,7 @@ void bytesToHuman(char *s, unsigned long long n) {
 
 
 /* An array of time buckets, each representing a latency range,
- * between 1 microsecond and roughly 1 second.
+ * between 10 nanosecond and roughly 1 second.
  * Each bucket covers twice the previous bucket’s range.
  * Empty buckets are not printed.
  * Everything above 1sec is considered +Inf. */
@@ -4538,23 +4499,23 @@ sds fillCumulativeDistributionLatencies(sds info, const char* histogram_name, st
     info = sdscatprintf(info, "latencyhist_%s:calls=%ld,histogram=[",
         histogram_name, histogram->total_count);
     struct hdr_iter iter;
-    hdr_iter_log_init(&iter, histogram, 2,2);
+    hdr_iter_log_init(&iter, histogram, 128,2);
     size_t bucket_pos = 0;
     int64_t previous_count = 0;
     while (hdr_iter_next(&iter))
     {
-        const int64_t micros = iter.highest_equivalent_value;
+        const int64_t nanos = iter.highest_equivalent_value;
         const int64_t cumulative_count = iter.cumulative_count;
         if(cumulative_count > previous_count){
             if (bucket_pos>0)
                 info = sdscatprintf(info,";");
-            info = sdscatprintf(info,"(%ld:%ld)",micros, cumulative_count);
+            info = sdscatprintf(info,"(le %ld:%ld)",nanos, cumulative_count);
             bucket_pos++;
         }
         previous_count = cumulative_count;
 
     }
-    info = sdscatprintf(info,"]\r\n");
+    info = sdscatprintf(info,";(le +Inf:%ld)]\r\n", histogram->total_count);
     return info;
 }
 
@@ -5228,26 +5189,32 @@ sds genRedisInfoString(const char *section) {
     }
 
     if (allsections || !strcasecmp(section,"latencystats")) {
-        /* Latency by percentile distribution per command category */
+        /* Latency by percentile distribution per command */
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Latencystats - latency by percentile distribution\r\n");
-        int numhistograms = sizeof(latencyHistogramsTable)/sizeof(struct redisLatencyHistogram);
-        for (int j = 0; j < numhistograms; j++) {
-            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
-            if (!h->histogram->total_count)
+        struct redisCommand *c;
+        dictEntry *de;
+        dictIterator *di;
+        di = dictGetSafeIterator(server.commands);
+        while((de = dictNext(di)) != NULL) {
+            c = (struct redisCommand *) dictGetVal(de);
+            if (!c->latency_histogram->total_count)
                 continue;
-            info = fillPercentileDistributionLatencies(info,h->category_name,h->histogram);
+            info = fillPercentileDistributionLatencies(info,c->name,c->latency_histogram);
         }
+        dictReleaseIterator(di);
 
         /* Per command category cumulative distribution of latencies */
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Latencystats - cumulative distribution of latencies\r\n");
-        for (int j = 0; j < numhistograms; j++) {
-            struct redisLatencyHistogram *h = latencyHistogramsTable+j;
-            if (!h->histogram->total_count)
+        di = dictGetSafeIterator(server.commands);
+        while((de = dictNext(di)) != NULL) {
+            c = (struct redisCommand *) dictGetVal(de);
+            if (!c->latency_histogram->total_count)
                 continue;
-            info = fillCumulativeDistributionLatencies(info,h->category_name,h->histogram);
+            info = fillCumulativeDistributionLatencies(info,c->name,c->latency_histogram);
         }
+        dictReleaseIterator(di);
     }
 
     /* Cluster */

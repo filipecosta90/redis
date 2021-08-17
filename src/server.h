@@ -492,8 +492,8 @@ typedef enum {
 #define serverPanic(...) _serverPanic(__FILE__,__LINE__,__VA_ARGS__),redis_unreachable()
 
 /* latency histogram number of categories */
-#define LATENCY_HISTOGRAM_MIN_VALUE 1L        /* >= 1 usecs */
-#define LATENCY_HISTOGRAM_MAX_VALUE 1000000L  /* <= 1 secs */
+#define LATENCY_HISTOGRAM_MIN_VALUE 10L        /* >= 10 nanosecs */
+#define LATENCY_HISTOGRAM_MAX_VALUE 1000000000L  /* <= 1 secs */
 
 /*-----------------------------------------------------------------------------
  * Data types
@@ -1647,8 +1647,7 @@ struct redisCommand {
                    ACLs. A connection is able to execute a given command if
                    the user associated to the connection has this command
                    bit set in the bitmap of allowed commands. */
-    struct hdr_histogram** latency_histograms; /*points to the latency command categories histograms */
-    size_t num_latency_histograms;
+    struct hdr_histogram* latency_histogram; /*points to the latency histogram */
 };
 
 struct redisError {
