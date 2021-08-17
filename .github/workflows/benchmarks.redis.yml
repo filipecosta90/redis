@@ -2,10 +2,6 @@ name: "benchmarks.redis"
 
 on:
   push:
-  pull_request:
-  schedule:
-    # run daily
-    - cron: '* 0 * * 0'
 
 jobs:
   analyze:
