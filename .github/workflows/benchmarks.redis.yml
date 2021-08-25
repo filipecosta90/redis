@@ -1,0 +1,28 @@
+name: "Trigger Redis benchmarks"
+
+on:
+  push:
+
+jobs:
+  analyze:
+    name: Trigger Redis benchmarks
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository 
+      uses: actions/checkout@v2
+
+    - name: Extract branch name and commit hash
+      shell: bash
+      run: |
+        echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
+        echo "##[set-output name=git_hash;]$(echo ${GITHUB_SHA})"
+      id: extract_git_info
+
+    - name: Send HTTP Request to benchmarks api 
+      uses: satak/webrequest-action@master
+      with:
+        url: http://benchmarks.redislabs.com:15000/api/gh/redis/redis/commits
+        method: POST
+        payload: '{"git_branch": "${{ steps.extract_git_info.outputs.branch }}", "git_hash":"${{ steps.extract_git_info.outputs.git_hash }}"}'
+        username: ${{ secrets.BENCH_API_AUTH_UN }}
+        password: ${{ secrets.BENCH_API_AUTH_PW }}
