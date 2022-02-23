@@ -3134,7 +3134,7 @@ void zrangeGenericCommandLegacy(client *c, int reverse) {
     rangelen = (end-start)+1;
 
     /* Return the result in form of a multi-bulk reply */
-    addReplyMultiBulkLen(c, withscores ? (rangelen*2) : rangelen);
+    addReplyArrayLen(c, withscores ? (rangelen*2) : rangelen);
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
