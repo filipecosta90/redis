@@ -3095,6 +3095,108 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     handler->finalizeResultEmission(handler, result_cardinality);
 }
 
+
+void zrangeGenericCommandLegacy(client *c, int reverse) {
+    robj *key = c->argv[1];
+    robj *zobj;
+    int withscores = 0;
+    long start;
+    long end;
+    long llen;
+    long rangelen;
+
+    if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != C_OK) ||
+        (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != C_OK)) return;
+
+    if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
+        withscores = 1;
+    } else if (c->argc >= 5) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+    if ((zobj = lookupKeyReadOrReply(c,key,shared.emptybulk)) == NULL
+         || checkType(c,zobj,OBJ_ZSET)) return;
+
+    /* Sanitize indexes. */
+    llen = zsetLength(zobj);
+    if (start < 0) start = llen+start;
+    if (end < 0) end = llen+end;
+    if (start < 0) start = 0;
+
+    /* Invariant: start >= 0, so this test will be true when end < 0.
+     * The range is empty when start > end or start >= length. */
+    if (start > end || start >= llen) {
+        addReply(c,shared.emptybulk);
+        return;
+    }
+    if (end >= llen) end = llen-1;
+    rangelen = (end-start)+1;
+
+    /* Return the result in form of a multi-bulk reply */
+    addReplyMultiBulkLen(c, withscores ? (rangelen*2) : rangelen);
+
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr, *sptr;
+        unsigned char *vstr;
+        unsigned int vlen;
+        long long vlong;
+        if (reverse)
+            eptr = lpSeek(zl,-2-(2*start));
+        else
+            eptr = lpSeek(zl,2*start);
+
+        serverAssertWithInfo(c,zobj,eptr != NULL);
+        sptr = lpNext(zl,eptr);
+
+        while (rangelen--) {
+            serverAssertWithInfo(c,zobj,eptr != NULL && sptr != NULL);
+            vstr = lpGetValue(eptr,&vlen,&vlong);
+            if (vstr == NULL)
+                addReplyBulkLongLong(c,vlong);
+            else
+                addReplyBulkCBuffer(c,vstr,vlen);
+
+            if (withscores)
+                addReplyDouble(c,zzlGetScore(sptr));
+
+            if (reverse)
+                zzlPrev(zl,&eptr,&sptr);
+            else
+                zzlNext(zl,&eptr,&sptr);
+        }
+
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = zobj->ptr;
+        zskiplist *zsl = zs->zsl;
+        zskiplistNode *ln;
+        sds ele;
+
+        /* Check if starting point is trivial, before doing log(N) lookup. */
+        if (reverse) {
+            ln = zsl->tail;
+            if (start > 0)
+                ln = zslGetElementByRank(zsl,llen-start);
+        } else {
+            ln = zsl->header->level[0].forward;
+            if (start > 0)
+                ln = zslGetElementByRank(zsl,start+1);
+        }
+
+        while(rangelen--) {
+            serverAssertWithInfo(c,zobj,ln != NULL);
+            ele = ln->ele;
+            addReplyBulkCBuffer(c,ele,sdslen(ele));
+            if (withscores)
+                addReplyDouble(c,ln->score);
+            ln = reverse ? ln->backward : ln->level[0].forward;
+        }
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+}
+
 /* ZRANGESTORE <dst> <src> <min> <max> [BYSCORE | BYLEX] [REV] [LIMIT offset count] */
 void zrangestoreCommand (client *c) {
     robj *dstkey = c->argv[1];
@@ -3113,9 +3215,7 @@ void zrangeCommand(client *c) {
 
 /* ZREVRANGE <key> <start> <stop> [WITHSCORES] */
 void zrevrangeCommand(client *c) {
-    zrange_result_handler handler;
-    zrangeResultHandlerInit(&handler, c, ZRANGE_CONSUMER_TYPE_CLIENT);
-    zrangeGenericCommand(&handler, 1, 0, ZRANGE_RANK, ZRANGE_DIRECTION_REVERSE);
+    zrangeGenericCommandLegacy(c,1);
 }
 
 /* This command implements ZRANGEBYSCORE, ZREVRANGEBYSCORE. */
