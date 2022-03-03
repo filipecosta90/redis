@@ -47,6 +47,7 @@
 #include "util.h"
 #include "sha256.h"
 #include "config.h"
+#include "fast_float.h"
 
 /* Glob-style pattern matching. */
 int stringmatchlen(const char *pattern, int patternLen,
@@ -540,8 +541,7 @@ int string2ld(const char *s, size_t slen, long double *dp) {
  * representing the number are accepted. */
 int string2d(const char *s, size_t slen, double *dp) {
     errno = 0;
-    char *eptr;
-    *dp = strtod(s, &eptr);
+    const char* eptr = fast_double_parser_c_parse_number(s, dp);
     if (slen == 0 ||
         isspace(((const char*)s)[0]) ||
         (size_t)(eptr-(char*)s) != slen ||

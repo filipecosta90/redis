@@ -40,6 +40,7 @@ distclean:
 	-(cd lua && $(MAKE) clean) > /dev/null || true
 	-(cd jemalloc && [ -f Makefile ] && $(MAKE) distclean) > /dev/null || true
 	-(cd hdr_histogram && $(MAKE) clean) > /dev/null || true
+	-(cd fast_float && $(MAKE) clean) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -65,6 +66,12 @@ hdr_histogram: .make-prerequisites
 	cd hdr_histogram && $(MAKE)
 
 .PHONY: hdr_histogram
+
+fast_float: .make-prerequisites
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	cd fast_float && $(MAKE)
+
+.PHONY: fast_float
 
 ifeq ($(uname_S),SunOS)
 	# Make isinf() available
