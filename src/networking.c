@@ -3706,10 +3706,9 @@ int getClientType(client *c) {
  * on each call we've added this simplification for the common case class of client check.
  */
 int isClientTypeSlave(client *c) {
-    const uint64_t flags = c->flags;
     /* Even though MONITOR clients are marked as replicas, we
      * want the expose them as normal clients. */
-    if (unlikely((flags & CLIENT_SLAVE) && !(flags & CLIENT_MONITOR)))
+    if (unlikely((c->flags & CLIENT_SLAVE)) && !unlikely((c->flags & CLIENT_MONITOR)))
         return 1;
     return 0;
 }
