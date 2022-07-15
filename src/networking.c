@@ -3702,14 +3702,14 @@ int getClientType(client *c) {
 }
 
 
-/* Given CLIENT_TYPE_SLAVE checks are very common, and getClientType costs around 2% of CPU cycles on each call
- * we've added this simplification for the common case class of client.
+/* Given CLIENT_TYPE_SLAVE checks are very common, and getClientType costs around 2% of CPU cycles
+ * on each call we've added this simplification for the common case class of client check.
  */
 int isClientTypeSlave(client *c) {
     const uint64_t flags = c->flags;
     /* Even though MONITOR clients are marked as replicas, we
      * want the expose them as normal clients. */
-    if (unlikely((flags & CLIENT_SLAVE)) && !unlikely((flags & CLIENT_MONITOR)))
+    if (unlikely((flags & CLIENT_SLAVE) && !(flags & CLIENT_MONITOR)))
         return 1;
     return 0;
 }
