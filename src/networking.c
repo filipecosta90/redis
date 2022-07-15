@@ -38,6 +38,7 @@
 
 static void setProtocolError(const char *errstr, client *c);
 int postponeClientRead(client *c);
+int isClientTypeSlave(client *c);
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 
 /* Return the size consumed from the allocator, for the specified SDS string,
@@ -385,7 +386,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
      * replication link that caused a reply to be generated we'll simply disconnect it.
      * Note this is the simplest way to check a command added a response. Replication links are used to write data but
      * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
@@ -702,7 +703,7 @@ void *addReplyDeferredLen(client *c) {
      * replication link that caused a reply to be generated we'll simply disconnect it.
      * Note this is the simplest way to check a command added a response. Replication links are used to write data but
      * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
@@ -1170,7 +1171,7 @@ void copyReplicaOutputBuffer(client *dst, client *src) {
 /* Return true if the specified client has pending reply buffers to write to
  * the socket. */
 int clientHasPendingReplies(client *c) {
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         /* Replicas use global shared replication buffer instead of
          * private output buffer. */
         serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
@@ -1594,7 +1595,7 @@ void freeClient(client *c) {
     }
 
     /* Log link disconnection with slave */
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         serverLog(LL_WARNING,"Connection with replica %s lost.",
             replicationGetSlaveName(c));
     }
@@ -1662,7 +1663,7 @@ void freeClient(client *c) {
         /* We need to remember the time when we started to have zero
          * attached slaves, as after some time we'll free the replication
          * backlog. */
-        if (getClientType(c) == CLIENT_TYPE_SLAVE && listLength(server.slaves) == 0)
+        if (isClientTypeSlave(c) && listLength(server.slaves) == 0)
             server.repl_no_slaves_since = server.unixtime;
         refreshGoodSlavesCount();
         /* Fire the replica change modules event. */
@@ -1867,7 +1868,7 @@ static int _writevToClient(client *c, ssize_t *nwritten) {
  * to client. */
 int _writeToClient(client *c, ssize_t *nwritten) {
     *nwritten = 0;
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
 
         replBufBlock *o = listNodeValue(c->ref_repl_buf_node);
@@ -1954,7 +1955,7 @@ int writeToClient(client *c, int handler_installed) {
             !(c->flags & CLIENT_SLAVE)) break;
     }
 
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         atomicIncr(server.stat_net_repl_output_bytes, totwritten);
     } else {
         atomicIncr(server.stat_net_output_bytes, totwritten);
@@ -2150,7 +2151,7 @@ int processInlineBuffer(client *c) {
     /* Newline from slaves can be used to refresh the last ACK time.
      * This is useful for a slave to ping back while loading a big
      * RDB file. */
-    if (querylen == 0 && getClientType(c) == CLIENT_TYPE_SLAVE)
+    if (querylen == 0 && isClientTypeSlave(c))
         c->repl_ack_time = server.unixtime;
 
     /* Masters should never send us inline protocol to run actual
@@ -3634,7 +3635,7 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
  * the caller wishes. The main usage of this function currently is
  * enforcing the client output length limits. */
 size_t getClientOutputBufferMemoryUsage(client *c) {
-    if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+    if (isClientTypeSlave(c)) {
         size_t repl_buf_size = 0;
         size_t repl_node_num = 0;
         size_t repl_node_size = sizeof(listNode) + sizeof(replBufBlock);
@@ -3688,13 +3689,29 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
  * CLIENT_TYPE_MASTER -> The client representing our replication master.
  */
 int getClientType(client *c) {
-    if (c->flags & CLIENT_MASTER) return CLIENT_TYPE_MASTER;
+    const uint64_t flags = c->flags;
+    if (unlikely((flags & CLIENT_MASTER)))
+        return CLIENT_TYPE_MASTER;
     /* Even though MONITOR clients are marked as replicas, we
      * want the expose them as normal clients. */
-    if ((c->flags & CLIENT_SLAVE) && !(c->flags & CLIENT_MONITOR))
+    if (unlikely((flags & CLIENT_SLAVE)) && !unlikely((flags & CLIENT_MONITOR)))
         return CLIENT_TYPE_SLAVE;
-    if (c->flags & CLIENT_PUBSUB) return CLIENT_TYPE_PUBSUB;
+    if (unlikely((flags & CLIENT_PUBSUB)))
+        return CLIENT_TYPE_PUBSUB;
     return CLIENT_TYPE_NORMAL;
+}
+
+
+/* Given CLIENT_TYPE_SLAVE checks are very common, and getClientType costs around 2% of CPU cycles on each call
+ * we've added this simplification for the common case class of client.
+ */
+int isClientTypeSlave(client *c) {
+    const uint64_t flags = c->flags;
+    /* Even though MONITOR clients are marked as replicas, we
+     * want the expose them as normal clients. */
+    if (unlikely((flags & CLIENT_SLAVE)) && !unlikely((flags & CLIENT_MONITOR)))
+        return 1;
+    return 0;
 }
 
 int getClientTypeByName(char *name) {
@@ -4208,7 +4225,7 @@ int handleClientsWithPendingWritesUsingThreads(void) {
          * buffer, to guarantee data accessing thread safe, we must put all
          * replicas client into io_threads_list[0] i.e. main thread handles
          * sending the output buffer of all replicas. */
-        if (getClientType(c) == CLIENT_TYPE_SLAVE) {
+        if (isClientTypeSlave(c)) {
             listAddNodeTail(io_threads_list[0],c);
             continue;
         }
