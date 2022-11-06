@@ -28,6 +28,10 @@ start_server {tags {"modules"}} {
             assert_equal 3.141 [r rw.double 3.141]
         }
 
+        test "RESP$proto: RM_ReplyWithDouble: a nan" {
+            assert_equal nan [r rw.double nan]
+        }
+
         set ld 0.00000000000000001
         test "RESP$proto: RM_ReplyWithLongDouble: a float reply" {
             if {$proto == 2} {

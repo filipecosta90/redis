@@ -840,7 +840,13 @@ void setDeferredPushLen(client *c, void *node, long length) {
 
 /* Add a double as a bulk reply */
 void addReplyDouble(client *c, double d) {
-    if (isinf(d)) {
+    if (isnan(d)) {
+        if (c->resp == 2) {
+            addReplyBulkCString(c, "nan");
+        } else {
+            addReplyProto(c, ",nan\r\n", 6);
+        }
+    } else if (isinf(d)) {
         /* Libc in odd systems (Hi Solaris!) will format infinite in a
          * different way, so better to handle it in an explicit way. */
         if (c->resp == 2) {
