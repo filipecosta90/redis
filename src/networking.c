@@ -434,6 +434,18 @@ void addReplySds(client *c, sds s) {
     sdsfree(s);
 }
 
+/* Add the SDS 's' string to the client output buffer. Avoids calling sdslen given the len is passes as parameter.
+ * As a side effect the SDS string is freed. */
+void addReplySdsWithLen(client *c, sds s, size_t len) {
+    if (prepareClientToWrite(c) != C_OK) {
+        /* The caller expects the sds to be free'd. */
+        sdsfree(s);
+        return;
+    }
+    _addReplyToBufferOrList(c,s,len);
+    sdsfree(s);
+}
+
 /* This low level function just adds whatever protocol you send it to the
  * client buffer, trying the static buffer initially, and using the string
  * of objects if not possible.
@@ -1034,8 +1046,9 @@ void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
 
 /* Add sds to reply (takes ownership of sds and frees it) */
 void addReplyBulkSds(client *c, sds s)  {
-    addReplyLongLongWithPrefix(c,sdslen(s),'$');
-    addReplySds(c,s);
+    const size_t len = sdslen(s);
+    addReplyLongLongWithPrefix(c,len,'$');
+    addReplySdsWithLen(c,s,len);
     addReplyProto(c,"\r\n",2);
 }
 
