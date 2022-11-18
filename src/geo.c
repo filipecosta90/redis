@@ -786,7 +786,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
              * itself. */
             if (option_length)
                 addReplyArrayLen(c, option_length + 1);
-            addReplyProto(c,gp->member,gp->memberlen);
+            addReplyBulkCBuffer(c,gp->member,gp->memberlen);
             sdsfree(gp->member);
             gp->member = NULL;
 
