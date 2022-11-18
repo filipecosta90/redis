@@ -277,8 +277,13 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
                 gp->longitude = xy[0];
                 gp->latitude = xy[1];
                 gp->dist = distance;
-                gp->member = (vstr == NULL) ? sdsfromlonglong(vlong) :
-                         sdsnewlen(vstr,vlen);
+                char buf[21];
+                if (vstr == NULL){
+                    vlen = sdsll2str(buf,vlong);
+                    vstr = (unsigned char *)&(buf[0]);
+                }
+                gp->member = sdsnewlen(vstr,vlen);
+                gp->memberlen = vlen;
                 gp->score = score;
             }
             if (ga->used && limit && ga->used >= limit) break;
@@ -307,7 +312,9 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
                 gp->longitude = xy[0];
                 gp->latitude = xy[1];
                 gp->dist = distance;
-                gp->member = sdsdup(ln->ele);
+                const size_t memberlen = sdslen(ln->ele);
+                gp->member = sdsnewlen(ln->ele,memberlen);
+                gp->memberlen = memberlen;
                 gp->score = ln->score;
             }
             if (ga->used && limit && ga->used >= limit) break;
@@ -779,8 +786,8 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
              * itself. */
             if (option_length)
                 addReplyArrayLen(c, option_length + 1);
-
-            addReplyBulkSds(c,gp->member);
+            addReplyProto(c,gp->member,gp->memberlen);
+            sdsfree(gp->member);
             gp->member = NULL;
 
             if (withdist)

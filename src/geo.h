@@ -10,6 +10,7 @@ typedef struct geoPoint {
     double latitude;
     double dist;
     double score;
+    size_t memberlen;
     char *member;
 } geoPoint;
 
