@@ -496,7 +496,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             }
             // Ensure parsing overhead is taken into account
             c->latency = ustime()-(c->start);
-            printf("Updating latency %ld\n",c->latency);
+            // printf("Updating latency %ld\n",c->latency);
             if (reply != NULL) {
                 if (reply == (void*)REDIS_REPLY_ERROR) {
                     fprintf(stderr,"Unexpected error reply, exiting...\n");
@@ -579,7 +579,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
                 c->pending--;
                 if (c->pending == 0) {
-                    printf("client done\n");
+                    // printf("client done\n");
                     clientDone(c);
                     break;
                 }
