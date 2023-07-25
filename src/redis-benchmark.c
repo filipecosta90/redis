@@ -483,10 +483,6 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
-
-    /* Calculate latency only for the first read event. This means that the
-     * server already sent the reply and we need to parse it. Parsing overhead
-     * is not part of the latency, so calculate it only once, here. */
     if (c->latency < 0) c->latency = ustime()-(c->start);
 
     if (redisBufferRead(c->context) != REDIS_OK) {
@@ -498,6 +494,9 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 fprintf(stderr,"Error: %s\n",c->context->errstr);
                 exit(1);
             }
+            // Ensure parsing overhead is taken into account
+            c->latency = ustime()-(c->start);
+            printf("Updating latency %ld\n",c->latency);
             if (reply != NULL) {
                 if (reply == (void*)REDIS_REPLY_ERROR) {
                     fprintf(stderr,"Unexpected error reply, exiting...\n");
@@ -580,6 +579,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
                 c->pending--;
                 if (c->pending == 0) {
+                    printf("client done\n");
                     clientDone(c);
                     break;
                 }
