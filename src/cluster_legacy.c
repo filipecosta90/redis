@@ -6459,6 +6459,10 @@ int isClusterHealthy(void) {
     return server.cluster->state == CLUSTER_OK;
 }
 
+int getClusterMastersSize(void) {
+    return server.cluster->size;
+}
+
 clusterNode *getNodeBySlot(int slot) {
     return server.cluster->slots[slot];
 }

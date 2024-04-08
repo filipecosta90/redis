@@ -983,6 +983,10 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     if (server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)
         return myself;
 
+    /* If there is only one node and all slots are set then return myself. */
+    if (getClusterMastersSize() == 1 && isClusterHealthy())
+        return myself;
+
     /* Set error code optimistically for the base case. */
     if (error_code) *error_code = CLUSTER_REDIR_NONE;
 

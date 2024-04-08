@@ -52,6 +52,7 @@ void clusterPropagatePublish(robj *channel, robj *message, int sharded);
 
 unsigned long getClusterConnectionsCount(void);
 int isClusterHealthy(void);
+int getClusterMastersSize(void);
 
 sds clusterGenNodesDescription(client *c, int filter, int tls_primary);
 sds genClusterInfoString(void);
