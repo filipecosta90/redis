@@ -79,7 +79,7 @@ struct redisServer server; /* Server global state */
 
 /* Cache for ustime and monotonic timestamp */
 static long long cached_ustime = 0;
-static long long cached_monotonic_us = 0;
+static monotime cached_monotonic_us = 0;
 
 /*============================ Internal prototypes ========================== */
 
