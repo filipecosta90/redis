@@ -2363,7 +2363,7 @@ int processMultibulkBuffer(client *c) {
         serverAssertWithInfo(c,NULL,c->argc == 0);
 
         /* Multi bulk length cannot be read without a \r\n */
-        newline = strchr(c->querybuf+c->qb_pos,'\r');
+        newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len);
         if (newline == NULL) {
             if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                 addReplyError(c,"Protocol error: too big mbulk count string");
@@ -2407,7 +2407,7 @@ int processMultibulkBuffer(client *c) {
     while(c->multibulklen) {
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
-            newline = strchr(c->querybuf+c->qb_pos,'\r');
+            newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len);
             if (newline == NULL) {
                 if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                     addReplyError(c,
@@ -2462,8 +2462,8 @@ int processMultibulkBuffer(client *c) {
                     c->qb_pos = 0;
                     /* Hint the sds library about the amount of bytes this string is
                      * going to contain. */
-                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf,ll+2-querybuf_len);
-                    querybuf_len = sdslen(c->querybuf);
+                    querybuf_len = ll+2-sdslen(c->querybuf);
+                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf,querybuf_len);
                     /* We later set the peak to the used portion of the buffer, but here we over
                      * allocated because we know what we need, make sure it'll not be shrunk before used. */
                     if (c->querybuf_peak < (size_t)ll + 2) c->querybuf_peak = ll + 2;
