@@ -2356,6 +2356,7 @@ int processMultibulkBuffer(client *c) {
     char *newline = NULL;
     int ok;
     long long ll;
+    const int non_master_client = !(c->flags & CLIENT_MASTER);
     size_t querybuf_len = sdslen(c->querybuf);
 
     if (c->multibulklen == 0) {
@@ -2364,7 +2365,7 @@ int processMultibulkBuffer(client *c) {
 
         /* Multi bulk length cannot be read without a \r\n */
         newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len);
-        if (newline == NULL) {
+        if (unlikely(newline == NULL)) {
             if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                 addReplyError(c,"Protocol error: too big mbulk count string");
                 setProtocolError("too big mbulk count string",c);
@@ -2408,7 +2409,7 @@ int processMultibulkBuffer(client *c) {
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
             newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len);
-            if (newline == NULL) {
+            if (unlikely(newline == NULL)) {
                 if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                     addReplyError(c,
                         "Protocol error: too big bulk count string");
@@ -2422,7 +2423,7 @@ int processMultibulkBuffer(client *c) {
             if (newline-(c->querybuf+c->qb_pos) > (ssize_t)(querybuf_len-c->qb_pos-2))
                 break;
 
-            if (c->querybuf[c->qb_pos] != '$') {
+            if (unlikely((c->querybuf[c->qb_pos] != '$'))) {
                 addReplyErrorFormat(c,
                     "Protocol error: expected '$', got '%c'",
                     c->querybuf[c->qb_pos]);
@@ -2431,19 +2432,19 @@ int processMultibulkBuffer(client *c) {
             }
 
             ok = string2ll(c->querybuf+c->qb_pos+1,newline-(c->querybuf+c->qb_pos+1),&ll);
-            if (!ok || ll < 0 ||
-                (!(c->flags & CLIENT_MASTER) && ll > server.proto_max_bulk_len)) {
+            if (unlikely(!ok || ll < 0 ||
+                (non_master_client && ll > server.proto_max_bulk_len))) {
                 addReplyError(c,"Protocol error: invalid bulk length");
                 setProtocolError("invalid bulk length",c);
                 return C_ERR;
-            } else if (ll > 16384 && authRequired(c)) {
+            } else if (unlikely(ll > 16384 && authRequired(c))) {
                 addReplyError(c, "Protocol error: unauthenticated bulk length");
                 setProtocolError("unauth bulk length", c);
                 return C_ERR;
             }
 
             c->qb_pos = newline-c->querybuf+2;
-            if (!(c->flags & CLIENT_MASTER) && ll >= PROTO_MBULK_BIG_ARG) {
+            if (unlikely(non_master_client && ll >= PROTO_MBULK_BIG_ARG)) {
                 /* When the client is not a master client (because master
                  * client's querybuf can only be trimmed after data applied
                  * and sent to replicas).
@@ -2486,10 +2487,10 @@ int processMultibulkBuffer(client *c) {
             /* Optimization: if a non-master client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */
-            if (!(c->flags & CLIENT_MASTER) &&
+            if (unlikely(non_master_client &&
                 c->qb_pos == 0 &&
                 c->bulklen >= PROTO_MBULK_BIG_ARG &&
-                querybuf_len == (size_t)(c->bulklen+2))
+                querybuf_len == (size_t)(c->bulklen+2)))
             {
                 c->argv[c->argc++] = createObject(OBJ_STRING,c->querybuf);
                 c->argv_len_sum += c->bulklen;
