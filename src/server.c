@@ -77,6 +77,10 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /* Global vars */
 struct redisServer server; /* Server global state */
 
+/* Cache for ustime and monotonic timestamp */
+static long long cached_ustime = 0;
+static long long cached_monotonic_us = 0;
+
 /*============================ Internal prototypes ========================== */
 
 static inline int isShutdownInitiated(void);
@@ -202,14 +206,31 @@ void serverLogFromHandler(int level, const char *fmt, ...) {
     serverLogRawFromHandler(level, msg);
 }
 
+
 /* Return the UNIX time in microseconds */
-long long ustime(void) {
+long long ustime_gettimeofday(void) {
     struct timeval tv;
     long long ust;
-
     gettimeofday(&tv, NULL);
     ust = ((long long)tv.tv_sec)*1000000;
     ust += tv.tv_usec;
+    return ust;
+}
+
+/* Return the UNIX time in microseconds */
+long long ustime(void) {
+    long long ust;
+    if (likely(monotonicGetType() == MONOTONIC_CLOCK_HW)){
+        if (unlikely(cached_ustime == 0)){
+            cached_ustime = ustime_gettimeofday();
+            cached_monotonic_us = getMonotonicUs();
+        }
+        /* Calculate elapsed time based on monotonic clock */
+        const long long now_monotonic_us = getMonotonicUs();
+        ust = cached_ustime + (now_monotonic_us - cached_monotonic_us);
+    } else {
+        ust = ustime_gettimeofday();
+    }
     return ust;
 }
 
