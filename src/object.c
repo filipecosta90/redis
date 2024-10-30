@@ -680,6 +680,18 @@ robj *tryObjectEncoding(robj *o) {
     return tryObjectEncodingEx(o, 1);
 }
 
+size_t getObjectLength(robj *o) {
+    switch(o->type) {
+        case OBJ_STRING: return stringObjectLen(o);
+        case OBJ_LIST: return listTypeLength(o);
+        case OBJ_SET: return setTypeSize(o);
+        case OBJ_ZSET: return zsetLength(o);
+        case OBJ_HASH: return hashTypeLength(o, 0);
+        case OBJ_STREAM: return streamLength(o);
+        default: return 0;
+    }
+}
+
 /* Get a decoded version of an encoded object (returned as a new object).
  * If the object is already raw-encoded just increment the ref count. */
 robj *getDecodedObject(robj *o) {

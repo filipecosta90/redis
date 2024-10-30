@@ -4171,15 +4171,7 @@ int RM_KeyType(RedisModuleKey *key) {
  * If the key pointer is NULL or the key is empty, zero is returned. */
 size_t RM_ValueLength(RedisModuleKey *key) {
     if (key == NULL || key->value == NULL) return 0;
-    switch(key->value->type) {
-    case OBJ_STRING: return stringObjectLen(key->value);
-    case OBJ_LIST: return listTypeLength(key->value);
-    case OBJ_SET: return setTypeSize(key->value);
-    case OBJ_ZSET: return zsetLength(key->value);
-    case OBJ_HASH: return hashTypeLength(key->value, 0);  /* OPEN: To subtract expired fields? */
-    case OBJ_STREAM: return streamLength(key->value);
-    default: return 0;
-    }
+    return getObjectLength(key->value);
 }
 
 /* If the key is open for writing, remove it, and setup the key to
@@ -8849,9 +8841,9 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
              * it will not be notified about it. */
             int prev_active = sub->active;
             sub->active = 1;
-            server.lazy_expire_disabled++;
+            server.allow_access_expired++;
             sub->notify_callback(&ctx, type, event, key);
-            server.lazy_expire_disabled--;
+            server.allow_access_expired--;
             sub->active = prev_active;
             moduleFreeContext(&ctx);
         }
@@ -9678,6 +9670,12 @@ RedisModuleString *RM_GetModuleUserACLString(RedisModuleUser *user) {
  * The returned string must be released with RedisModule_FreeString() or by
  * enabling automatic memory management. */
 RedisModuleString *RM_GetCurrentUserName(RedisModuleCtx *ctx) {
+    /* Sometimes, the user isn't passed along the call stack or isn't
+     * even set, so we need to check for the members to avoid crashes. */
+    if (ctx->client == NULL || ctx->client->user == NULL || ctx->client->user->name == NULL) {
+        return NULL;
+    }
+
     return RM_CreateString(ctx,ctx->client->user->name,sdslen(ctx->client->user->name));
 }
 
@@ -11890,7 +11888,7 @@ void processModuleLoadingProgressEvent(int is_aof) {
 /* When a key is deleted (in dbAsyncDelete/dbSyncDelete/setKey), it
 *  will be called to tell the module which key is about to be released. */
 void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
-    server.lazy_expire_disabled++;
+    server.allow_access_expired++;
     int subevent = REDISMODULE_SUBEVENT_KEY_DELETED;
     if (flags & DB_FLAG_KEY_EXPIRED) {
         subevent = REDISMODULE_SUBEVENT_KEY_EXPIRED;
@@ -11913,7 +11911,7 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
             mt->unlink(key,mv->value);
         }
     }
-    server.lazy_expire_disabled--;
+    server.allow_access_expired--;
 }
 
 /* Return the free_effort of the module, it will automatically choose to call 
