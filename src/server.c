@@ -2076,6 +2076,7 @@ void initServerConfig(void) {
     char *default_bindaddr[CONFIG_DEFAULT_BINDADDR_COUNT] = CONFIG_DEFAULT_BINDADDR;
 
     initConfigValues();
+    monotonicInit();    /* we need monotonic to be initialized before calling ustime */
     updateCachedTime(1);
     server.cmd_time_snapshot = server.mstime;
     getRandomHexChars(server.runid,CONFIG_RUN_ID_SIZE);
