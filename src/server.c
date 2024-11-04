@@ -220,17 +220,13 @@ long long ustime_gettimeofday(void) {
 /* Return the UNIX time in microseconds */
 long long ustime(void) {
     long long ust;
-    if (likely(monotonicGetType() == MONOTONIC_CLOCK_HW)){
-        if (unlikely(cached_ustime == 0)){
-            cached_ustime = ustime_gettimeofday();
-            cached_monotonic_us = getMonotonicUs();
-        }
-        /* Calculate elapsed time based on monotonic clock */
-        const long long now_monotonic_us = getMonotonicUs();
-        ust = cached_ustime + (now_monotonic_us - cached_monotonic_us);
-    } else {
-        ust = ustime_gettimeofday();
+    if (unlikely(cached_ustime == 0)){
+        cached_ustime = ustime_gettimeofday();
+        cached_monotonic_us = getMonotonicUs();
     }
+    /* Calculate elapsed time based on monotonic clock */
+    const long long now_monotonic_us = getMonotonicUs();
+    ust = cached_ustime + (now_monotonic_us - cached_monotonic_us);
     return ust;
 }
 
@@ -3609,10 +3605,6 @@ void call(client *c, int flags) {
      * re-processed. */
     if (reprocessing_command) c->flags |= CLIENT_REPROCESSING_COMMAND;
 
-    monotime monotonic_start = 0;
-    if (monotonicGetType() == MONOTONIC_CLOCK_HW)
-        monotonic_start = getMonotonicUs();
-
     c->cmd->proc(c);
 
     /* Clear the CLIENT_REPROCESSING_COMMAND flag after the proc is executed. */
@@ -3624,13 +3616,7 @@ void call(client *c, int flags) {
      * it means the execution is not yet completed and we MIGHT reprocess the command in the future. */
     if (!(c->flags & CLIENT_BLOCKED)) c->flags &= ~(CLIENT_EXECUTING_COMMAND);
 
-    /* In order to avoid performance implication due to querying the clock using a system call 3 times,
-     * we use a monotonic clock, when we are sure its cost is very low, and fall back to non-monotonic call otherwise. */
-    ustime_t duration;
-    if (monotonicGetType() == MONOTONIC_CLOCK_HW)
-        duration = getMonotonicUs() - monotonic_start;
-    else
-        duration = ustime() - call_timer;
+    ustime_t duration = ustime() - call_timer;
 
     c->duration += duration;
     dirty = server.dirty-dirty;
