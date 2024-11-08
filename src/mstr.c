@@ -257,6 +257,7 @@ void mstrPrint(mstr s, struct mstrKind *kind, int verbose) {
 
 /* return length of the string (ignoring metadata attached) */
 size_t mstrlen(const mstr s) {
+    __builtin_prefetch(&s[-1], 0, 1);
     unsigned char info = s[-1];
     switch(info & MSTR_TYPE_MASK) {
         case MSTR_TYPE_5:
