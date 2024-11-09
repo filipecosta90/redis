@@ -122,7 +122,7 @@ void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, u
  * in the replication link. */
 robj *lookupKey(redisDb *db, robj *key, int flags, dictEntry **deref) {
     const int keySlot = getKeySlot(key->ptr);
-    dictEntry *de = kvstoreDictFind(db->keys, keySlot, key);
+    dictEntry *de = kvstoreDictFind(db->keys, keySlot, key->ptr);
     robj *val = NULL;
     if (de) {
         val = dictGetVal(de);
