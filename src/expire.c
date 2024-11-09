@@ -454,6 +454,7 @@ void expireSlaveKeys(void) {
     while(1) {
         dictEntry *de = dictGetRandomKey(slaveKeysWithExpire);
         sds keyname = dictGetKey(de);
+        const int keySlot = getKeySlot(keyname);
         uint64_t dbids = dictGetUnsignedIntegerVal(de);
         uint64_t new_dbids = 0;
 
@@ -463,7 +464,7 @@ void expireSlaveKeys(void) {
         while(dbids && dbid < server.dbnum) {
             if ((dbids & 1) != 0) {
                 redisDb *db = server.db+dbid;
-                dictEntry *expire = dbFindExpires(db, keyname);
+                dictEntry *expire = dbFindExpires(db, keyname, keySlot);
                 int expired = expire && activeExpireCycleTryExpire(server.db+dbid,expire,start);
 
                 /* If the key was not expired in this DB, we need to set the
@@ -659,7 +660,7 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     }
 
     if (flag) {
-        current_expire = getExpire(c->db, key);
+        current_expire = getExpire(c->db, key, getKeySlot(key->ptr));
 
         /* NX option is set, check current expiry */
         if (flag & EXPIRE_NX) {
@@ -771,7 +772,7 @@ void ttlGenericCommand(client *c, int output_ms, int output_abs) {
 
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
-    expire = getExpire(c->db,c->argv[1]);
+    expire = getExpire(c->db,c->argv[1],getKeySlot(c->argv[1]->ptr));
     if (expire != -1) {
         ttl = output_abs ? expire : expire-commandTimeSnapshot();
         if (ttl < 0) ttl = 0;

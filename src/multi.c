@@ -303,7 +303,7 @@ void watchForKey(client *c, robj *key) {
     wk->key = key;
     wk->client = c;
     wk->db = c->db;
-    wk->expired = keyIsExpired(c->db, key);
+    wk->expired = keyIsExpired(c->db, key,getKeySlot(key->ptr));
     incrRefCount(key);
     listAddNodeTail(c->watched_keys, wk);
     watchedKeyLinkToClients(clients, wk);
@@ -348,7 +348,7 @@ int isWatchedKeyExpired(client *c) {
     while ((ln = listNext(&li))) {
         wk = listNodeValue(ln);
         if (wk->expired) continue; /* was expired when WATCH was called */
-        if (keyIsExpired(wk->db, wk->key)) return 1;
+        if (keyIsExpired(wk->db, wk->key,getKeySlot(wk->key->ptr))) return 1;
     }
 
     return 0;
@@ -414,9 +414,10 @@ void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
     dictIterator *di = dictGetSafeIterator(emptied->watched_keys);
     while((de = dictNext(di)) != NULL) {
         robj *key = dictGetKey(de);
-        int exists_in_emptied = dbFind(emptied, key->ptr) != NULL;
+        const int keySlot = getKeySlot(key->ptr);
+        int exists_in_emptied = dbFindWithSlot(emptied, key->ptr, keySlot) != NULL;
         if (exists_in_emptied ||
-            (replaced_with && dbFind(replaced_with, key->ptr) != NULL))
+            (replaced_with && dbFindWithSlot(replaced_with, key->ptr, keySlot) != NULL))
         {
             list *clients = dictGetVal(de);
             if (!clients) continue;
@@ -424,16 +425,16 @@ void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
             while((ln = listNext(&li))) {
                 watchedKey *wk = redis_member2struct(watchedKey, node, ln);
                 if (wk->expired) {
-                    if (!replaced_with || !dbFind(replaced_with, key->ptr)) {
+                    if (!replaced_with || !dbFindWithSlot(replaced_with, key->ptr, keySlot)) {
                         /* Expired key now deleted. No logical change. Clear the
                          * flag. Deleted keys are not flagged as expired. */
                         wk->expired = 0;
                         continue;
-                    } else if (keyIsExpired(replaced_with, key)) {
+                    } else if (keyIsExpired(replaced_with, key, keySlot)) {
                         /* Expired key remains expired. */
                         continue;
                     }
-                } else if (!exists_in_emptied && keyIsExpired(replaced_with, key)) {
+                } else if (!exists_in_emptied && keyIsExpired(replaced_with, key, keySlot)) {
                     /* Non-existing key is replaced with an expired key. */
                     wk->expired = 1;
                     continue;

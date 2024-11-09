@@ -2306,7 +2306,7 @@ int rewriteAppendOnlyFileRio(rio *aof) {
             o = dictGetVal(de);
             initStaticStringObject(key,keystr);
 
-            expiretime = getExpire(db,&key);
+            expiretime = getExpire(db,&key,getKeySlot(key.ptr));
 
             /* Save the key and associated value */
             if (o->type == OBJ_STRING) {
