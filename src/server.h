@@ -3364,6 +3364,7 @@ int setModuleNumericConfig(ModuleConfig *config, long long val, const char **err
 /* db.c -- Keyspace access API */
 void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, uint64_t newLen);
 int removeExpire(redisDb *db, robj *key);
+int removeExpireWithKeySlot(redisDb *db, robj *key, int keySlot);
 void deleteExpiredKeyAndPropagate(redisDb *db, robj *keyobj);
 void deleteEvictedKeyAndPropagate(redisDb *db, robj *keyobj, long long *key_mem_freed);
 void propagateDeletion(redisDb *db, robj *key, int lazy);
@@ -3371,11 +3372,14 @@ int keyIsExpired(redisDb *db, robj *key, int keySlot);
 long long getExpire(redisDb *db, robj *key, int keySlot);
 void setExpire(client *c, redisDb *db, robj *key, long long when);
 void setExpireWithDictEntry(client *c, redisDb *db, robj *key, long long when, dictEntry *kde);
+void setExpireWithDictEntryAndSlot(client *c, redisDb *db, robj *key, long long when, dictEntry *kde, int keySlot);
 int checkAlreadyExpired(long long when);
 int parseExtendedExpireArgumentsOrReply(client *c, int *flags);
 robj *lookupKeyRead(redisDb *db, robj *key);
 robj *lookupKeyWrite(redisDb *db, robj *key);
 robj *lookupKeyWriteWithDictEntry(redisDb *db, robj *key, dictEntry **deref);
+robj *lookupKeyWriteWithDictEntryAndSlot(redisDb *db, robj *key, dictEntry **deref, int keySlot);
+robj *lookupKeyWriteWithKeySlot(redisDb *db, robj *key, int keySlot);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags);
@@ -3405,6 +3409,7 @@ void dbReplaceValueWithDictEntry(redisDb *db, robj *key, robj *val, dictEntry *d
 #define SETKEY_ADD_OR_UPDATE 16 /* Key most likely doesn't exists */
 void setKey(client *c, redisDb *db, robj *key, robj *val, int flags);
 void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de);
+void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot);
 robj *dbRandomKey(redisDb *db);
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags);
 int dbSyncDelete(redisDb *db, robj *key);

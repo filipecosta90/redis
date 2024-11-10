@@ -74,7 +74,8 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     }
 
     dictEntry *de = NULL;
-    found = (lookupKeyWriteWithDictEntry(c->db,key,&de) != NULL);
+    const int keySlot = getKeySlot(key->ptr);
+    found = (lookupKeyWriteWithDictEntryAndSlot(c->db,key,&de,keySlot) != NULL);
 
     if ((flags & OBJ_SET_NX && found) ||
         (flags & OBJ_SET_XX && !found))
@@ -89,12 +90,12 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     setkey_flags |= ((flags & OBJ_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
 
-    setKeyWithDictEntry(c,c->db,key,val,setkey_flags,de);
+    setKeyWithDictEntryAndSlot(c,c->db,key,val,setkey_flags,de,keySlot);
     server.dirty++;
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
 
     if (expire) {
-        setExpireWithDictEntry(c,c->db,key,milliseconds,de);
+        setExpireWithDictEntryAndSlot(c,c->db,key,milliseconds,de,keySlot);
         /* Propagate as SET Key Value PXAT millisecond-timestamp if there is
          * EX/PX/EXAT flag. */
         if (!(flags & OBJ_PXAT)) {

@@ -806,10 +806,12 @@ void pexpiretimeCommand(client *c) {
 
 /* PERSIST key */
 void persistCommand(client *c) {
-    if (lookupKeyWrite(c->db,c->argv[1])) {
-        if (removeExpire(c->db,c->argv[1])) {
-            signalModifiedKey(c,c->db,c->argv[1]);
-            notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
+    robj* key = c->argv[1];
+    const int keySlot = getKeySlot(key->ptr);
+    if (lookupKeyWriteWithKeySlot(c->db,key,keySlot)) {
+        if (removeExpireWithKeySlot(c->db,key,keySlot)) {
+            signalModifiedKey(c,c->db,key);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",key,c->db->id);
             addReply(c,shared.cone);
             server.dirty++;
         } else {

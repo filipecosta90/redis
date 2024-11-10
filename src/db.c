@@ -38,6 +38,7 @@ typedef enum {
 keyStatus expireIfNeeded(redisDb *db, robj *key, int flags, int keySlot);
 int keyIsExpired(redisDb *db, robj *key, int keySlot);
 static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de);
+static __always_inline void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int keySlot);
 
 /* Update LFU when an object is accessed.
  * Firstly, decrement the counter if the decrement time is reached.
@@ -90,38 +91,7 @@ void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, u
     }
 }
 
-/* Lookup a key for read or write operations, or return NULL if the key is not
- * found in the specified DB. This function implements the functionality of
- * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
- *
- * 'deref' is an optional output dictEntry reference argument, to get the
- * associated dictEntry* of the key in case the key is found.
- *
- * Side-effects of calling this function:
- *
- * 1. A key gets expired if it reached it's TTL.
- * 2. The key's last access time is updated.
- * 3. The global keys hits/misses stats are updated (reported in INFO).
- * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
- *
- * Flags change the behavior of this command:
- *
- *  LOOKUP_NONE (or zero): No special flags are passed.
- *  LOOKUP_NOTOUCH: Don't alter the last access time of the key.
- *  LOOKUP_NONOTIFY: Don't trigger keyspace event on key miss.
- *  LOOKUP_NOSTATS: Don't increment key hits/misses counters.
- *  LOOKUP_WRITE: Prepare the key for writing (delete expired keys even on
- *                replicas, use separate keyspace stats and events (TODO)).
- *  LOOKUP_NOEXPIRE: Perform expiration check, but avoid deleting the key,
- *                   so that we don't have to propagate the deletion.
- *
- * Note: this function also returns NULL if the key is logically expired but
- * still existing, in case this is a replica and the LOOKUP_WRITE is not set.
- * Even if the key expiry is master-driven, we can correctly report a key is
- * expired on replicas even if the master is lagging expiring our key via DELs
- * in the replication link. */
-robj *lookupKey(redisDb *db, robj *key, int flags, dictEntry **deref) {
-    const int keySlot = getKeySlot(key->ptr);
+static __always_inline robj *lookupKeyWithKeySlot(redisDb *db, robj *key, int flags, dictEntry **deref, int keySlot) {
     dictEntry *de = kvstoreDictFind(db->keys, keySlot, key->ptr);
     robj *val = NULL;
     if (de) {
@@ -178,6 +148,41 @@ robj *lookupKey(redisDb *db, robj *key, int flags, dictEntry **deref) {
     return val;
 }
 
+/* Lookup a key for read or write operations, or return NULL if the key is not
+ * found in the specified DB. This function implements the functionality of
+ * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
+ *
+ * 'deref' is an optional output dictEntry reference argument, to get the
+ * associated dictEntry* of the key in case the key is found.
+ *
+ * Side-effects of calling this function:
+ *
+ * 1. A key gets expired if it reached it's TTL.
+ * 2. The key's last access time is updated.
+ * 3. The global keys hits/misses stats are updated (reported in INFO).
+ * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
+ *
+ * Flags change the behavior of this command:
+ *
+ *  LOOKUP_NONE (or zero): No special flags are passed.
+ *  LOOKUP_NOTOUCH: Don't alter the last access time of the key.
+ *  LOOKUP_NONOTIFY: Don't trigger keyspace event on key miss.
+ *  LOOKUP_NOSTATS: Don't increment key hits/misses counters.
+ *  LOOKUP_WRITE: Prepare the key for writing (delete expired keys even on
+ *                replicas, use separate keyspace stats and events (TODO)).
+ *  LOOKUP_NOEXPIRE: Perform expiration check, but avoid deleting the key,
+ *                   so that we don't have to propagate the deletion.
+ *
+ * Note: this function also returns NULL if the key is logically expired but
+ * still existing, in case this is a replica and the LOOKUP_WRITE is not set.
+ * Even if the key expiry is master-driven, we can correctly report a key is
+ * expired on replicas even if the master is lagging expiring our key via DELs
+ * in the replication link. */
+robj *lookupKey(redisDb *db, robj *key, int flags, dictEntry **deref) {
+    const int keySlot = getKeySlot(key->ptr);
+    return lookupKeyWithKeySlot(db,key,flags,deref,keySlot);
+}
+
 /* Lookup a key for read operations, or return NULL if the key is not found
  * in the specified DB.
  *
@@ -208,8 +213,22 @@ robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
     return lookupKey(db, key, flags | LOOKUP_WRITE, NULL);
 }
 
+/* Lookup a key for write operations, and as a side effect, if needed, expires
+ * the key if its TTL is reached. It's equivalent to lookupKey() with the
+ * LOOKUP_WRITE flag added.
+ *
+ * Returns the linked value object if the key exists or NULL if the key
+ * does not exist in the specified DB. */
+static __always_inline robj *lookupKeyWriteWithFlagsAndSlot(redisDb *db, robj *key, int flags, int keySlot) {
+    return lookupKeyWithKeySlot(db, key, flags | LOOKUP_WRITE, NULL, keySlot);
+}
+
 robj *lookupKeyWrite(redisDb *db, robj *key) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NONE);
+}
+
+robj *lookupKeyWriteWithKeySlot(redisDb *db, robj *key, int keySlot) {
+    return lookupKeyWriteWithFlagsAndSlot(db, key, LOOKUP_NONE, keySlot);
 }
 
 /* Like lookupKeyWrite(), but accepts an optional dictEntry input,
@@ -218,6 +237,16 @@ robj *lookupKeyWrite(redisDb *db, robj *key) {
 robj *lookupKeyWriteWithDictEntry(redisDb *db, robj *key, dictEntry **deref) {
     return lookupKey(db, key, LOOKUP_NONE | LOOKUP_WRITE, deref);
 }
+
+
+/* Like lookupKeyWrite(), but accepts an optional dictEntry and keySlot inputs:
+ *  - dictEntry can be used if we already have one, thus saving the dbFind call.
+ *  - keySlot can be use thus saving the getKeySlot one/many inner calls.
+ */
+robj *lookupKeyWriteWithDictEntryAndSlot(redisDb *db, robj *key, dictEntry **deref, int keySlot) {
+    return lookupKeyWithKeySlot(db, key, LOOKUP_NONE | LOOKUP_WRITE, deref, keySlot);
+}
+
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
     robj *o = lookupKeyRead(c->db, key);
@@ -236,12 +265,11 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * If the update_if_existing argument is false, the program is aborted
  * if the key already exists, otherwise, it can fall back to dbOverwrite. */
-static dictEntry *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing) {
+static __always_inline dictEntry *dbAddInternalWithKeySlot(redisDb *db, robj *key, robj *val, int update_if_existing, int slot) {
     dictEntry *existing;
-    int slot = getKeySlot(key->ptr);
     dictEntry *de = kvstoreDictAddRaw(db->keys, slot, key->ptr, &existing);
     if (update_if_existing && existing) {
-        dbSetValue(db, key, val, 1, existing);
+        dbSetValueWithKeySlot(db, key, val, 1, existing,slot);
         return existing;
     }
     serverAssertWithInfo(NULL, key, de != NULL);
@@ -254,9 +282,24 @@ static dictEntry *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if
     return de;
 }
 
+/* Add the key to the DB. It's up to the caller to increment the reference
+ * counter of the value if needed.
+ *
+ * If the update_if_existing argument is false, the program is aborted
+ * if the key already exists, otherwise, it can fall back to dbOverwrite. */
+static dictEntry *dbAddInternal(redisDb *db, robj *key, robj *val, int update_if_existing) {
+    int slot = getKeySlot(key->ptr);
+    return dbAddInternalWithKeySlot(db,key,val,update_if_existing,slot);
+}
+
+dictEntry *dbAddWithKeySlot(redisDb *db, robj *key, robj *val, int keySlot) {
+    return dbAddInternalWithKeySlot(db, key, val, 0, keySlot);
+}
+
 dictEntry *dbAdd(redisDb *db, robj *key, robj *val) {
     return dbAddInternal(db, key, val, 0);
 }
+
 
 /* Returns key's hash slot when cluster mode is enabled, or 0 when disabled.
  * The only difference between this function and getKeySlot, is that it's not using cached key slot from the current_client
@@ -302,6 +345,8 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
     return 1;
 }
 
+
+
 /* Overwrite an existing key with a new value. Incrementing the reference
  * count of the new value is up to the caller.
  * This function does not modify the expire time of the existing key.
@@ -314,8 +359,7 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
  * The dictEntry input is optional, can be used if we already have one.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de) {
-    int slot = getKeySlot(key->ptr);
+static __always_inline void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int slot) {
     if (!de) de = kvstoreDictFind(db->keys, slot, key->ptr);
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
@@ -355,6 +399,23 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     }
 }
 
+/* Overwrite an existing key with a new value. Incrementing the reference
+ * count of the new value is up to the caller.
+ * This function does not modify the expire time of the existing key.
+ *
+ * The 'overwrite' flag is an indication whether this is done as part of a
+ * complete replacement of their key, which can be thought as a deletion and
+ * replacement (in which case we need to emit deletion signals), or just an
+ * update of a value of an existing key (when false).
+ *
+ * The dictEntry input is optional, can be used if we already have one.
+ *
+ * The program is aborted if the key was not already present. */
+static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de) {
+    const int slot = getKeySlot(key->ptr);
+    dbSetValueWithKeySlot(db,key,val,overwrite,de,slot);
+}
+
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(redisDb *db, robj *key, robj *val) {
@@ -390,23 +451,50 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
  * which can be used if we already have one, thus saving the dictFind call. */
 void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
     int keyfound = 0;
+    int keySlot = 0;
+
+    if (flags & SETKEY_ALREADY_EXIST)
+        keyfound = 1;
+    else if (flags & SETKEY_ADD_OR_UPDATE)
+        keyfound = -1;
+    else if (!(flags & SETKEY_DOESNT_EXIST)) {
+        keySlot = getKeySlot(key->ptr);
+        keyfound = (lookupKeyWriteWithKeySlot(db,key,keySlot) != NULL);
+    }
+
+    if (!keyfound) {
+        dbAddWithKeySlot(db,key,val,keySlot);
+    } else if (keyfound<0) {
+        dbAddInternalWithKeySlot(db,key,val,1,keySlot);
+    } else {
+        dbSetValueWithKeySlot(db,key,val,1,de,keySlot);
+    }
+    incrRefCount(val);
+    if (!(flags & SETKEY_KEEPTTL)) removeExpireWithKeySlot(db,key,keySlot);
+    if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
+}
+
+/* Like setKey(), but accepts an optional dictEntry input,
+ * which can be used if we already have one, thus saving the dictFind call. */
+void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot) {
+    int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
         keyfound = 1;
     else if (flags & SETKEY_ADD_OR_UPDATE)
         keyfound = -1;
     else if (!(flags & SETKEY_DOESNT_EXIST))
-        keyfound = (lookupKeyWrite(db,key) != NULL);
+        keyfound = (lookupKeyWriteWithKeySlot(db,key,keySlot) != NULL);
 
     if (!keyfound) {
-        dbAdd(db,key,val);
+        dbAddWithKeySlot(db,key,val,keySlot);
     } else if (keyfound<0) {
-        dbAddInternal(db,key,val,1);
+        dbAddInternalWithKeySlot(db,key,val,1,keySlot);
     } else {
-        dbSetValue(db,key,val,1,de);
+        dbSetValueWithKeySlot(db,key,val,1,de,keySlot);
     }
     incrRefCount(val);
-    if (!(flags & SETKEY_KEEPTTL)) removeExpire(db,key);
+    if (!(flags & SETKEY_KEEPTTL)) removeExpireWithKeySlot(db,key,keySlot);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
 }
 
@@ -2001,6 +2089,11 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 
+
+int removeExpireWithKeySlot(redisDb *db, robj *key, int keySlot) {
+    return kvstoreDictDelete(db->expires, keySlot, key->ptr) == DICT_OK;
+}
+
 int removeExpire(redisDb *db, robj *key) {
     return kvstoreDictDelete(db->expires, getKeySlot(key->ptr), key->ptr) == DICT_OK;
 }
@@ -2017,10 +2110,17 @@ void setExpire(client *c, redisDb *db, robj *key, long long when) {
 /* Like setExpire(), but accepts an optional dictEntry input,
  * which can be used if we already have one, thus saving the kvstoreDictFind call. */
 void setExpireWithDictEntry(client *c, redisDb *db, robj *key, long long when, dictEntry *kde) {
+    /* Reuse the sds from the main dict in the expire dict */
+    int slot = getKeySlot(key->ptr);
+    setExpireWithDictEntryAndSlot(c,db,key,when,kde,slot);
+}
+
+/* Like setExpire(), but accepts an optional dictEntry input,
+ * which can be used if we already have one, thus saving the kvstoreDictFind call. */
+void setExpireWithDictEntryAndSlot(client *c, redisDb *db, robj *key, long long when, dictEntry *kde, int slot) {
     dictEntry *de, *existing;
 
     /* Reuse the sds from the main dict in the expire dict */
-    int slot = getKeySlot(key->ptr);
     if (!kde) kde = kvstoreDictFind(db->keys, slot, key->ptr);
     serverAssertWithInfo(NULL,key,kde != NULL);
     de = kvstoreDictAddRaw(db->expires, slot, dictGetKey(kde), &existing);
