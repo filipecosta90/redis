@@ -653,14 +653,16 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     }
     when += basetime;
 
+    dictEntry *de = NULL;
+    const int keySlot = getKeySlot(key->ptr);
     /* No key, return zero. */
-    if (lookupKeyWrite(c->db,key) == NULL) {
+    if (lookupKeyWriteWithDictEntryAndSlot(c->db,key,&de,keySlot) == NULL) {
         addReply(c,shared.czero);
         return;
     }
 
     if (flag) {
-        current_expire = getExpire(c->db, key, getKeySlot(key->ptr));
+        current_expire = getExpire(c->db, key, keySlot);
 
         /* NX option is set, check current expiry */
         if (flag & EXPIRE_NX) {
@@ -718,7 +720,7 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
         addReply(c, shared.cone);
         return;
     } else {
-        setExpire(c,c->db,key,when);
+        setExpireWithDictEntryAndSlot(c,c->db,key,when,de,keySlot);
         addReply(c,shared.cone);
         /* Propagate as PEXPIREAT millisecond-timestamp
          * Only rewrite the command arg if not already PEXPIREAT */
@@ -763,16 +765,18 @@ void pexpireatCommand(client *c) {
 /* Implements TTL, PTTL, EXPIRETIME and PEXPIRETIME */
 void ttlGenericCommand(client *c, int output_ms, int output_abs) {
     long long expire, ttl = -1;
+    robj* key = c->argv[1];
+    const int keySlot = getKeySlot(key->ptr);
 
     /* If the key does not exist at all, return -2 */
-    if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
+    if (lookupKeyReadWithFlagsAndSlot(c->db,key,LOOKUP_NOTOUCH,keySlot) == NULL) {
         addReplyLongLong(c,-2);
         return;
     }
 
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
-    expire = getExpire(c->db,c->argv[1],getKeySlot(c->argv[1]->ptr));
+    expire = getExpire(c->db,key,keySlot);
     if (expire != -1) {
         ttl = output_abs ? expire : expire-commandTimeSnapshot();
         if (ttl < 0) ttl = 0;

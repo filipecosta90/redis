@@ -3383,6 +3383,7 @@ robj *lookupKeyWriteWithKeySlot(redisDb *db, robj *key, int keySlot);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags);
+robj *lookupKeyReadWithFlagsAndSlot(redisDb *db, robj *key, int flags, int keySlot);
 robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags);
 robj *objectCommandLookup(client *c, robj *key);
 robj *objectCommandLookupOrReply(client *c, robj *key, robj *reply);

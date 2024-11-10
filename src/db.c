@@ -38,7 +38,7 @@ typedef enum {
 keyStatus expireIfNeeded(redisDb *db, robj *key, int flags, int keySlot);
 int keyIsExpired(redisDb *db, robj *key, int keySlot);
 static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de);
-static __always_inline void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int keySlot);
+static void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int keySlot);
 
 /* Update LFU when an object is accessed.
  * Firstly, decrement the counter if the decrement time is reached.
@@ -91,7 +91,7 @@ void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, u
     }
 }
 
-static __always_inline robj *lookupKeyWithKeySlot(redisDb *db, robj *key, int flags, dictEntry **deref, int keySlot) {
+static inline robj *lookupKeyWithKeySlot(redisDb *db, robj *key, int flags, dictEntry **deref, int keySlot) {
     dictEntry *de = kvstoreDictFind(db->keys, keySlot, key->ptr);
     robj *val = NULL;
     if (de) {
@@ -197,6 +197,12 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
     return lookupKey(db, key, flags, NULL);
 }
 
+/* Like lookupKeyReadWithFlags(), but does not calculate again the key slot. */
+robj *lookupKeyReadWithFlagsAndSlot(redisDb *db, robj *key, int flags, int keySlot) {
+    serverAssert(!(flags & LOOKUP_WRITE));
+    return lookupKeyWithKeySlot(db,key,flags,NULL,keySlot);
+}
+
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
  * common case. */
 robj *lookupKeyRead(redisDb *db, robj *key) {
@@ -219,7 +225,7 @@ robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
  *
  * Returns the linked value object if the key exists or NULL if the key
  * does not exist in the specified DB. */
-static __always_inline robj *lookupKeyWriteWithFlagsAndSlot(redisDb *db, robj *key, int flags, int keySlot) {
+static inline robj *lookupKeyWriteWithFlagsAndSlot(redisDb *db, robj *key, int flags, int keySlot) {
     return lookupKeyWithKeySlot(db, key, flags | LOOKUP_WRITE, NULL, keySlot);
 }
 
@@ -265,7 +271,7 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * If the update_if_existing argument is false, the program is aborted
  * if the key already exists, otherwise, it can fall back to dbOverwrite. */
-static __always_inline dictEntry *dbAddInternalWithKeySlot(redisDb *db, robj *key, robj *val, int update_if_existing, int slot) {
+static inline dictEntry *dbAddInternalWithKeySlot(redisDb *db, robj *key, robj *val, int update_if_existing, int slot) {
     dictEntry *existing;
     dictEntry *de = kvstoreDictAddRaw(db->keys, slot, key->ptr, &existing);
     if (update_if_existing && existing) {
@@ -359,7 +365,7 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
  * The dictEntry input is optional, can be used if we already have one.
  *
  * The program is aborted if the key was not already present. */
-static __always_inline void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int slot) {
+static inline void dbSetValueWithKeySlot(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de, int slot) {
     if (!de) de = kvstoreDictFind(db->keys, slot, key->ptr);
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
@@ -449,14 +455,14 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
 
 /* Like setKey(), but accepts an optional dictEntry input,
  * which can be used if we already have one, thus saving the dictFind call. */
-__always_inline void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
+inline  void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
     const int keySlot = getKeySlot(key->ptr);
     setKeyWithDictEntryAndSlot(c,db,key,val,flags,de,keySlot);
 }
 
 /* Like setKey(), but accepts an optional dictEntry input,
  * which can be used if we already have one, thus saving the dictFind call. */
-__always_inline void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot) {
+inline void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
