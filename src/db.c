@@ -449,34 +449,14 @@ void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
 
 /* Like setKey(), but accepts an optional dictEntry input,
  * which can be used if we already have one, thus saving the dictFind call. */
-void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
-    int keyfound = 0;
-    int keySlot = 0;
-
-    if (flags & SETKEY_ALREADY_EXIST)
-        keyfound = 1;
-    else if (flags & SETKEY_ADD_OR_UPDATE)
-        keyfound = -1;
-    else if (!(flags & SETKEY_DOESNT_EXIST)) {
-        keySlot = getKeySlot(key->ptr);
-        keyfound = (lookupKeyWriteWithKeySlot(db,key,keySlot) != NULL);
-    }
-
-    if (!keyfound) {
-        dbAddWithKeySlot(db,key,val,keySlot);
-    } else if (keyfound<0) {
-        dbAddInternalWithKeySlot(db,key,val,1,keySlot);
-    } else {
-        dbSetValueWithKeySlot(db,key,val,1,de,keySlot);
-    }
-    incrRefCount(val);
-    if (!(flags & SETKEY_KEEPTTL)) removeExpireWithKeySlot(db,key,keySlot);
-    if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
+__always_inline void setKeyWithDictEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
+    const int keySlot = getKeySlot(key->ptr);
+    setKeyWithDictEntryAndSlot(c,db,key,val,flags,de,keySlot);
 }
 
 /* Like setKey(), but accepts an optional dictEntry input,
  * which can be used if we already have one, thus saving the dictFind call. */
-void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot) {
+__always_inline void setKeyWithDictEntryAndSlot(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de, int keySlot) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
