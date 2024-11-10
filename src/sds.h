@@ -16,6 +16,7 @@ extern const char *SDS_NOINIT;
 #include <sys/types.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <xmmintrin.h>  // For _mm_prefetch
 
 typedef char *sds;
 
@@ -62,6 +63,8 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 #define SDS_TYPE_5_LEN(f) ((f)>>SDS_TYPE_BITS)
 
 static inline size_t sdslen(const sds s) {
+    // Prefetch the flags byte (s[-1]) to potentially reduce cache miss latency
+    _mm_prefetch((const char *)(s - 1), _MM_HINT_T0);
     unsigned char flags = s[-1];
     switch(flags&SDS_TYPE_MASK) {
         case SDS_TYPE_5:
