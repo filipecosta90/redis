@@ -837,13 +837,13 @@ unsigned int zzlLength(unsigned char *zl) {
 
 /* Move to next entry based on the values in eptr and sptr. Both are set to
  * NULL when there is no next entry. */
-void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
+void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr, const size_t zlbytes) {
     unsigned char *_eptr, *_sptr;
     serverAssert(*eptr != NULL && *sptr != NULL);
 
-    _eptr = lpNext(zl,*sptr);
+    _eptr = lpNextWithBytes(zl,*sptr,zlbytes);
     if (_eptr != NULL) {
-        _sptr = lpNext(zl,_eptr);
+        _sptr = lpNextWithBytes(zl,_eptr,zlbytes);
         serverAssert(_sptr != NULL);
     } else {
         /* No next entry. */
@@ -903,13 +903,14 @@ int zzlIsInRange(unsigned char *zl, zrangespec *range) {
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
     unsigned char *eptr = lpSeek(zl,0), *sptr;
+    const size_t zlbytes = lpBytes(zl);
     double score;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInRange(zl,range)) return NULL;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssert(sptr != NULL);
 
         score = zzlGetScore(sptr);
@@ -921,7 +922,7 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
         }
 
         /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        eptr = lpNextWithBytes(zl,sptr,zlbytes);
     }
 
     return NULL;
@@ -931,13 +932,14 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
     unsigned char *eptr = lpSeek(zl,-2), *sptr;
+    const size_t zlbytes = lpBytes(zl);
     double score;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInRange(zl,range)) return NULL;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssert(sptr != NULL);
 
         score = zzlGetScore(sptr);
@@ -1001,6 +1003,7 @@ int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
     unsigned char *eptr = lpSeek(zl,0), *sptr;
+    const size_t zlbytes = lpBytes(zl);
 
     /* If everything is out of range, return early. */
     if (!zzlIsInLexRange(zl,range)) return NULL;
@@ -1014,9 +1017,9 @@ unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
         }
 
         /* Move to next element. */
-        sptr = lpNext(zl,eptr); /* This element score. Skip it. */
+        sptr = lpNextWithBytes(zl,eptr,zlbytes); /* This element score. Skip it. */
         serverAssert(sptr != NULL);
-        eptr = lpNext(zl,sptr); /* Next element. */
+        eptr = lpNextWithBytes(zl,sptr,zlbytes); /* Next element. */
     }
 
     return NULL;
@@ -1104,10 +1107,11 @@ unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, doub
  * not yet present in the list. */
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
     unsigned char *eptr = lpSeek(zl,0), *sptr;
+    const size_t zlbytes = lpBytes(zl);
     double s;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssert(sptr != NULL);
         s = zzlGetScore(sptr);
 
@@ -1126,7 +1130,7 @@ unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
         }
 
         /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        eptr = lpNextWithBytes(zl,sptr,zlbytes);
     }
 
     /* Push on tail of list when it was not yet inserted. */
@@ -1260,6 +1264,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
     if (zobj->encoding == encoding) return;
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
         unsigned int vlen;
@@ -1277,7 +1282,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         eptr = lpSeek(zl,0);
         if (eptr != NULL) {
-            sptr = lpNext(zl,eptr);
+            sptr = lpNextWithBytes(zl,eptr,zlbytes);
             serverAssertWithInfo(NULL,zobj,sptr != NULL);
         }
 
@@ -1291,7 +1296,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
             node = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&node->score) == DICT_OK);
-            zzlNext(zl,&eptr,&sptr);
+            zzlNext(zl,&eptr,&sptr,zlbytes);
         }
 
         zfree(zobj->ptr);
@@ -1608,11 +1613,12 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
 
         eptr = lpSeek(zl,0);
         serverAssert(eptr != NULL);
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssert(sptr != NULL);
 
         rank = 1;
@@ -1620,7 +1626,7 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
             if (lpCompare(eptr,(unsigned char*)ele,sdslen(ele)))
                 break;
             rank++;
-            zzlNext(zl,&eptr,&sptr);
+            zzlNext(zl,&eptr,&sptr,zlbytes);
         }
 
         if (eptr != NULL) {
@@ -3162,6 +3168,7 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     handler->beginResultEmission(handler, rangelen);
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
         unsigned int vlen;
@@ -3174,7 +3181,7 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
             eptr = lpSeek(zl,2*start);
 
         serverAssertWithInfo(c,zobj,eptr != NULL);
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
 
         while (rangelen--) {
             serverAssertWithInfo(c,zobj,eptr != NULL && sptr != NULL);
@@ -3192,7 +3199,7 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
             if (reverse)
                 zzlPrev(zl,&eptr,&sptr);
             else
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
         }
 
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -3263,6 +3270,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
         unsigned int vlen;
@@ -3277,7 +3285,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
 
         /* Get score pointer for the first element. */
         if (eptr)
-            sptr = lpNext(zl,eptr);
+            sptr = lpNextWithBytes(zl,eptr,zlbytes);
 
         /* If there is an offset, just traverse the number of elements without
          * checking the score because that is done in the next loop. */
@@ -3285,7 +3293,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
             if (reverse) {
                 zzlPrev(zl,&eptr,&sptr);
             } else {
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
 
@@ -3311,7 +3319,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
             if (reverse) {
                 zzlPrev(zl,&eptr,&sptr);
             } else {
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -3383,6 +3391,7 @@ void zcountCommand(client *c) {
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         double score;
 
@@ -3396,7 +3405,7 @@ void zcountCommand(client *c) {
         }
 
         /* First element is in range */
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         score = zzlGetScore(sptr);
         serverAssertWithInfo(c,zobj,zslValueLteMax(score,&range));
 
@@ -3409,7 +3418,7 @@ void zcountCommand(client *c) {
                 break;
             } else {
                 count++;
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -3464,6 +3473,7 @@ void zlexcountCommand(client *c) {
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
 
         /* Use the first element in range as the starting point */
@@ -3477,7 +3487,7 @@ void zlexcountCommand(client *c) {
         }
 
         /* First element is in range */
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssertWithInfo(c,zobj,zzlLexValueLteMax(eptr,&range));
 
         /* Iterate over elements in range */
@@ -3487,7 +3497,7 @@ void zlexcountCommand(client *c) {
                 break;
             } else {
                 count++;
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -3532,6 +3542,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
 
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
         unsigned int vlen;
@@ -3546,7 +3557,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
 
         /* Get score pointer for the first element. */
         if (eptr)
-            sptr = lpNext(zl,eptr);
+            sptr = lpNextWithBytes(zl,eptr,zlbytes);
 
         /* If there is an offset, just traverse the number of elements without
          * checking the score because that is done in the next loop. */
@@ -3554,7 +3565,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
             if (reverse) {
                 zzlPrev(zl,&eptr,&sptr);
             } else {
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
 
@@ -3582,7 +3593,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
             if (reverse) {
                 zzlPrev(zl,&eptr,&sptr);
             } else {
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {

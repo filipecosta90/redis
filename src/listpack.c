@@ -473,7 +473,8 @@ static inline unsigned char *lpSkip(unsigned char *p) {
     return p;
 }
 
-/* This is similar to lpNext() but avoids the inner call to lpBytes when you already know the listpack size. */
+/* This is similar to lpNext() but avoids the inner call to lpBytes
+ * when you already know the listpack size. */
 unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes) {
     assert(p);
     p = lpSkip(p);
@@ -536,9 +537,10 @@ unsigned long lpLength(unsigned char *lp) {
      * to get the total number. */
     uint32_t count = 0;
     unsigned char *p = lpFirst(lp);
+    const size_t lpbytes = lpGetTotalBytes(lp);
     while(p) {
         count++;
-        p = lpNext(lp,p);
+        p = lpNextWithBytes(lp,p,lpbytes);
     }
 
     /* If the count is again within range of the header numele field,
@@ -1577,12 +1579,12 @@ unsigned char *lpSeek(unsigned char *lp, long index) {
          * want to always scan right-to-left. */
         if (index < 0) forward = 0;
     }
-
+    const size_t lpbytes = lpGetTotalBytes(lp);
     /* Forward and backward scanning is trivially based on lpNext()/lpPrev(). */
     if (forward) {
         unsigned char *ele = lpFirst(lp);
         while (index > 0 && ele) {
-            ele = lpNext(lp,ele);
+            ele = lpNextWithBytes(lp,ele,lpbytes);
             index--;
         }
         return ele;
@@ -1793,10 +1795,11 @@ void lpRandomEntries(unsigned char *lp, unsigned int count, listpackEntry *entri
      * array respecting the original order. */
     unsigned char *p = lpFirst(lp);
     unsigned int j = 0; /* index in listpack */
+    const size_t lpbytes = lpGetTotalBytes(lp);
     for (unsigned int i = 0; i < count; i++) {
         /* Advance listpack pointer to until we reach 'index' listpack. */
         while (j < picks[i].index) {
-            p = lpNext(lp, p);
+            p = lpNextWithBytes(lp,p,lpbytes);
             j++;
         }
         int storeorder = picks[i].order;
@@ -1845,10 +1848,11 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
 
     /* fetch the elements form the listpack into a output array respecting the original order. */
     unsigned int lpindex = picks[0].index, pickindex = 0;
+    const size_t lpbytes = lpGetTotalBytes(lp);
     p = lpSeek(lp, lpindex);
     while (p && pickindex < count) {
         key = lpGetValue(p, &klen, &klval);
-        assert((p = lpNext(lp, p)));
+        assert((p = lpNextWithBytes(lp,p,lpbytes)));
         value = lpGetValue(p, &vlen, &vlval);
         while (pickindex < count && lpindex == picks[pickindex].index) {
             int storeorder = picks[pickindex].order;
@@ -1860,7 +1864,7 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
         lpindex += tuple_len;
 
         for (int i = 0; i < tuple_len - 1; i++) {
-            p = lpNext(lp, p);
+            p = lpNextWithBytes(lp,p,lpbytes);
         }
     }
 
@@ -1891,17 +1895,18 @@ unsigned int lpRandomPairsUnique(unsigned char *lp, unsigned int count,
 
     p = lpFirst(lp);
     unsigned int picked = 0, remaining = count;
+    const size_t lpbytes = lpGetTotalBytes(lp);
     while (picked < count && p) {
         assert((p = lpNextRandom(lp, p, &index, remaining, tuple_len)));
         key = lpGetValue(p, &klen, &klval);
         lpSaveValue(key, klen, klval, &keys[picked]);
-        assert((p = lpNext(lp, p)));
+        assert((p = lpNextWithBytes(lp,p,lpbytes)));
         index++;
         if (vals) {
             key = lpGetValue(p, &klen, &klval);
             lpSaveValue(key, klen, klval, &vals[picked]);
         }
-        p = lpNext(lp, p);
+        p = lpNextWithBytes(lp,p,lpbytes);
         remaining--;
         picked++;
         index++;
@@ -1944,9 +1949,10 @@ unsigned char *lpNextRandom(unsigned char *lp, unsigned char *p, unsigned int *i
      * equally likely to be picked. */
     unsigned int i = *index;
     unsigned int total_size = lpLength(lp);
+    const size_t lpbytes = lpGetTotalBytes(lp);
     while (i < total_size && p != NULL) {
         if (i % tuple_len != 0) {
-            p = lpNext(lp, p);
+            p = lpNextWithBytes(lp,p,lpbytes);
             i++;
             continue;
         }
@@ -1960,7 +1966,7 @@ unsigned char *lpNextRandom(unsigned char *lp, unsigned char *p, unsigned int *i
             return p;
         }
 
-        p = lpNext(lp, p);
+        p = lpNextWithBytes(lp,p,lpbytes);
         i++;
     }
 
@@ -1973,8 +1979,8 @@ void lpRepr(unsigned char *lp) {
     int64_t vlen;
     unsigned char intbuf[LP_INTBUF_SIZE];
     int index = 0;
-
-    printf("{total bytes %zu} {num entries %lu}\n", lpBytes(lp), lpLength(lp));
+    const size_t lpbytes = lpGetTotalBytes(lp);
+    printf("{total bytes %zu} {num entries %lu}\n", lpbytes, lpLength(lp));
         
     p = lpFirst(lp);
     while(p) {
@@ -2013,7 +2019,7 @@ void lpRepr(unsigned char *lp) {
         }
         printf("\n}\n");
         index++;
-        p = lpNext(lp, p);
+        p = lpNextWithBytes(lp,p,lpbytes);
     }
     printf("{end}\n\n");
 }

@@ -395,6 +395,7 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
     listpackEx *lpt = o->ptr;
 
     ptr = lpFirst(lpt->lp);
+    const size_t lpbytes = lpBytes(lpt->lp);
 
     while (ptr != NULL && (info->itemsExpired < info->maxToExpire)) {
         long long val;
@@ -403,9 +404,9 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
 
         fref = lpGet(ptr, &flen, intbuf);
 
-        ptr = lpNext(lpt->lp, ptr);
+        ptr = lpNextWithBytes(lpt->lp,ptr,lpbytes);
         serverAssert(ptr);
-        ptr = lpNext(lpt->lp, ptr);
+        ptr = lpNextWithBytes(lpt->lp,ptr,lpbytes);
         serverAssert(ptr && lpGetIntegerValue(ptr, &val));
 
         /* Fields are ordered by expiry time. If we reached to a non-expired
@@ -416,7 +417,7 @@ void listpackExExpire(redisDb *db, robj *o, ExpireInfo *info) {
         propagateHashFieldDeletion(db, ((listpackEx *) o->ptr)->key, (char *)((fref) ? fref : intbuf), flen);
         server.stat_expired_subkeys++;
 
-        ptr = lpNext(lpt->lp, ptr);
+        ptr = lpNextWithBytes(lpt->lp,ptr,lpbytes);
 
         info->itemsExpired++;
         expired++;
@@ -1387,6 +1388,7 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         long long expire_time;
         unsigned char *zl = hashTypeListpackGetLp(hi->subject);
         unsigned char *fptr, *vptr, *tptr;
+        const size_t lpbytes = lpBytes(zl);
 
         fptr = hi->fptr;
         vptr = hi->vptr;
@@ -1399,22 +1401,22 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         } else {
             /* Advance cursor */
             serverAssert(tptr != NULL);
-            fptr = lpNext(zl, tptr);
+            fptr = lpNextWithBytes(zl,tptr,lpbytes);
         }
         if (fptr == NULL) return C_ERR;
 
         while (fptr != NULL) {
             /* Grab pointer to the value (fptr points to the field) */
-            vptr = lpNext(zl, fptr);
+            vptr = lpNextWithBytes(zl,fptr,lpbytes);
             serverAssert(vptr != NULL);
 
-            tptr = lpNext(zl, vptr);
+            tptr = lpNextWithBytes(zl,vptr,lpbytes);
             serverAssert(tptr && lpGetIntegerValue(tptr, &expire_time));
 
             if (!skipExpiredFields || !hashTypeIsExpired(hi->subject, expire_time))
                 break;
 
-            fptr = lpNext(zl, tptr);
+            fptr = lpNextWithBytes(zl,tptr,lpbytes);
         }
         if (fptr == NULL) return C_ERR;
 
@@ -1573,12 +1575,13 @@ void hashTypeConvertListpack(robj *o, int enc) {
 
         /* Append HASH_LP_NO_TTL to each field name - value pair. */
         p = lpFirst(o->ptr);
+        const size_t lpbytes = lpBytes(o->ptr);
         while (p != NULL) {
-            p = lpNext(o->ptr, p);
+            p = lpNextWithBytes(o->ptr,p,lpbytes);
             serverAssert(p);
 
             o->ptr = lpInsertInteger(o->ptr, HASH_LP_NO_TTL, p, LP_AFTER, &p);
-            p = lpNext(o->ptr, p);
+            p = lpNextWithBytes(o->ptr,p,lpbytes);
         }
 
         listpackEx *lpt = listpackExCreate();
@@ -3051,6 +3054,7 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
         return;
     } else if (hashObj->encoding == OBJ_ENCODING_LISTPACK_EX) {
         listpackEx *lpt = hashObj->ptr;
+        const size_t lpbytes = lpBytes(lpt->lp);
 
         addReplyArrayLen(c, numFields);
         for (int i = 0 ; i < numFields ; i++) {
@@ -3065,9 +3069,9 @@ static void httlGenericCommand(client *c, const char *cmd, long long basetime, i
                 continue;
             }
 
-            fptr = lpNext(lpt->lp, fptr);
+            fptr = lpNextWithBytes(lpt->lp,fptr,lpbytes);
             serverAssert(fptr);
-            fptr = lpNext(lpt->lp, fptr);
+            fptr = lpNextWithBytes(lpt->lp,fptr,lpbytes);
             serverAssert(fptr && lpGetIntegerValue(fptr, &expire));
 
             if (expire == HASH_LP_NO_TTL) {
@@ -3374,7 +3378,7 @@ void hpersistCommand(client *c) {
         long long prevExpire;
         unsigned char *fptr, *vptr, *tptr;
         listpackEx *lpt = hashObj->ptr;
-
+        const size_t lpbytes = lpBytes(lpt->lp);
         addReplyArrayLen(c, numFields);
         for (int i = 0 ; i < numFields ; i++) {
             sds field = c->argv[numFieldsAt + 1 + i]->ptr;
@@ -3388,9 +3392,9 @@ void hpersistCommand(client *c) {
                 continue;
             }
 
-            vptr = lpNext(lpt->lp, fptr);
+            vptr = lpNextWithBytes(lpt->lp,fptr,lpbytes);
             serverAssert(vptr);
-            tptr = lpNext(lpt->lp, vptr);
+            tptr = lpNextWithBytes(lpt->lp,vptr,lpbytes);
             serverAssert(tptr && lpGetIntegerValue(tptr, &prevExpire));
 
             if (prevExpire == HASH_LP_NO_TTL) {

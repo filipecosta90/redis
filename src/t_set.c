@@ -831,6 +831,7 @@ void spopWithCountCommand(client *c) {
         /* Specialized case for listpack. Traverse it only once. */
         unsigned char *lp = set->ptr;
         unsigned char *p = lpFirst(lp);
+        const size_t lpbytes = lpBytes(lp);
         unsigned int index = 0;
         unsigned char **ps = zmalloc(sizeof(char *) * count);
         for (unsigned long i = 0; i < count; i++) {
@@ -856,7 +857,7 @@ void spopWithCountCommand(client *c) {
 
             /* Store pointer for later deletion and move to next. */
             ps[i] = p;
-            p = lpNext(lp, p);
+            p = lpNextWithBytes(lp,p,lpbytes);
             index++;
         }
         lp = lpBatchDelete(lp, ps, count);
@@ -892,6 +893,7 @@ void spopWithCountCommand(client *c) {
             /* Specialized case for listpack. Traverse it only once. */
             newset = createSetListpackObject();
             unsigned char *lp = set->ptr;
+            const size_t lpbytes = lpBytes(lp);
             unsigned char *p = lpFirst(lp);
             unsigned int index = 0;
             unsigned char **ps = zmalloc(sizeof(char *) * remaining);
@@ -901,7 +903,7 @@ void spopWithCountCommand(client *c) {
                 str = (char *)lpGetValue(p, &len, (long long *)&llele);
                 setTypeAddAux(newset, str, len, llele, 0);
                 ps[i] = p;
-                p = lpNext(lp, p);
+                p = lpNextWithBytes(lp,p,lpbytes);
                 index++;
             }
             lp = lpBatchDelete(lp, ps, remaining);
@@ -1122,6 +1124,7 @@ void srandmemberWithCountCommand(client *c) {
      * listpack in CASE 4. So we use this instead. */
     if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = set->ptr;
+        const size_t lpbytes = lpBytes(lp);
         unsigned char *p = lpFirst(lp);
         unsigned int i = 0;
         addReplyArrayLen(c, count);
@@ -1134,7 +1137,7 @@ void srandmemberWithCountCommand(client *c) {
             } else {
                 addReplyBulkCBuffer(c, str, len);
             }
-            p = lpNext(lp, p);
+            p = lpNextWithBytes(lp, p, lpbytes);
             i++;
         }
         return;

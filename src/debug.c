@@ -155,6 +155,7 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
 
         if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *zl = o->ptr;
+            const size_t zlbytes = lpBytes(zl);
             unsigned char *eptr, *sptr;
             unsigned char *vstr;
             unsigned int vlen;
@@ -181,7 +182,7 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
                 buf[len] = '\0';
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
-                zzlNext(zl,&eptr,&sptr);
+                zzlNext(zl,&eptr,&sptr,zlbytes);
             }
         } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = o->ptr;

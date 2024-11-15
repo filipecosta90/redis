@@ -1882,6 +1882,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
 
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = o->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
         unsigned int vlen;
@@ -1890,7 +1891,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
 
         eptr = lpSeek(zl,0);
         serverAssert(eptr != NULL);
-        sptr = lpNext(zl,eptr);
+        sptr = lpNextWithBytes(zl,eptr,zlbytes);
         serverAssert(sptr != NULL);
 
         while (eptr != NULL) {
@@ -1914,7 +1915,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
             } else {
                 if (!rioWriteBulkLongLong(r,vll)) return 0;
             }
-            zzlNext(zl,&eptr,&sptr);
+            zzlNext(zl,&eptr,&sptr,zlbytes);
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }

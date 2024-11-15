@@ -265,6 +265,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
     size_t origincount = ga->used;
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
+        const size_t zlbytes = lpBytes(zl);
         unsigned char *eptr, *sptr;
         unsigned char *vstr = NULL;
         unsigned int vlen = 0;
@@ -276,7 +277,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             return 0;
         }
 
-        sptr = lpNext(zl, eptr);
+        sptr = lpNextWithBytes(zl, eptr, zlbytes);
         while (eptr) {
             double xy[2];
             double distance = 0;
@@ -293,7 +294,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
                 geoArrayAppend(ga, xy, distance, score, member);
             }
             if (ga->used && limit && ga->used >= limit) break;
-            zzlNext(zl, &eptr, &sptr);
+            zzlNext(zl, &eptr, &sptr, zlbytes);
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
