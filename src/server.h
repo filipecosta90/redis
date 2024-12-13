@@ -1156,40 +1156,54 @@ typedef struct {
 #endif
 
 typedef struct client {
+    /* Frequently accessed fields */
     uint64_t id;            /* Client incremental unique ID. */
     uint64_t flags;         /* Client flags: CLIENT_* macros. */
+    size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
+    struct redisCommand *cmd;  /* Last command executed. */
+    struct redisCommand *realcmd; /* The original command that was executed by the client,
+                                     Used to update error stats in case the c->cmd was modified
+                                     during the command invocation (like on GEOADD for example). */
+    int reqtype;            /* Request protocol type: PROTO_REQ_* */
+    int argc;               /* Num of arguments of current command. */
+    size_t qb_pos;          /* The position we have read in querybuf. */
+    sds querybuf;           /* Buffer we use to accumulate client queries. */
+    int bufpos;             /* Buffer position. */
+    /* Response buffer */
+    size_t buf_peak;        /* Peak used size of buffer in last 5 sec interval. */
+    mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
+    size_t buf_usable_size; /* Usable size of buffer. */
+
+    /* Moderately accessed fields */
+    robj **argv;            /* Arguments of current command. */
+    robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
+    struct redisCommand *lastcmd;  /* Last command executed. */
+    long duration;          /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
+    size_t sentlen;         /* Amount of bytes already sent in the current
+                               buffer or object being sent. */
+    time_t ctime;           /* Client creation time. */
+    list *reply;            /* List of reply objects to send to the client. */
+    list *deferred_reply_errors;    /* Used for module thread safe contexts. */
+    user *user;             /* User associated with this connection. If the
+                               user is set to NULL the connection can do
+                               anything (admin). */
+
+    /* Rarely accessed fields */
     connection *conn;
     int resp;               /* RESP protocol version. Can be 2 or 3. */
     redisDb *db;            /* Pointer to currently SELECTed DB. */
     robj *name;             /* As set by CLIENT SETNAME. */
     robj *lib_name;         /* The client library name as set by CLIENT SETINFO. */
     robj *lib_ver;          /* The client library version as set by CLIENT SETINFO. */
-    sds querybuf;           /* Buffer we use to accumulate client queries. */
-    size_t qb_pos;          /* The position we have read in querybuf. */
     size_t querybuf_peak;   /* Recent (100ms or more) peak of querybuf size. */
-    int argc;               /* Num of arguments of current command. */
-    robj **argv;            /* Arguments of current command. */
     int argv_len;           /* Size of argv array (may be more than argc) */
     int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
-    robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
-    size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
-    struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
-    struct redisCommand *realcmd; /* The original command that was executed by the client,
-                                     Used to update error stats in case the c->cmd was modified
-                                     during the command invocation (like on GEOADD for example). */
-    user *user;             /* User associated with this connection. If the
-                               user is set to NULL the connection can do
-                               anything (admin). */
-    int reqtype;            /* Request protocol type: PROTO_REQ_* */
+
+
     int multibulklen;       /* Number of multi bulk arguments left to read. */
     long bulklen;           /* Length of bulk argument in multi bulk request. */
-    list *reply;            /* List of reply objects to send to the client. */
     unsigned long long reply_bytes; /* Tot bytes of objects in reply list. */
-    list *deferred_reply_errors;    /* Used for module thread safe contexts. */
-    size_t sentlen;         /* Amount of bytes already sent in the current
-                               buffer or object being sent. */
-    time_t ctime;           /* Client creation time. */
-    long duration;          /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
+
     int slot;               /* The slot the client is executing against. Set to -1 if no slot is being used */
     dictEntry *cur_script;  /* Cached pointer to the dictEntry of the script being executed. */
     time_t lastinteraction; /* Time of the last interaction, used for timeout */
@@ -1269,11 +1283,6 @@ typedef struct client {
 
     /* list node in clients_pending_write list */
     listNode clients_pending_write_node;
-    /* Response buffer */
-    size_t buf_peak; /* Peak used size of buffer in last 5 sec interval. */
-    mstime_t buf_peak_last_reset_time; /* keeps the last time the buffer peak value was reset */
-    int bufpos;
-    size_t buf_usable_size; /* Usable size of buffer. */
     char *buf;
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
