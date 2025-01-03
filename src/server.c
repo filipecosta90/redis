@@ -4051,16 +4051,19 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Check if the user can run this command according to the current
-     * ACLs. */
-    int acl_errpos;
-    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
-    if (acl_retval != ACL_OK) {
-        addACLLogEntry(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
-        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
-        rejectCommandFormat(c, "-NOPERM %s", msg);
-        sdsfree(msg);
-        return C_OK;
+    /* If there is no associated user, the connection can run anything. */
+    if (unlikely(c->user != NULL)){
+        /* Check if the user can run this command according to the current
+        * ACLs. */
+        int acl_errpos;
+        const int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+        if (acl_retval != ACL_OK) {
+            addACLLogEntry(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
+            sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
+            rejectCommandFormat(c, "-NOPERM %s", msg);
+            sdsfree(msg);
+            return C_OK;
+        }
     }
 
     /* If cluster is enabled perform the cluster redirection here.
