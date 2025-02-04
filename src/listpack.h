@@ -35,6 +35,7 @@ typedef struct {
 
 unsigned char *lpNew(size_t capacity);
 void lpFree(unsigned char *lp);
+void lpFreeGeneric(void *lp);
 unsigned char* lpShrinkToFit(unsigned char *lp);
 unsigned char *lpInsertString(unsigned char *lp, unsigned char *s, uint32_t slen,
                               unsigned char *p, int where, unsigned char **newp);
@@ -65,6 +66,7 @@ unsigned char *lpFindCb(unsigned char *lp, unsigned char *p, void *user, lpCmp c
 unsigned char *lpFirst(unsigned char *lp);
 unsigned char *lpLast(unsigned char *lp);
 unsigned char *lpNext(unsigned char *lp, unsigned char *p);
+unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes);
 unsigned char *lpPrev(unsigned char *lp, unsigned char *p);
 size_t lpBytes(unsigned char *lp);
 size_t lpEntrySizeInteger(long long lval);

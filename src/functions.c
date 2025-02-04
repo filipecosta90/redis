@@ -144,6 +144,10 @@ static void engineLibraryFree(functionLibInfo* li) {
     zfree(li);
 }
 
+static void engineLibraryFreeGeneric(void *li) {
+    engineLibraryFree((functionLibInfo *)li);
+}
+
 static void engineLibraryDispose(dict *d, void *obj) {
     UNUSED(d);
     engineLibraryFree(obj);
@@ -338,7 +342,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
             } else {
                 if (!old_libraries_list) {
                     old_libraries_list = listCreate();
-                    listSetFreeMethod(old_libraries_list, (void (*)(void*))engineLibraryFree);
+                    listSetFreeMethod(old_libraries_list, engineLibraryFreeGeneric);
                 }
                 libraryUnlink(functions_lib_ctx_dst, old_li);
                 listAddNodeTail(old_libraries_list, old_li);
@@ -1063,7 +1067,7 @@ void functionLoadCommand(client *c) {
 }
 
 /* Return memory usage of all the engines combine */
-unsigned long functionsMemory(void) {
+unsigned long functionsMemoryVM(void) {
     dictIterator *iter = dictGetIterator(engines);
     dictEntry *entry = NULL;
     size_t engines_memory = 0;
@@ -1078,7 +1082,7 @@ unsigned long functionsMemory(void) {
 }
 
 /* Return memory overhead of all the engines combine */
-unsigned long functionsMemoryOverhead(void) {
+unsigned long functionsMemoryEngine(void) {
     size_t memory_overhead = dictMemUsage(engines);
     memory_overhead += dictMemUsage(curr_functions_lib_ctx->functions);
     memory_overhead += sizeof(functionsLibCtx);

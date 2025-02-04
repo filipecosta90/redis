@@ -115,12 +115,13 @@ typedef long long ustime_t;
 #define REDISMODULE_ZADD_LT      (1<<6)
 
 /* Hash API flags. */
-#define REDISMODULE_HASH_NONE       0
-#define REDISMODULE_HASH_NX         (1<<0)
-#define REDISMODULE_HASH_XX         (1<<1)
-#define REDISMODULE_HASH_CFIELDS    (1<<2)
-#define REDISMODULE_HASH_EXISTS     (1<<3)
-#define REDISMODULE_HASH_COUNT_ALL  (1<<4)
+#define REDISMODULE_HASH_NONE        0
+#define REDISMODULE_HASH_NX          (1<<0)
+#define REDISMODULE_HASH_XX          (1<<1)
+#define REDISMODULE_HASH_CFIELDS     (1<<2)
+#define REDISMODULE_HASH_EXISTS      (1<<3)
+#define REDISMODULE_HASH_COUNT_ALL   (1<<4)
+#define REDISMODULE_HASH_EXPIRE_TIME (1<<5) 
 
 #define REDISMODULE_CONFIG_DEFAULT 0 /* This is the default for a module config. */
 #define REDISMODULE_CONFIG_IMMUTABLE (1ULL<<0) /* Can this value only be set at startup? */
@@ -131,6 +132,7 @@ typedef long long ustime_t;
 
 #define REDISMODULE_CONFIG_MEMORY (1ULL<<7) /* Indicates if this value can be set as a memory value */
 #define REDISMODULE_CONFIG_BITFLAGS (1ULL<<8) /* Indicates if this value can be set as a multiple enum values */
+#define REDISMODULE_CONFIG_UNPREFIXED (1ULL<<9) /* Provided configuration name won't be prefixed with the module name */
 
 /* StreamID type. */
 typedef struct RedisModuleStreamID {
@@ -206,11 +208,13 @@ typedef struct RedisModuleStreamID {
 #define REDISMODULE_CTX_FLAGS_ASYNC_LOADING (1<<23)
 /* Redis is starting. */
 #define REDISMODULE_CTX_FLAGS_SERVER_STARTUP (1<<24)
+/* This context can call execute debug commands. */
+#define REDISMODULE_CTX_FLAGS_DEBUG_ENABLED (1<<25)
 
 /* Next context flag, must be updated when adding new flags above!
 This flag should not be used directly by the module.
  * Use RedisModule_GetContextFlagsAll instead. */
-#define _REDISMODULE_CTX_FLAGS_NEXT (1<<25)
+#define _REDISMODULE_CTX_FLAGS_NEXT (1<<26)
 
 /* Keyspace changes notification classes. Every class is associated with a
  * character for configuration purposes.
@@ -1082,6 +1086,7 @@ REDISMODULE_API int (*RedisModule_ZsetRangePrev)(RedisModuleKey *key) REDISMODUL
 REDISMODULE_API int (*RedisModule_ZsetRangeEndReached)(RedisModuleKey *key) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_HashSet)(RedisModuleKey *key, int flags, ...) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_HashGet)(RedisModuleKey *key, int flags, ...) REDISMODULE_ATTR;
+REDISMODULE_API mstime_t (*RedisModule_HashFieldMinExpire)(RedisModuleKey *key) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_StreamAdd)(RedisModuleKey *key, int flags, RedisModuleStreamID *id, RedisModuleString **argv, int64_t numfields) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_StreamDelete)(RedisModuleKey *key, RedisModuleStreamID *id) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_StreamIteratorStart)(RedisModuleKey *key, int flags, RedisModuleStreamID *startid, RedisModuleStreamID *endid) REDISMODULE_ATTR;
@@ -1287,6 +1292,7 @@ REDISMODULE_API RedisModuleString * (*RedisModule_GetCurrentUserName)(RedisModul
 REDISMODULE_API RedisModuleUser * (*RedisModule_GetModuleUserFromUserName)(RedisModuleString *name) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_ACLCheckCommandPermissions)(RedisModuleUser *user, RedisModuleString **argv, int argc) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_ACLCheckKeyPermissions)(RedisModuleUser *user, RedisModuleString *key, int flags) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_ACLCheckKeyPrefixPermissions)(RedisModuleUser *user, RedisModuleString *prefix, int flags) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_ACLCheckChannelPermissions)(RedisModuleUser *user, RedisModuleString *ch, int literal) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_ACLAddLogEntry)(RedisModuleCtx *ctx, RedisModuleUser *user, RedisModuleString *object, RedisModuleACLLogEntryReason reason) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_ACLAddLogEntryByUserName)(RedisModuleCtx *ctx, RedisModuleString *user, RedisModuleString *object, RedisModuleACLLogEntryReason reason) REDISMODULE_ATTR;
@@ -1451,6 +1457,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(ZsetRangeEndReached);
     REDISMODULE_GET_API(HashSet);
     REDISMODULE_GET_API(HashGet);
+    REDISMODULE_GET_API(HashFieldMinExpire);
     REDISMODULE_GET_API(StreamAdd);
     REDISMODULE_GET_API(StreamDelete);
     REDISMODULE_GET_API(StreamIteratorStart);
@@ -1656,6 +1663,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(GetModuleUserFromUserName);
     REDISMODULE_GET_API(ACLCheckCommandPermissions);
     REDISMODULE_GET_API(ACLCheckKeyPermissions);
+    REDISMODULE_GET_API(ACLCheckKeyPrefixPermissions);    
     REDISMODULE_GET_API(ACLCheckChannelPermissions);
     REDISMODULE_GET_API(ACLAddLogEntry);
     REDISMODULE_GET_API(ACLAddLogEntryByUserName);

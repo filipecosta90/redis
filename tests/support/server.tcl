@@ -373,6 +373,8 @@ proc run_external_server_test {code overrides} {
 
     r flushall
     r function flush
+    r script flush
+    r config resetstat
 
     # store configs
     set saved_config {}

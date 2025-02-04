@@ -3,6 +3,9 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  *
@@ -268,7 +271,7 @@ dict *configs = NULL; /* Runtime config values */
 
 /* Lookup a config by the provided sds string name, or return NULL
  * if the config does not exist */
-static standardConfig *lookupConfig(sds name) {
+static standardConfig *lookupConfig(const sds name) {
     dictEntry *de = dictFind(configs, name);
     return de ? dictGetVal(de) : NULL;
 }
@@ -430,6 +433,7 @@ void loadServerConfigFromString(char *config) {
         {"list-max-ziplist-entries", 2, 2},
         {"list-max-ziplist-value", 2, 2},
         {"lua-replicate-commands", 2, 2},
+        {"io-threads-do-reads", 2, 2},
         {NULL, 0},
     };
     char buf[1024];
@@ -552,16 +556,6 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"loadmodule") && argc >= 2) {
             queueLoadModule(argv[1],&argv[2],argc-2);
-        } else if (strchr(argv[0], '.')) {
-            if (argc < 2) {
-                err = "Module config specified without value";
-                goto loaderr;
-            }
-            sds name = sdsdup(argv[0]);
-            sds val = sdsdup(argv[1]);
-            for (int i = 2; i < argc; i++)
-                val = sdscatfmt(val, " %S", argv[i]);
-            if (!dictReplace(server.module_configs_queue, name, val)) sdsfree(name);
         } else if (!strcasecmp(argv[0],"sentinel")) {
             /* argc == 1 is handled by main() as we need to enter the sentinel
              * mode ASAP. */
@@ -573,7 +567,20 @@ void loadServerConfigFromString(char *config) {
                 queueSentinelConfig(argv+1,argc-1,linenum,lines[i]);
             }
         } else {
-            err = "Bad directive or wrong number of arguments"; goto loaderr;
+            /* Collect all unknown configurations into `module_configs_queue`.
+             * These may include valid module configurations or invalid ones.
+             * They will be validated later by loadModuleConfigs() against the
+             * configurations declared by the loaded module(s). */
+            
+            if (argc < 2) {
+                err = "Bad directive or wrong number of arguments";
+                goto loaderr;
+            }
+            sds name = sdsdup(argv[0]);
+            sds val = sdsdup(argv[1]);
+            for (int i = 2; i < argc; i++)
+                val = sdscatfmt(val, " %S", argv[i]);
+            if (!dictReplace(server.module_configs_queue, name, val)) sdsfree(name);
         }
         sdsfreesplitres(argv,argc);
         argv = NULL;
@@ -2547,11 +2554,10 @@ static int updateMaxclients(const char **err) {
         *err = msg;
         return 0;
     }
-    if ((unsigned int) aeGetSetSize(server.el) <
-        server.maxclients + CONFIG_FDSET_INCR)
-    {
-        if (aeResizeSetSize(server.el,
-            server.maxclients + CONFIG_FDSET_INCR) == AE_ERR)
+    size_t newsize = server.maxclients + CONFIG_FDSET_INCR;
+    if ((unsigned int) aeGetSetSize(server.el) < newsize) {
+        if (aeResizeSetSize(server.el, newsize) == AE_ERR ||
+            resizeAllIOThreadsEventLoops(newsize) == AE_ERR)
         {
             *err = "The event loop API used by Redis is not able to handle the specified number of clients";
             return 0;
@@ -3032,6 +3038,7 @@ static int applyClientMaxMemoryUsage(const char **err) {
     if (server.maxmemory_clients != 0)
         initServerClientMemUsageBuckets();
 
+    pauseAllIOThreads();
     /* When client eviction is enabled update memory buckets for all clients.
      * When disabled, clear that data structure. */
     listRewind(server.clients, &li);
@@ -3045,6 +3052,7 @@ static int applyClientMaxMemoryUsage(const char **err) {
             updateClientMemUsageAndBucket(c);
         }
     }
+    resumeAllIOThreads();
 
     if (server.maxmemory_clients == 0)
         freeServerClientMemUsageBuckets();
@@ -3071,6 +3079,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lazyfree-lazy-user-flush", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.lazyfree_lazy_user_flush , 0, NULL, NULL),
     createBoolConfig("repl-disable-tcp-nodelay", NULL, MODIFIABLE_CONFIG, server.repl_disable_tcp_nodelay, 0, NULL, NULL),
     createBoolConfig("repl-diskless-sync", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.repl_diskless_sync, 1, NULL, NULL),
+    createBoolConfig("repl-rdb-channel", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.repl_rdb_channel, 1, NULL, NULL),
     createBoolConfig("aof-rewrite-incremental-fsync", NULL, MODIFIABLE_CONFIG, server.aof_rewrite_incremental_fsync, 1, NULL, NULL),
     createBoolConfig("no-appendfsync-on-rewrite", NULL, MODIFIABLE_CONFIG, server.aof_no_fsync_on_rewrite, 0, NULL, NULL),
     createBoolConfig("cluster-require-full-coverage", NULL, MODIFIABLE_CONFIG, server.cluster_require_full_coverage, 1, NULL, NULL),
@@ -3213,6 +3222,7 @@ standardConfig static_configs[] = {
     createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024*1024, LONG_MAX, server.proto_max_bulk_len, 512ll*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.repl_backlog_size, 1024*1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 1mb */
+    createLongLongConfig("replica-full-sync-buffer-limit", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.repl_full_sync_buffer_limit, 0, MEMORY_CONFIG, NULL, NULL), /* Default: Inherits 'client-output-buffer-limit <replica>' */
 
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
@@ -3312,16 +3322,34 @@ void removeConfig(sds name) {
     standardConfig *config = lookupConfig(name);
     if (!config) return;
     if (config->flags & MODULE_CONFIG) {
+        
         sdsfree((sds) config->name);
-        if (config->type == ENUM_CONFIG) {
-            configEnum *enumNode = config->data.enumd.enum_value;
-            while(enumNode->name != NULL) {
-                zfree(enumNode->name);
-                enumNode++;
-            }
-            zfree(config->data.enumd.enum_value);
-        } else if (config->type == SDS_CONFIG) {
-            if (config->data.sds.default_value) sdsfree((sds)config->data.sds.default_value);
+        sdsfree((sds) config->alias);
+        
+        switch (config->type) {
+            case BOOL_CONFIG:
+                break;
+            case NUMERIC_CONFIG:
+                break;
+            case SDS_CONFIG:
+                if (config->data.sds.default_value) 
+                    sdsfree((sds)config->data.sds.default_value);
+                break;
+            case ENUM_CONFIG: 
+                {
+                    configEnum *enumNode = config->data.enumd.enum_value;
+                    while(enumNode->name != NULL) {
+                        zfree(enumNode->name);
+                        enumNode++;
+                    }
+                    zfree(config->data.enumd.enum_value);
+                }
+                break;
+            case SPECIAL_CONFIG: /* Not used by modules */
+            case STRING_CONFIG: /* Not used by modules */
+            default:
+                serverAssert(0);
+                break;
         }
     }
     dictDelete(configs, name);
@@ -3332,40 +3360,77 @@ void removeConfig(sds name) {
  *----------------------------------------------------------------------------*/
 
 /* Create a bool/string/enum/numeric standardConfig for a module config in the configs dictionary */
-void addModuleBoolConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val) {
-    sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
+
+/* On removeConfig(), name and alias will be sdsfree() */
+void addModuleBoolConfig(sds name, sds alias, int flags, void *privdata, int default_val) {
     int config_dummy_address;
-    standardConfig module_config = createBoolConfig(config_name, NULL, flags | MODULE_CONFIG, config_dummy_address, default_val, NULL, NULL);
-    module_config.data.yesno.config = NULL;
-    module_config.privdata = privdata;
-    registerConfigValue(config_name, &module_config, 0);
+    standardConfig sc = createBoolConfig(name, alias, flags | MODULE_CONFIG, config_dummy_address, default_val, NULL, NULL);
+    sc.data.yesno.config = NULL;
+    sc.privdata = privdata;
+    registerConfigValue(name, &sc, 0);
+
+    /* If alias available, deep copy standardConfig and register again */
+    if (alias) {
+        sc.name = sdsdup(name);
+        sc.alias = sdsdup(alias);
+        registerConfigValue(sc.alias, &sc, 1);
+    }
 }
 
-void addModuleStringConfig(const char *module_name, const char *name, int flags, void *privdata, sds default_val) {
-    sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
+/* On removeConfig(), name, default_val, and alias will be sdsfree() */
+void addModuleStringConfig(sds name, sds alias, int flags, void *privdata, sds default_val) {
     sds config_dummy_address;
-    standardConfig module_config = createSDSConfig(config_name, NULL, flags | MODULE_CONFIG, 0, config_dummy_address, default_val, NULL, NULL);
-    module_config.data.sds.config = NULL;
-    module_config.privdata = privdata;
-    registerConfigValue(config_name, &module_config, 0);
+    standardConfig sc = createSDSConfig(name, alias, flags | MODULE_CONFIG, 0, config_dummy_address, default_val, NULL, NULL);
+    sc.data.sds.config = NULL;
+    sc.privdata = privdata;
+    registerConfigValue(name, &sc, 0); /* memcpy sc */
+
+    /* If alias available, deep copy standardConfig and register again */
+    if (alias) {
+        sc.name = sdsdup(name);
+        sc.alias = sdsdup(alias);
+        if (default_val) sc.data.sds.default_value = sdsdup(default_val);
+        registerConfigValue(sc.alias, &sc, 1);
+    }
 }
 
-void addModuleEnumConfig(const char *module_name, const char *name, int flags, void *privdata, int default_val, configEnum *enum_vals) {
-    sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
+/* On removeConfig(), name, default_val, alias and enum_vals will be freed */
+void addModuleEnumConfig(sds name, sds alias, int flags, void *privdata, int default_val, configEnum *enum_vals, int num_enum_vals) {
     int config_dummy_address;
-    standardConfig module_config = createEnumConfig(config_name, NULL, flags | MODULE_CONFIG, enum_vals, config_dummy_address, default_val, NULL, NULL);
-    module_config.data.enumd.config = NULL;
-    module_config.privdata = privdata;
-    registerConfigValue(config_name, &module_config, 0);
+    standardConfig sc = createEnumConfig(name, alias, flags | MODULE_CONFIG, enum_vals, config_dummy_address, default_val, NULL, NULL);
+    sc.data.enumd.config = NULL;
+    sc.privdata = privdata;
+    registerConfigValue(name, &sc, 0);
+
+    /* If alias available, deep copy standardConfig and register again */
+    if (alias) {
+        sc.name = sdsdup(name);
+        sc.alias = sdsdup(alias);
+        sc.data.enumd.enum_value = zmalloc((num_enum_vals + 1) * sizeof(configEnum));
+        for (int i = 0; i < num_enum_vals; i++) {
+            sc.data.enumd.enum_value[i].name = zstrdup(enum_vals[i].name);
+            sc.data.enumd.enum_value[i].val = enum_vals[i].val;
+        }
+        sc.data.enumd.enum_value[num_enum_vals].name = NULL;
+        sc.data.enumd.enum_value[num_enum_vals].val = 0;        
+        registerConfigValue(sc.alias, &sc, 1);
+    }    
 }
 
-void addModuleNumericConfig(const char *module_name, const char *name, int flags, void *privdata, long long default_val, int conf_flags, long long lower, long long upper) {
-    sds config_name = sdscatfmt(sdsempty(), "%s.%s", module_name, name);
+/* On removeConfig(), it will free name, and alias if it is not NULL */
+void addModuleNumericConfig(sds name, sds alias, int flags, void *privdata, long long default_val, int conf_flags, long long lower, long long upper) {
     long long config_dummy_address;
-    standardConfig module_config = createLongLongConfig(config_name, NULL, flags | MODULE_CONFIG, lower, upper, config_dummy_address, default_val, conf_flags, NULL, NULL);
-    module_config.data.numeric.config.ll = NULL;
-    module_config.privdata = privdata;
-    registerConfigValue(config_name, &module_config, 0);
+    standardConfig sc = createLongLongConfig(name, alias, flags | MODULE_CONFIG, lower, upper, config_dummy_address, default_val, conf_flags, NULL, NULL);
+    sc.data.numeric.config.ll = NULL;
+    sc.privdata = privdata;
+    registerConfigValue(name, &sc, 0);
+
+    /* If alias available, deep copy standardConfig and register again */
+    if (alias) {
+        sc.name = sdsdup(name);
+        sc.alias = sdsdup(alias);
+        registerConfigValue(sc.alias, &sc, 1);
+    }
 }
 
 /*-----------------------------------------------------------------------------
@@ -3417,4 +3482,8 @@ void configRewriteCommand(client *c) {
         serverLog(LL_NOTICE,"CONFIG REWRITE executed with success.");
         addReply(c,shared.ok);
     }
+}
+
+int configExists(const sds name) {
+    return lookupConfig(name) != NULL;
 }

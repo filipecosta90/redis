@@ -1884,6 +1884,35 @@ start_server {tags {"scripting needs:debug"}} {
 }
 
 start_server {tags {"scripting"}} {
+    test "Test script flush will not leak memory - script:$is_eval" {
+        r flushall
+        r script flush
+        r function flush
+
+        # This is a best-effort test to check we don't leak some resources on
+        # script flush and function flush commands. For lua vm, we create a
+        # jemalloc thread cache. On each script flush command, thread cache is
+        # destroyed and we create a new one. In this test, running script flush
+        # many times to verify there is no increase in the memory usage while
+        # re-creating some of the resources for lua vm.
+        set used_memory [s used_memory]
+        set allocator_allocated [s allocator_allocated]
+
+        r multi
+        for {set j 1} {$j <= 500} {incr j} {
+            if {$is_eval} {
+                r SCRIPT FLUSH
+            } else {
+                r FUNCTION FLUSH
+            }
+        }
+        r exec
+
+        # Verify used memory is not (much) higher.
+        assert_lessthan [s used_memory] [expr $used_memory*1.5]
+        assert_lessthan [s allocator_allocated] [expr $allocator_allocated*1.5]
+    }
+
     test "Verify Lua performs GC correctly after script loading" {
         set dummy_script "--[string repeat x 10]\nreturn "
         set n 50000
