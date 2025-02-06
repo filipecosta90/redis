@@ -3562,6 +3562,11 @@ int incrCommandStatsOnError(struct redisCommand *cmd, int flags) {
     return res;
 }
 
+/* Returns true if the command is not internal, or the connection is internal. */
+static bool commandVisibleForClient(client *c, struct redisCommand *cmd) {
+    return (!(cmd->flags & CMD_INTERNAL)) || (c->flags & CLIENT_INTERNAL);
+}
+
 /* Call() is the core of Redis execution of a command.
  *
  * The following flags can be passed:
@@ -3713,7 +3718,8 @@ void call(client *c, int flags) {
      * Other exceptions is a client which is unblocked and retrying to process the command
      * or we are currently in the process of loading AOF. */
     if (update_command_stats && !reprocessing_command &&
-        !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN))) {
+        !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
+    {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
         int argc = c->original_argv ? c->original_argc : c->argc;
         replicationFeedMonitors(c,server.monitors,c->db->id,argv,argc);
@@ -3992,6 +3998,7 @@ int processCommand(client *c) {
      * we do not have to repeat the same checks */
     if (!client_reprocessing_command) {
         struct redisCommand *cmd = c->iolookedcmd ? c->iolookedcmd : lookupCommand(c->argv, c->argc);
+
         if (!cmd) {
             /* Handle possible security attacks. */
             if (!strcasecmp(c->argv[0]->ptr,"host:") || !strcasecmp(c->argv[0]->ptr,"post")) {
@@ -3999,6 +4006,13 @@ int processCommand(client *c) {
                 return C_ERR;
             }
         }
+
+        /* Internal commands seem unexistent to non-internal connections.
+         * masters and AOF loads are implicitly internal. */
+        if (cmd && (cmd->flags & CMD_INTERNAL) && !((c->flags & CLIENT_INTERNAL) || mustObeyClient(c))) {
+            cmd = NULL;
+        }
+
         c->cmd = c->lastcmd = c->realcmd = cmd;
         sds err;
         if (!commandCheckExistence(c, &err)) {
@@ -5019,7 +5033,7 @@ void addReplyCommandKeySpecs(client *c, struct redisCommand *cmd) {
 
 /* Reply with an array of sub-command using the provided reply callback. */
 void addReplyCommandSubCommands(client *c, struct redisCommand *cmd, void (*reply_function)(client*, struct redisCommand*), int use_map) {
-    if (!cmd->subcommands_dict) {
+    if (!cmd->subcommands_dict || !commandVisibleForClient(c, cmd)) {
         addReplySetLen(c, 0);
         return;
     }
@@ -5041,7 +5055,7 @@ void addReplyCommandSubCommands(client *c, struct redisCommand *cmd, void (*repl
 
 /* Output the representation of a Redis command. Used by the COMMAND command and COMMAND INFO. */
 void addReplyCommandInfo(client *c, struct redisCommand *cmd) {
-    if (!cmd) {
+    if (!cmd || !commandVisibleForClient(c, cmd)) {
         addReplyNull(c);
     } else {
         int firstkey = 0, lastkey = 0, keystep = 0;
@@ -5145,7 +5159,7 @@ void getKeysSubcommandImpl(client *c, int with_flags) {
     getKeysResult result = GETKEYS_RESULT_INIT;
     int j;
 
-    if (!cmd) {
+    if (!cmd || !commandVisibleForClient(c, cmd)) {
         addReplyError(c,"Invalid command specified");
         return;
     } else if (!doesCommandHaveKeys(cmd)) {
@@ -5189,22 +5203,39 @@ void getKeysSubcommand(client *c) {
     getKeysSubcommandImpl(c, 0);
 }
 
-/* COMMAND (no args) */
-void commandCommand(client *c) {
+void genericCommandCommand(client *c, int count_only) {
     dictIterator *di;
     dictEntry *de;
+    void *len = NULL;
+    int count = 0;
 
-    addReplyArrayLen(c, dictSize(server.commands));
+    if (!count_only)
+        len = addReplyDeferredLen(c);
+
     di = dictGetIterator(server.commands);
     while ((de = dictNext(di)) != NULL) {
-        addReplyCommandInfo(c, dictGetVal(de));
+        struct redisCommand *cmd = dictGetVal(de);
+        if (!commandVisibleForClient(c, cmd))
+            continue;
+        if (!count_only)
+            addReplyCommandInfo(c, dictGetVal(de));
+        count++;
     }
     dictReleaseIterator(di);
+    if (count_only)
+        addReplyLongLong(c, count);
+    else
+        setDeferredArrayLen(c, len, count);
+}
+
+/* COMMAND (no args) */
+void commandCommand(client *c) {
+    genericCommandCommand(c, 0);
 }
 
 /* COMMAND COUNT */
 void commandCountCommand(client *c) {
-    addReplyLongLong(c, dictSize(server.commands));
+    genericCommandCommand(c, 1);
 }
 
 typedef enum {
@@ -5258,7 +5289,7 @@ void commandListWithFilter(client *c, dict *commands, commandListFilter filter, 
 
     while ((de = dictNext(di)) != NULL) {
         struct redisCommand *cmd = dictGetVal(de);
-        if (!shouldFilterFromCommandList(cmd,&filter)) {
+        if (commandVisibleForClient(c, cmd) && !shouldFilterFromCommandList(cmd,&filter)) {
             addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
             (*numcmds)++;
         }
@@ -5277,8 +5308,10 @@ void commandListWithoutFilter(client *c, dict *commands, int *numcmds) {
 
     while ((de = dictNext(di)) != NULL) {
         struct redisCommand *cmd = dictGetVal(de);
-        addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
-        (*numcmds)++;
+        if (commandVisibleForClient(c, cmd)) {
+            addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
+            (*numcmds)++;
+        }
 
         if (cmd->subcommands_dict) {
             commandListWithoutFilter(c, cmd->subcommands_dict, numcmds);
@@ -5334,14 +5367,7 @@ void commandInfoCommand(client *c) {
     int i;
 
     if (c->argc == 2) {
-        dictIterator *di;
-        dictEntry *de;
-        addReplyArrayLen(c, dictSize(server.commands));
-        di = dictGetIterator(server.commands);
-        while ((de = dictNext(di)) != NULL) {
-            addReplyCommandInfo(c, dictGetVal(de));
-        }
-        dictReleaseIterator(di);
+        genericCommandCommand(c, 0);
     } else {
         addReplyArrayLen(c, c->argc-2);
         for (i = 2; i < c->argc; i++) {
@@ -5353,25 +5379,29 @@ void commandInfoCommand(client *c) {
 /* COMMAND DOCS [command-name [command-name ...]] */
 void commandDocsCommand(client *c) {
     int i;
+    int numcmds = 0;
     if (c->argc == 2) {
         /* Reply with an array of all commands */
         dictIterator *di;
         dictEntry *de;
-        addReplyMapLen(c, dictSize(server.commands));
+        void *replylen = addReplyDeferredLen(c);
         di = dictGetIterator(server.commands);
         while ((de = dictNext(di)) != NULL) {
             struct redisCommand *cmd = dictGetVal(de);
-            addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
-            addReplyCommandDocs(c, cmd);
+            if (commandVisibleForClient(c, cmd)) {
+                addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
+                addReplyCommandDocs(c, cmd);
+                numcmds++;
+            }
         }
         dictReleaseIterator(di);
+        setDeferredMapLen(c,replylen,numcmds);
     } else {
         /* Reply with an array of the requested commands (if we find them) */
-        int numcmds = 0;
         void *replylen = addReplyDeferredLen(c);
         for (i = 2; i < c->argc; i++) {
             struct redisCommand *cmd = lookupCommandBySds(c->argv[i]->ptr);
-            if (!cmd)
+            if (!cmd || !commandVisibleForClient(c, cmd))
                 continue;
             addReplyBulkCBuffer(c, cmd->fullname, sdslen(cmd->fullname));
             addReplyCommandDocs(c, cmd);

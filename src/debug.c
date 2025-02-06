@@ -494,6 +494,8 @@ void debugCommand(client *c) {
 "    Enable or disable the main dict and expire dict resizing.",
 "SCRIPT <LIST|<sha>>",
 "    Output SHA and content of all scripts or of a specific script with its SHA.",
+"MARK-INTERNAL-CLIENT [UNMARK]",
+"    Promote the current connection to an internal connection.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -1074,6 +1076,17 @@ NULL
             return;
         }
         addReply(c,shared.ok);
+    } else if(!strcasecmp(c->argv[1]->ptr,"mark-internal-client") && c->argc < 4) {
+        if (c->argc == 2) {
+            c->flags |= CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "unmark")) {
+            c->flags &= ~CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;

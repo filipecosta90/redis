@@ -660,6 +660,10 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     listRewind(monitors,&li);
     while((ln = listNext(&li))) {
         client *monitor = ln->value;
+        /* Do not show internal commands to non-internal clients. */
+        if (c->realcmd && (c->realcmd->flags & CMD_INTERNAL) && !(monitor->flags & CLIENT_INTERNAL)) {
+            continue;
+        }
         addReply(monitor,cmdobj);
         updateClientMemUsageAndBucket(monitor);
     }
