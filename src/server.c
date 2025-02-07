@@ -271,6 +271,21 @@ void dictDictDestructor(dict *d, void *val)
     dictRelease((dict*)val);
 }
 
+size_t dictSdsLen(dict *d, const void *key)
+{
+    UNUSED(d);
+
+    return sdslen((sds)key);
+}
+
+int dictSdsKeyCompareWithLen(dict *d, const void *key1,
+        const void *key2, const size_t l1, const size_t l2)
+{
+    UNUSED(d);
+    if (l1 != l2) return 0;
+    return memcmp(key1, key2, l1) == 0;
+}
+
 int dictSdsKeyCompare(dict *d, const void *key1,
         const void *key2)
 {
@@ -495,6 +510,8 @@ dictType dbDictType = {
     dictSdsDestructor,          /* key destructor */
     dictObjectDestructor,       /* val destructor */
     dictResizeAllowed,          /* allow to resize */
+    .keyLen = dictSdsLen,       /* key length */
+    .keyCompareWithLen = dictSdsKeyCompareWithLen /* key compare with length */
 };
 
 /* Db->expires */

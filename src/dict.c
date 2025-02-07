@@ -72,12 +72,26 @@ static int dictDefaultCompare(dict *d, const void *key1, const void *key2);
 /* -------------------------- misc inline functions -------------------------------- */
 
 typedef int (*keyCmpFunc)(dict *d, const void *key1, const void *key2);
+typedef size_t (*keyLenFunc)(dict *d, const void *key1);
+typedef int (*keyCmpFuncWithLen)(dict *d, const void *key1, const void *key2, const size_t key1Len,const size_t key2Len);
 static inline keyCmpFunc dictGetKeyCmpFunc(dict *d) {
     if (d->useStoredKeyApi && d->type->storedKeyCompare)
         return d->type->storedKeyCompare;
     if (d->type->keyCompare)
         return d->type->keyCompare;
     return dictDefaultCompare;
+}
+
+static inline keyCmpFuncWithLen dictGetKeyCmpFuncWithLen(dict *d) {
+    if (d->type->keyCompareWithLen)
+        return d->type->keyCompareWithLen;
+    return NULL;
+}
+
+static inline keyLenFunc dictGetKeyLenFunc(dict *d) {
+    if (d->type->keyLen)
+        return d->type->keyLen;
+    return NULL;
 }
 
 static inline uint64_t dictHashKey(dict *d, const void *key, int isStoredKey) {
@@ -744,6 +758,11 @@ dictEntry *dictFind(dict *d, const void *key)
     idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
     keyCmpFunc cmpFunc = dictGetKeyCmpFunc(d);
 
+    /* Check if we can use the compare function with length to avoid recomputing length of key always */
+    keyCmpFuncWithLen cmpFuncWithLen = dictGetKeyCmpFuncWithLen(d);
+    keyLenFunc keyLenFunc = dictGetKeyLenFunc(d);
+    const int has_len_fn = (keyLenFunc != NULL && cmpFuncWithLen != NULL);
+    const size_t keyLen = has_len_fn ? keyLenFunc(d, key) : 0;
     if (dictIsRehashing(d)) {
         if ((long)idx >= d->rehashidx && d->ht_table[0][idx]) {
             /* If we have a valid hash entry at `idx` in ht0, we perform
@@ -762,7 +781,8 @@ dictEntry *dictFind(dict *d, const void *key)
         he = d->ht_table[table][idx];
         while(he) {
             void *he_key = dictGetKey(he);
-            if (key == he_key || cmpFunc(d, key, he_key))
+            if (key == he_key ||
+                (has_len_fn ? cmpFuncWithLen(d, key, he_key, keyLen, keyLenFunc(d, he_key)) : cmpFunc(d, key, he_key)))
                 return he;
             he = dictGetNext(he);
         }
@@ -770,6 +790,7 @@ dictEntry *dictFind(dict *d, const void *key)
     }
     return NULL;
 }
+
 
 void *dictFetchValue(dict *d, const void *key) {
     dictEntry *he;

@@ -88,6 +88,10 @@ typedef struct dictType {
 
     /* Optional callback called when the dict is destroyed. */
     void (*onDictRelease)(dict *d);
+
+    /* Optional keylen to avoid duplication computation of key lengths*/
+    size_t (*keyLen)(dict *d, const void *key);
+    int (*keyCompareWithLen)(dict *d, const void *key1, const void *key2, const size_t l1, const size_t l2);
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
