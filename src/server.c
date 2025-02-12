@@ -3921,7 +3921,14 @@ int processCommand(client *c) {
      * In case we are reprocessing a command after it was blocked,
      * we do not have to repeat the same checks */
     if (!client_reprocessing_command) {
-        c->cmd = c->lastcmd = c->realcmd = lookupCommand(c->argv,c->argc);
+        struct redisCommand *cmd = NULL;
+        if (c->lastcmd!=NULL && c->lastcmd->subcommands_dict==NULL
+                             && strcasecmp(c->lastcmd->fullname,c->argv[0]->ptr)==0){
+            cmd = c->lastcmd;
+        } else {
+            cmd =  lookupCommand(c->argv, c->argc);
+        }
+        c->cmd = c->lastcmd = c->realcmd = cmd;
         sds err;
         if (!commandCheckExistence(c, &err)) {
             rejectCommandSds(c, err);
