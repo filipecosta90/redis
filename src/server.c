@@ -1830,6 +1830,20 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             dont_sleep = 1;
     }
 
+    /* Corresponding to IOThreadBeforeSleep, process the clients from IO threads
+     * without notification. */
+    if (processClientsOfAllIOThreads() > 0) {
+        /* If there are clients that are processed, it means IO thread is busy to
+         * trafer clients to main thread, so the main thread does not sleep. */
+        dont_sleep = 1;
+    }
+    if (!dont_sleep) {
+        atomicSetWithSync(server.running, 0); /* Not running if going to sleep. */
+        /* Try to process the clients from IO threads again, since before setting running
+         * to 0, some client may be transferred without notification. */
+        processClientsOfAllIOThreads();
+    }
+
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWrites();
 
@@ -1920,6 +1934,8 @@ void afterSleep(struct aeEventLoop *eventLoop) {
     if (!ProcessingEventsWhileBlocked) {
         server.cmd_time_snapshot = server.mstime;
     }
+
+    atomicSetWithSync(server.running, 1);
 }
 
 /* =========================== Server initialization ======================== */
@@ -2831,6 +2847,7 @@ void initServer(void) {
     server.repl_good_slaves_count = 0;
     server.last_sig_received = 0;
     memset(server.io_threads_clients_num, 0, sizeof(server.io_threads_clients_num));
+    atomicSetWithSync(server.running, 0);
 
     /* Initiate acl info struct */
     server.acl_info.invalid_cmd_accesses = 0;

@@ -366,7 +366,11 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEnt
     if (old->type == OBJ_HASH)
         hashTypeRemoveFromExpires(&db->hexpires, old);
 
-    if (server.lazyfree_lazy_server_del) {
+    /* In multi-threaded mode, the OBJ_ENCODING_RAW string object usually is
+     * allocated in the io thread, so we defer the free to the io thread. */
+    if (server.io_threads_num > 1 && old->encoding == OBJ_ENCODING_RAW && server.current_client) {
+        tryDeferFreeObject(server.current_client, old);
+    } else if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key,old,db->id);
     } else {
         decrRefCount(old);

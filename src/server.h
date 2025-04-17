@@ -189,6 +189,10 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 /* Max number of IO threads */
 #define IO_THREADS_MAX_NUM 128
 
+/* To make IO threads and main thread run in parallel, we will transfer clients
+ * between them if the number of clients in the pending list reaches this value. */
+#define IO_THREAD_MAX_PENDING_CLIENTS 32
+
 /* Main thread id for doing IO work, whatever we enable or disable io thread
  * the main thread always does IO work, so we can consider that the main thread
  * is the io thread 0. */
@@ -401,6 +405,9 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 
 /* Any flag that does not let optimize FLUSH SYNC to run it in bg as blocking client ASYNC */
 #define CLIENT_AVOID_BLOCKING_ASYNC_FLUSH (CLIENT_DENY_BLOCKING|CLIENT_MULTI|CLIENT_LUA_DEBUG|CLIENT_LUA_DEBUG_SYNC|CLIENT_MODULE)
+
+/* Max deferred objects to be freed by IO thread for each client. */
+#define CLIENT_MAX_DEFERRED_OBJECTS 32
 
 /* Client flags for client IO */
 #define CLIENT_IO_READ_ENABLED (1ULL<<0) /* Client can read from socket. */
@@ -1290,6 +1297,8 @@ typedef struct client {
     int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
     size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
+    robj **deferred_objects;    /* List of deferred objects to free. */
+    int deferred_objects_num; /* Number of deferred objects to free. */
     struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
     struct redisCommand *iolookedcmd;    /* Command looked up in IO threads. */
     struct redisCommand *realcmd; /* The original command that was executed by the client,
@@ -1409,6 +1418,7 @@ typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
                                                  * than 256, we should also promote the data type. */
     pthread_t tid;                              /* Pthread ID */
     redisAtomic int paused;                     /* Paused status for the io thread. */
+    redisAtomic int running;                    /* Running if true, main thread can send clients directly. */
     aeEventLoop *el;                            /* Main event loop of io thread. */
     list *pending_clients;                      /* List of clients with pending writes. */
     list *processing_clients;                   /* List of clients being processed. */
@@ -1729,6 +1739,7 @@ struct redisServer {
     int client_pause_in_transaction; /* Was a client pause executed during this Exec? */
     int thp_enabled;                 /* If true, THP is enabled. */
     size_t page_size;                /* The page size of OS. */
+    redisAtomic int running;    /* Running if true, IO threads can send clients without notification */
     /* Modules */
     dict *moduleapi;            /* Exported core APIs dictionary for modules. */
     dict *sharedapi;            /* Like moduleapi but containing the APIs that
@@ -2740,6 +2751,8 @@ void clearClientConnectionState(client *c);
 void resetClient(client *c);
 void freeClientOriginalArgv(client *c);
 void freeClientArgv(client *c);
+void tryDeferFreeObject(client *c, robj *o);
+void freeDeferredObjects(client *c, int free_array);
 void sendReplyToClient(connection *conn);
 void *addReplyDeferredLen(client *c);
 void setDeferredArrayLen(client *c, void *node, long length);
@@ -2859,7 +2872,8 @@ void enqueuePendingClientsToMainThread(client *c, int unbind);
 void putInPendingClienstForIOThreads(client *c);
 void handleClientReadError(client *c);
 void unbindClientFromIOThreadEventLoop(client *c);
-void processClientsOfAllIOThreads(void);
+int processClientsOfAllIOThreads(void);
+int processClientsFromMainThread(IOThread *t);
 void assignClientToIOThread(client *c);
 void fetchClientFromIOThread(client *c);
 int isClientMustHandledByMainThread(client *c);
