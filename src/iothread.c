@@ -30,7 +30,7 @@ static inline void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check
     pending = listLength(mainThreadPendingClients[t->id]);
     listJoin(mainThreadPendingClients[t->id], t->pending_clients_to_main_thread);
     pthread_mutex_unlock(&mainThreadPendingClientsMutexes[t->id]);
-    atomicGetWithSync(server.running, running);
+    if (!pending) atomicGetWithSync(server.running, running);
 
     /* Only notify main thread if it is not running and no pending clients to process,
      * to avoid unnecessary notify/wakeup. If the main thread is running, it will
@@ -360,7 +360,7 @@ static inline void sendPendingClientsToIOThreadIfNeeded(IOThread *t, int size_ch
         pending = listLength(t->pending_clients);
         listJoin(t->pending_clients, mainThreadPendingClientsToIOThreads[t->id]);
         pthread_mutex_unlock(&(t->pending_clients_mutex));
-        atomicGetWithSync(t->running, running);
+        if (!pending) atomicGetWithSync(t->running, running);
 
         /* Only notify io thread if it is not running and no pending clients to
          * process, to avoid unnecessary notify/wakeup. If the io thread is running,

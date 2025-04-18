@@ -191,7 +191,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 
 /* To make IO threads and main thread run in parallel, we will transfer clients
  * between them if the number of clients in the pending list reaches this value. */
-#define IO_THREAD_MAX_PENDING_CLIENTS 32
+#define IO_THREAD_MAX_PENDING_CLIENTS 16
 
 /* Main thread id for doing IO work, whatever we enable or disable io thread
  * the main thread always does IO work, so we can consider that the main thread
