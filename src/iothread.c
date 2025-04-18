@@ -21,7 +21,7 @@ static eventNotifier* mainThreadPendingClientsNotifiers[IO_THREADS_MAX_NUM]; /* 
 
 /* Send the clients to the main thread for processing when the number of clients
  * in pending list reaches IO_THREAD_MAX_PENDING_CLIENTS, or check_size is 0. */
-void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check_size) {
+static inline void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check_size) {
     size_t len = listLength(t->pending_clients_to_main_thread);
     if (len == 0 || (check_size && len < IO_THREAD_MAX_PENDING_CLIENTS)) return;
 
@@ -343,7 +343,7 @@ extern int ProcessingEventsWhileBlocked;
 
 /* Send the pending clients to the IO thread if the number of pending clients
  * is greater than IO_THREAD_MAX_PENDING_CLIENTS, or if size_check is 0. */
-void sendPendingClientsToIOThreadIfNeeded(IOThread *t, int size_check) {
+static inline void sendPendingClientsToIOThreadIfNeeded(IOThread *t, int size_check) {
     size_t len = listLength(mainThreadPendingClientsToIOThreads[t->id]);
     if (len == 0 || (size_check && len < IO_THREAD_MAX_PENDING_CLIENTS)) return;
 
