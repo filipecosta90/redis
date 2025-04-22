@@ -1413,6 +1413,8 @@ int VLINKS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     if (!node)
         return RedisModule_ReplyWithNull(ctx);
 
+    const u_int32_t quant_type = vset->hnsw->quant_type;
+    const u_int32_t vector_dim = vset->hnsw->vector_dim;
     /* Reply with array of arrays, one per level. */
     RedisModule_ReplyWithArray(ctx, node->level + 1);
 
@@ -1429,7 +1431,9 @@ int VLINKS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
             struct vsetNodeVal *nv = node->layers[i].links[j]->value;
             RedisModule_ReplyWithString(ctx, nv->item);
             if (withscores) {
-                float distance = hnsw_distance(vset->hnsw, node, node->layers[i].links[j]);
+                float distance = hnsw_distance(vector_dim, quant_type,
+                                               node->vector, node->quants_range,
+                                               node->layers[i].links[j]->vector, node->layers[i].links[j]->quants_range);
                 /* Convert distance to similarity score to match
                  * VSIM behavior.*/
                 float similarity = 1.0 - distance/2.0;

@@ -301,14 +301,16 @@ float vectors_distance_bin(const uint64_t *x, const uint64_t *y, uint32_t dim) {
 
 /* Dot product between nodes. Will call the right version depending on the
  * quantization used. */
-float hnsw_distance(HNSW *index, hnswNode *a, hnswNode *b) {
-    switch(index->quant_type) {
+float hnsw_distance(uint32_t vector_dim, uint32_t quant_type,
+                    void *vector_a, const float range_a,
+                    void *vector_b, const float range_b) {
+    switch(quant_type) {
     case HNSW_QUANT_NONE:
-        return vectors_distance_float(a->vector,b->vector,index->vector_dim);
+        return vectors_distance_float(vector_a,vector_b,vector_dim);
     case HNSW_QUANT_Q8:
-        return vectors_distance_q8(a->vector,b->vector,index->vector_dim,a->quants_range,b->quants_range);
+        return vectors_distance_q8(vector_a,vector_b,vector_dim,range_a,range_b);
     case HNSW_QUANT_BIN:
-        return vectors_distance_bin(a->vector,b->vector,index->vector_dim);
+        return vectors_distance_bin(vector_a,vector_b,vector_dim);
     default:
         assert(1 != 1);
         return 0;
@@ -651,7 +653,9 @@ pqueue *search_layer_with_filter(
     uint32_t evaluated_candidates = 1;
 
     // Add entry point.
-    float dist = hnsw_distance(index, query, entry_point);
+    float dist = hnsw_distance(index->vector_dim, index->quant_type,
+                               query->vector, query->quants_range,
+                               entry_point->vector, entry_point->quants_range);
     pq_push(candidates, entry_point, dist);
     if (filter_callback == NULL ||
         filter_callback(entry_point->value, filter_privdata))
@@ -682,7 +686,9 @@ pqueue *search_layer_with_filter(
                 continue; // Already visited during this scan.
 
             neighbor->visited_epoch[slot] = index->current_epoch[slot];
-            float neighbor_dist = hnsw_distance(index, query, neighbor);
+            float neighbor_dist = hnsw_distance(index->vector_dim, index->quant_type,
+                                                query->vector, query->quants_range,
+                                                neighbor->vector, neighbor->quants_range);
 
             furthest = pq_max_distance(results);
             if (filter_callback == NULL) {
@@ -863,8 +869,13 @@ int hnsw_search(HNSW *index, const float *query_vector, uint32_t k,
 void hnsw_update_worst_neighbor(HNSW *index, hnswNode *node, uint32_t layer) {
     float worst_dist = 0;
     uint32_t worst_idx = 0;
+    const uint32_t vector_dim = index->vector_dim;
+    const uint32_t quant_type = index->quant_type;
     for (uint32_t i = 0; i < node->layers[layer].num_links; i++) {
-        float dist = hnsw_distance(index, node, node->layers[layer].links[i]);
+        hnswNode *neighbor = node->layers[layer].links[i];
+        float dist = hnsw_distance(vector_dim, quant_type,
+                                   node->vector, node->quants_range,
+                                   neighbor->vector, neighbor->quants_range);
         if (dist > worst_dist) {
             worst_dist = dist;
             worst_idx = i;
@@ -942,6 +953,8 @@ void hnsw_update_worst_neighbor_on_remove(HNSW *index, hnswNode *node, uint32_t 
 void select_neighbors(HNSW *index, pqueue *candidates, hnswNode *new_node,
                       uint32_t layer, uint32_t required_links, int aggressive)
 {
+    const uint32_t vector_dim = index->vector_dim;
+    const uint32_t quant_type = index->quant_type;
     for (uint32_t i = 0; i < candidates->count; i++) {
         hnswNode *neighbor = pq_get_node(candidates,i);
         if (neighbor == new_node) continue; // Don't link node with itself.
@@ -979,8 +992,10 @@ void select_neighbors(HNSW *index, pqueue *candidates, hnswNode *new_node,
         if (!aggressive) {
             int diversity_failed = 0;
             for (uint32_t j = 0; j < new_node->layers[layer].num_links; j++) {
-                float link_dist = hnsw_distance(index, neighbor,
-                    new_node->layers[layer].links[j]);
+                hnswNode *candidate = new_node->layers[layer].links[j];
+                float link_dist = hnsw_distance(vector_dim, quant_type,
+                                                neighbor->vector, neighbor->quants_range,
+                                                candidate->vector, candidate->quants_range);
                 if (link_dist < dist) {
                     diversity_failed = 1;
                     break;
@@ -1056,6 +1071,8 @@ void select_neighbors(HNSW *index, pqueue *candidates, hnswNode *new_node,
             worst_node = NULL;
             uint32_t worst_idx = 0;
             float max_dist = 0;
+            const uint32_t vector_dim = index->vector_dim;
+            const int quant_type = index->quant_type;
             for (uint32_t j = 0; j < neighbor->layers[layer].num_links; j++) {
                 hnswNode *to_drop = neighbor->layers[layer].links[j];
 
@@ -1069,7 +1086,9 @@ void select_neighbors(HNSW *index, pqueue *candidates, hnswNode *new_node,
                  * nodes linked among them. */
                 if (to_drop->layers[layer].num_links <= index->M/4) continue;
 
-                float link_dist = hnsw_distance(index, neighbor, to_drop);
+                float link_dist = hnsw_distance(vector_dim, quant_type,
+                                                neighbor->vector, neighbor->quants_range,
+                                                to_drop->vector, to_drop->quants_range);
                 if (worst_node == NULL || link_dist > max_dist) {
                     worst_node = to_drop;
                     max_dist = link_dist;
@@ -1199,10 +1218,17 @@ void hnsw_reconnect_nodes(HNSW *index, hnswNode **nodes, int count, uint32_t lay
     float *distances = hmalloc((unsigned long) count * count * sizeof(float));
     if (!distances) return;
 
+    const uint32_t vector_dim = index->vector_dim;
+    const uint32_t quant_type = index->quant_type;
+
     for (int i = 0; i < count; i++) {
+        void* vector_a = nodes[i]->vector;
+        const float quants_range_a = nodes[i]->quants_range;
         distances[i*count + i] = 0;  // Distance to self is 0
         for (int j = i+1; j < count; j++) {
-            float dist = hnsw_distance(index, nodes[i], nodes[j]);
+            float dist = hnsw_distance(vector_dim, quant_type,
+                                       vector_a, quants_range_a,
+                                       nodes[j]->vector, nodes[j]->quants_range);
             distances[i*count + j] = dist;     // Upper triangle.
             distances[j*count + i] = dist;     // Lower triangle.
         }
@@ -1895,7 +1921,10 @@ static int compare_floats(const float *a, const float *b) {
 int hnsw_should_reuse_node(HNSW *index, hnswNode *node, int is_normalized, const float *new_vector) {
     /* Step 1: Not enough links? Advice to avoid reuse. */
     const uint32_t min_links_for_reuse = 4;
-    uint32_t layer0_connections = node->layers[0].num_links;
+    const uint32_t layer0_connections = node->layers[0].num_links;
+    hnswNode **layer0_links = node->layers[0].links;
+    const uint32_t vector_dim = index->vector_dim;
+    const int quant_type = index->quant_type;
     if (layer0_connections < min_links_for_reuse) return 0;
 
     /* Step2: get all current distances and run our heuristic. */
@@ -1912,7 +1941,9 @@ int hnsw_should_reuse_node(HNSW *index, hnswNode *node, int is_normalized, const
     /* Get old dinstances and sort them to access the 25% worst
      * (bigger) ones. */
     for (uint32_t i = 0; i < layer0_connections; i++) {
-        old_distances[i] = hnsw_distance(index, node, node->layers[0].links[i]);
+        old_distances[i] = hnsw_distance(vector_dim, quant_type,
+            node->vector, node->quants_range,
+            layer0_links[i]->vector, layer0_links[i]->quants_range);
     }
     qsort(old_distances, layer0_connections, sizeof(float),
           (int (*)(const void*, const void*))(&compare_floats));
@@ -1929,7 +1960,10 @@ int hnsw_should_reuse_node(HNSW *index, hnswNode *node, int is_normalized, const
     // Count how many new distances stay below the threshold.
     uint32_t good_distances = 0;
     for (uint32_t i = 0; i < layer0_connections; i++) {
-        float new_dist = hnsw_distance(index, &tmp_node, node->layers[0].links[i]);
+        float new_dist = hnsw_distance(vector_dim, quant_type,
+                                        tmp_node.vector, tmp_node.quants_range,
+                                        layer0_links[i]->vector, layer0_links[i]->quants_range);
+
         if (new_dist <= worst_avg) good_distances++;
     }
     hnsw_free_tmp_node(&tmp_node,new_vector);
@@ -2700,7 +2734,10 @@ int hnsw_ground_truth_with_filter
         }
 
         /* Calculate distance to query. */
-        float dist = hnsw_distance(index, &query, current);
+        float dist = hnsw_distance(index->vector_dim, index->quant_type,
+            query.vector, query.quants_range,
+            current->vector, current->quants_range);
+
 
         /* Add to results to pqueue. Will be accepted only if better than
          * the current worse or pqueue not full. */

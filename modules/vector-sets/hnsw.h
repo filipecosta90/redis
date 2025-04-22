@@ -177,7 +177,9 @@ void hnsw_set_allocator(void (*free_ptr)(void*), void *(*malloc_ptr)(size_t),
 /* Testing. */
 int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_links);
 void hnsw_test_graph_recall(HNSW *index, int test_ef, int verbose);
-float hnsw_distance(HNSW *index, hnswNode *a, hnswNode *b);
+float hnsw_distance(uint32_t vector_dim, uint32_t quant_type,
+                    void *vector_a, const float range_a, 
+                    void *vector_b, const float range_b);
 int hnsw_ground_truth_with_filter
                (HNSW *index, const float *query_vector, uint32_t k,
                 hnswNode **neighbors, float *distances, uint32_t slot,
