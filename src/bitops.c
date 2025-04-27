@@ -9,6 +9,21 @@
 
 #include "server.h"
 
+
+/* Check if CPU supports POPCNT instruction - cached as a static variable */
+static inline int cpu_supports_popcnt(void) {
+    #if defined(HAVE_POPCNT)
+        static int popcnt_supported = -1;
+        if (unlikely(popcnt_supported == -1)) {
+            popcnt_supported = __builtin_cpu_supports("popcnt");
+        }
+        return popcnt_supported;
+    #else
+        return 0; /* Assume CPU does not support POPCNT if __builtin_cpu_supports() is not available. */
+    #endif
+    }
+
+
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -21,12 +36,7 @@ long long redisPopcount(void *s, long count) {
     long long bits = 0;
     unsigned char *p = s;
     uint32_t *p4;
-#if defined(HAVE_POPCNT)
-    int use_popcnt = __builtin_cpu_supports("popcnt"); /* Check if CPU supports POPCNT instruction. */
-#else
-    int use_popcnt = 0; /* Assume CPU does not support POPCNT if
-                         * __builtin_cpu_supports() is not available. */
-#endif
+    const int use_popcnt = cpu_supports_popcnt();
     static const unsigned char bitsinbyte[256] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8};
     
     /* Count initial bytes not aligned to 64-bit when using the POPCNT instruction,
