@@ -52,6 +52,11 @@ typedef enum {
 
 typedef void *(*GetValueDataFunc)(const void *val);
 
+/* Returns 1 if the entry has a value field and 0 otherwise. */
+static inline int entryHasValue(const dictEntry *de) {
+    return ((uintptr_t)(void *)de & 7) == 0; /* Check if it's a normal entry */
+}
+
 typedef struct KeyPrefetchInfo {
     PrefetchState state;      /* Current state of the prefetch operation */
     HashTableIndex ht_idx;    /* Index of the current hash table (0 or 1 for rehashing) */
@@ -213,6 +218,14 @@ static void prefetchEntry(KeyPrefetchInfo *info) {
 * If the value is not found, move to the PREFETCH_ENTRY state to look at the next entry in the bucket. */
 static void prefetchValue(KeyPrefetchInfo *info) {
     size_t i = batch->cur_idx;
+
+    /* Check if the entry has a value before trying to get it */
+    if (!entryHasValue(info->current_entry)) {
+        /* No value in this entry, move to the next entry */
+        info->state = PREFETCH_ENTRY;
+        return;
+    }
+
     void *value = dictGetVal(info->current_entry);
 
     if (dictGetNext(info->current_entry) == NULL && !dictIsRehashing(batch->current_dicts[i])) {
@@ -238,7 +251,7 @@ static void prefetchValue(KeyPrefetchInfo *info) {
 
 /* Prefetch the value data if available. */
 static void prefetchValueData(KeyPrefetchInfo *info, GetValueDataFunc get_val_data_func) {
-    if (get_val_data_func) {
+    if (get_val_data_func && entryHasValue(info->current_entry)) {
         void *value_data = get_val_data_func(dictGetVal(info->current_entry));
         if (value_data) prefetchAndMoveToNextKey(value_data);
     }
