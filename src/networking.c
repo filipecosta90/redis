@@ -137,6 +137,8 @@ client *createClient(connection *conn) {
     c->id = client_id;
     c->tid = IOTHREAD_MAIN_THREAD_ID;
     c->running_tid = IOTHREAD_MAIN_THREAD_ID;
+    c->deferred_objects = NULL;
+    c->deferred_objects_num = 0;
     if (conn) server.io_threads_clients_num[c->tid]++;
 #ifdef LOG_REQ_RES
     reqresReset(c, 0);
@@ -1461,6 +1463,36 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
     }
 }
 
+/* Attempt to defer freeing the object to the IO thread. We usually call this since
+ * we know the object is allocated in the IO thread, to avoid memory arena contention,
+ * and also reducing the load of the main thread. */
+void tryDeferFreeObject(client *c, robj *o) {
+    if (c->tid == IOTHREAD_MAIN_THREAD_ID || o->refcount > 1 || o->type != OBJ_STRING) {
+        decrRefCount(o);
+        return;
+    }
+
+    if (c->deferred_objects && c->deferred_objects_num < CLIENT_MAX_DEFERRED_OBJECTS) {
+        c->deferred_objects[c->deferred_objects_num++] = o;
+    } else {
+        decrRefCount(o);
+    }
+}
+
+/* Free the objects in the deferred_objects array. If free_array is true
+ * then free the array itself as well. */
+void freeDeferredObjects(client *c, int free_array) {
+    for (int j = 0; j < c->deferred_objects_num; j++) {
+        decrRefCount(c->deferred_objects[j]);
+    }
+    c->deferred_objects_num = 0;
+
+    if (free_array) {
+        zfree(c->deferred_objects);
+        c->deferred_objects = NULL;
+    }
+}
+
 void freeClientOriginalArgv(client *c) {
     /* We didn't rewrite this client */
     if (!c->original_argv) return;
@@ -1474,8 +1506,13 @@ void freeClientOriginalArgv(client *c) {
 
 static inline void freeClientArgvInternal(client *c, int free_argv) {
     int j;
-    for (j = 0; j < c->argc; j++)
-        decrRefCount(c->argv[j]);
+    if (c->tid == IOTHREAD_MAIN_THREAD_ID) {
+        for (j = 0; j < c->argc; j++)
+            decrRefCount(c->argv[j]);
+    } else {
+        for (j = 0; j < c->argc; j++)
+            tryDeferFreeObject(c, c->argv[j]);
+    }
     c->argc = 0;
     c->cmd = NULL;
     c->iolookedcmd = NULL;
@@ -1542,6 +1579,8 @@ void unlinkClient(client *c) {
             listDelNode(server.clients,c->client_list_node);
             c->client_list_node = NULL;
         }
+
+        removeClientFromPendingCommandsBatch(c);
 
         /* Check if this is a replica waiting for diskless replication (rdb pipe),
          * in which case it needs to be cleaned from that list */
@@ -1773,6 +1812,7 @@ void freeClient(client *c) {
     freeReplicaReferencedReplBuffer(c);
     freeClientArgv(c);
     freeClientOriginalArgv(c);
+    freeDeferredObjects(c, 1);
     if (c->deferred_reply_errors)
         listRelease(c->deferred_reply_errors);
 #ifdef LOG_REQ_RES

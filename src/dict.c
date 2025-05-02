@@ -65,7 +65,6 @@ static void _dictShrinkIfNeeded(dict *d);
 static void _dictRehashStepIfNeeded(dict *d, uint64_t visitedIdx);
 static signed char _dictNextExp(unsigned long size);
 static int _dictInit(dict *d, dictType *type);
-static dictEntry *dictGetNext(const dictEntry *de);
 static dictEntLink dictGetNextLink(dictEntry *de);
 static void dictSetNext(dictEntry *de, dictEntry *next);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
@@ -130,8 +129,8 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
 #define ENTRY_PTR_MASK        7 /* 111 */
 #define ENTRY_PTR_NORMAL      0 /* 000 : If a pointer to an entry with value. */
 #define ENTRY_PTR_IS_ODD_KEY  1 /* XX1 : If a pointer to odd key address (must be 1). */
-#define ENTRY_PTR_IS_EVEN_KEY 2 /* 010 : If a pointer to even key address. (must be 2 or 4). */ 
-#define ENTRY_PTR_NO_VALUE    4 /* 100 : If a pointer to an entry without value. */ 
+#define ENTRY_PTR_IS_EVEN_KEY 2 /* 010 : If a pointer to even key address. (must be 2 or 4). */
+#define ENTRY_PTR_NO_VALUE    4 /* 100 : If a pointer to an entry without value. */
 
 /* Returns 1 if the entry pointer is a pointer to a key, rather than to an
  * allocated entry. Returns 0 otherwise. */
@@ -294,7 +293,7 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
 }
 
 int _dictExpand(dict *d, unsigned long size, int* malloc_failed) {
-    /* the size is invalid if it is smaller than the size of the hash table 
+    /* the size is invalid if it is smaller than the size of the hash table
      * or smaller than the number of elements already inside the hash table */
     if (dictIsRehashing(d) || d->ht_used[0] > size || DICTHT_SIZE(d->ht_size_exp[0]) >= size)
         return DICT_ERR;
@@ -342,16 +341,16 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
         }
         if (d->type->no_value) {
             if (!d->ht_table[1][h]) {
-                /* The destination bucket is empty, allowing the key to be stored 
-                 * directly without allocating a dictEntry. If an old entry was 
-                 * previously allocated, free its memory. */                
+                /* The destination bucket is empty, allowing the key to be stored
+                 * directly without allocating a dictEntry. If an old entry was
+                 * previously allocated, free its memory. */
                 if (!entryIsKey(de)) zfree(decodeMaskedPtr(de));
-                
+
                 if (d->type->keys_are_odd)
                     de = key; /* ENTRY_PTR_IS_ODD_KEY trivially set by the odd key. */
                 else
                     de = encodeMaskedPtr(key, ENTRY_PTR_IS_EVEN_KEY);
-                
+
             } else if (entryIsKey(de)) {
                 /* We don't have an allocated entry but we need one. */
                 de = createEntryNoValue(key, d->ht_table[1][h]);
@@ -375,7 +374,7 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
 /* This checks if we already rehashed the whole table and if more rehashing is required */
 static int dictCheckRehashingCompleted(dict *d) {
     if (d->ht_used[0] != 0) return 0;
-    
+
     if (d->type->rehashingCompleted) d->type->rehashingCompleted(d);
     zfree(d->ht_table[0]);
     /* Copy the new ht onto the old one */
@@ -401,10 +400,10 @@ int dictRehash(dict *d, int n) {
     unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
     unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
     if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
-    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing. 
+    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing.
      * - If expanding, the threshold is dict_force_resize_ratio which is 4.
      * - If shrinking, the threshold is 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio) which is 1/32. */
-    if (dict_can_resize == DICT_RESIZE_AVOID && 
+    if (dict_can_resize == DICT_RESIZE_AVOID &&
         ((s1 > s0 && s1 < dict_force_resize_ratio * s0) ||
          (s1 < s0 && s0 < HASHTABLE_MIN_FILL * dict_force_resize_ratio * s1)))
     {
@@ -469,10 +468,10 @@ int _dictBucketRehash(dict *d, uint64_t idx) {
     unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
     unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
     if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
-    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing. 
+    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing.
      * - If expanding, the threshold is dict_force_resize_ratio which is 4.
      * - If shrinking, the threshold is 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio) which is 1/32. */
-    if (dict_can_resize == DICT_RESIZE_AVOID && 
+    if (dict_can_resize == DICT_RESIZE_AVOID &&
         ((s1 > s0 && s1 < dict_force_resize_ratio * s0) ||
          (s1 < s0 && s0 < HASHTABLE_MIN_FILL * dict_force_resize_ratio * s1)))
     {
@@ -537,7 +536,7 @@ dictEntry *dictInsertKeyAtLink(dict *d, void *key, dictEntLink link) {
            bucket <= &d->ht_table[htidx][DICTHT_SIZE_MASK(d->ht_size_exp[htidx])]);
     if (d->type->no_value) {
         if (!*bucket) {
-            /* We can store the key directly in the destination bucket without 
+            /* We can store the key directly in the destination bucket without
              * allocating dictEntry.
              */
             if (d->type->keys_are_odd) {
@@ -741,10 +740,10 @@ void dictRelease(dict *d)
     zfree(d);
 }
 
-/* Finds a given key. Like dictFindLink(), yet search bucket even if dict is empty. 
- * 
+/* Finds a given key. Like dictFindLink(), yet search bucket even if dict is empty.
+ *
  * Returns dictEntLink reference if found. Otherwise, return NULL.
- * 
+ *
  * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
  */
 static dictEntLink dictFindLinkInternal(dict *d, const void *key, dictEntLink *bucket) {
@@ -752,12 +751,12 @@ static dictEntLink dictFindLinkInternal(dict *d, const void *key, dictEntLink *b
     dictEntLink link;
     uint64_t idx;
     int table;
-    
+
     if (bucket) {
         *bucket = NULL;
     } else {
         /* If dict is empty and no need to find bucket, return NULL */
-        if (dictSize(d) == 0) return NULL; 
+        if (dictSize(d) == 0) return NULL;
     }
 
     const uint64_t hash = dictHashKey(d, key, d->useStoredKeyApi);
@@ -783,7 +782,7 @@ static dictEntLink dictFindLinkInternal(dict *d, const void *key, dictEntLink *b
             /* Prefetch the next entry to improve cache efficiency */
             redis_prefetch_read(dictGetNext(*link));
 
-            if (key == visitedKey || cmpFunc( &cmpCache, key, visitedKey))                
+            if (key == visitedKey || cmpFunc( &cmpCache, key, visitedKey))
                 return link;
 
             link = dictGetNextLink(*link);
@@ -799,62 +798,62 @@ dictEntry *dictFind(dict *d, const void *key)
 }
 
 /* Find a key and return its dictEntLink reference. Otherwise, return NULL
- * 
- * A dictEntLink pointer being used to find preceding dictEntry of searched item. 
- * It is Useful for deletion, addition, unlinking and updating, especially for 
- * dict configured with 'no_value'. In such cases returning only `dictEntry` from 
- * a lookup may be insufficient since it might be opt-out to be the object itself. 
- * By locating preceding dictEntry (dictEntLink) these ops can be properly handled. 
- * 
- * After calling link = dictFindLink(...), any necessary updates based on returned 
- * link or bucket must be performed immediately after by calling dictSetKeyAtLink() 
- * without any intervening operations on given dict. Otherwise, `dictEntLink` may 
+ *
+ * A dictEntLink pointer being used to find preceding dictEntry of searched item.
+ * It is Useful for deletion, addition, unlinking and updating, especially for
+ * dict configured with 'no_value'. In such cases returning only `dictEntry` from
+ * a lookup may be insufficient since it might be opt-out to be the object itself.
+ * By locating preceding dictEntry (dictEntLink) these ops can be properly handled.
+ *
+ * After calling link = dictFindLink(...), any necessary updates based on returned
+ * link or bucket must be performed immediately after by calling dictSetKeyAtLink()
+ * without any intervening operations on given dict. Otherwise, `dictEntLink` may
  * become invalid. Example with kvobj of replacing key with new key:
- * 
+ *
  *      link = dictFindLink(d, key, &bucket, 0);
  *      ... Do something, but don't modify the dict ...
  *      // assert(link != NULL);
  *      dictSetKeyAtLink(d, kv, &link, 0);
- *      
+ *
  * To add new value (If no space for the new key, dict will be expanded by
  * dictSetKeyAtLink() and bucket will be looked up again.):
- *   
+ *
  *      link = dictFindLink(d, key, &bucket);
  *      ... Do something, but don't modify the dict ...
  *      // assert(link == NULL);
  *      dictSetKeyAtLink(d, kv, &bucket, 1);
- *  
+ *
  *  bucket - return link to bucket that the key was mapped. unless dict is empty.
  */
 dictEntLink dictFindLink(dict *d, const void *key, dictEntLink *bucket) {
     if (bucket) *bucket = NULL;
     if (unlikely(dictSize(d) == 0))
         return NULL;
-    
+
     return dictFindLinkInternal(d, key, bucket);
 }
 
-/* Set the key with link 
+/* Set the key with link
  *
  * link:    - When `newItem` is set, `link` points to the bucket of the key.
  *          - When `newItem` is not set, `link` points to the link of the key.
  *          - If *link is NULL, dictFindLink() will be called to locate the key.
- *          - On return, get updated, by need, to the inserted key. 
+ *          - On return, get updated, by need, to the inserted key.
  *
  * newItem: 1 = Add a key with a new dictEntry.
- *          0 = Set a key to an existing dictEntry. 
+ *          0 = Set a key to an existing dictEntry.
  */
 void dictSetKeyAtLink(dict *d, void *key, dictEntLink *link, int newItem) {
     dictEntLink dummy = NULL;
     if (link == NULL) link = &dummy;
     void *addedKey = (d->type->keyDup) ? d->type->keyDup(d, key) : key;
-    
+
     if (newItem) {
         signed char snap[2] = {d->ht_size_exp[0], d->ht_size_exp[1] };
 
         /* Make room if needed for the new key */
         dictExpandIfNeeded(d);
-        
+
         /* Lookup key's link if tables reallocated or if given link is set to NULL */
         if (snap[0] != d->ht_size_exp[0] || snap[1] != d->ht_size_exp[1] || *link == NULL) {
             dictEntLink bucket;
@@ -868,15 +867,15 @@ void dictSetKeyAtLink(dict *d, void *key, dictEntLink *link, int newItem) {
         }
         dictInsertKeyAtLink(d, addedKey, *link);
         return;
-    } 
-    
+    }
+
     /* Setting key of existing dictEntry (newItem == 0)*/
-    
+
     if (*link == NULL) {
         *link = dictFindLink(d, key, NULL);
         assert(*link != NULL);
     }
-    
+
     dictEntry **de = *link;
     /* is it regular dict entry of key and next */
     if (entryIsNoValue(*de)) {
@@ -920,7 +919,7 @@ dictEntLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index) {
     if (dictSize(d) == 0) return NULL; /* dict is empty */
     if (dictIsRehashing(d)) _dictRehashStep(d);
 
-    h = dictHashKey(d, key, d->useStoredKeyApi);    
+    h = dictHashKey(d, key, d->useStoredKeyApi);
     keyCmpFunc cmpFunc = dictGetCmpFuncAndResetCache(d, &cmpCache);
 
     for (table = 0; table <= 1; table++) {
@@ -1000,8 +999,8 @@ double dictIncrDoubleVal(dictEntry *de, double val) {
 void *dictGetKey(const dictEntry *de) {
     /* if entryIsKey() */
     if ((uintptr_t)de & ENTRY_PTR_IS_ODD_KEY) return (void *) de;
-    if ((uintptr_t)de & ENTRY_PTR_IS_EVEN_KEY) return decodeMaskedPtr(de);    
-    /* Regular entry */ 
+    if ((uintptr_t)de & ENTRY_PTR_IS_EVEN_KEY) return decodeMaskedPtr(de);
+    /* Regular entry */
     if (entryIsNoValue(de)) return decodeEntryNoValue(de)->key;
     return de->key;
 }
@@ -1034,7 +1033,7 @@ double *dictGetDoubleValPtr(dictEntry *de) {
 
 /* Returns the 'next' field of the entry or NULL if the entry doesn't have a
  * 'next' field. */
-static dictEntry *dictGetNext(const dictEntry *de) {
+dictEntry *dictGetNext(const dictEntry *de) {
     if (entryIsKey(de)) return NULL; /* there's no next */
     if (entryIsNoValue(de)) return decodeEntryNoValue(de)->next;
     return de->next;
@@ -1514,9 +1513,9 @@ void dictScanDefragBucket(dictScanFunction *fn,
 
         if (!next) break; /* if last element, break */
 
-        /* if `*plink` still pointing to 'de', then it means that the 
+        /* if `*plink` still pointing to 'de', then it means that the
          * visited item wasn't deleted by fn() */
-        if (*plink == de)            
+        if (*plink == de)
             plink = (entryIsNoValue(de)) ? &(decodeEntryNoValue(de)->next) : &(de->next);
 
         de = next;
@@ -1577,7 +1576,7 @@ unsigned long dictScanDefrag(dict *d,
         /* Iterate over indices in larger table that are the expansion
          * of the index pointed to by the cursor in the smaller table */
         do {
-            dictScanDefragBucket(fn, defragfns, privdata, &d->ht_table[htidx1][v & m1]);            
+            dictScanDefragBucket(fn, defragfns, privdata, &d->ht_table[htidx1][v & m1]);
 
             /* Increment the reverse cursor not covered by the smaller mask.*/
             v |= ~m1;
@@ -1606,7 +1605,7 @@ static int dictTypeResizeAllowed(dict *d, size_t size) {
                     (double)d->ht_used[0] / DICTHT_SIZE(d->ht_size_exp[0]));
 }
 
-/* Returning DICT_OK indicates a successful expand or the dictionary is undergoing rehashing, 
+/* Returning DICT_OK indicates a successful expand or the dictionary is undergoing rehashing,
  * and there is nothing else we need to do about this dictionary currently. While DICT_ERR indicates
  * that expand has not been triggered (may be try shrinking?)*/
 int dictExpandIfNeeded(dict *d) {
@@ -1639,17 +1638,17 @@ int dictExpandIfNeeded(dict *d) {
 static int _dictExpandIfNeeded(dict *d) {
     /* Automatic resizing is disallowed. Return */
     if (d->pauseAutoResize > 0) return DICT_ERR;
-    
+
     return dictExpandIfNeeded(d);
 }
 
-/* Returning DICT_OK indicates a successful shrinking or the dictionary is undergoing rehashing, 
+/* Returning DICT_OK indicates a successful shrinking or the dictionary is undergoing rehashing,
  * and there is nothing else we need to do about this dictionary currently. While DICT_ERR indicates
  * that shrinking has not been triggered (may be try expanding?)*/
 int dictShrinkIfNeeded(dict *d) {
     /* Incremental rehashing already in progress. Return. */
     if (dictIsRehashing(d)) return DICT_OK;
-    
+
     /* If the size of hash table is DICT_HT_INITIAL_SIZE, don't shrink it. */
     if (DICTHT_SIZE(d->ht_size_exp[0]) <= DICT_HT_INITIAL_SIZE) return DICT_OK;
 
@@ -1668,7 +1667,7 @@ int dictShrinkIfNeeded(dict *d) {
     return DICT_ERR;
 }
 
-static void _dictShrinkIfNeeded(dict *d) 
+static void _dictShrinkIfNeeded(dict *d)
 {
     /* Automatic resizing is disallowed. Return */
     if (d->pauseAutoResize > 0) return;
@@ -1720,7 +1719,7 @@ dictEntLink dictFindLinkForInsert(dict *d, const void *key, dictEntry **existing
     keyCmpFunc cmpFunc = dictGetCmpFuncAndResetCache(d, &cmpCache);
 
     for (table = 0; table <= 1; table++) {
-        if (table == 0 && (long)idx < d->rehashidx) continue; 
+        if (table == 0 && (long)idx < d->rehashidx) continue;
         idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
         /* Search if this slot does not already contain the given key */
         he = d->ht_table[table][idx];
@@ -2259,7 +2258,7 @@ int dictTest(int argc, char **argv, int flags) {
     TEST("Test dictFindLink() functionality") {
         dictType dt = BenchmarkDictType;
         dict *d = dictCreate(&dt);
-        
+
         /* find in empty dict */
         dictEntLink link = dictFindLink(d, "key", NULL);
         assert(link == NULL);
@@ -2275,7 +2274,7 @@ int dictTest(int argc, char **argv, int flags) {
             assert(link != NULL);
             assert(*link != NULL);
             assert(dictGetKey(*link) != NULL);
-            
+
             /* Test that the key found is the correct one */
             void *foundKey = dictGetKey(*link);
             assert(compareCallback( NULL, foundKey, key));
