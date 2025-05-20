@@ -57,8 +57,11 @@ typedef struct hnswNode {
 
     /* Last time (epoch) this node was visited. We need one per thread.
      * This avoids having a different data structure where we track
-     * visited nodes, but costs memory per node. */
-    uint64_t visited_epoch[HNSW_MAX_THREADS];
+     * visited nodes, but costs memory per node. 
+     * Align on cache line to reduce false sharing. */
+    struct {
+        uint64_t epoch __attribute__((aligned(64)));
+    } visited_epoch[HNSW_MAX_THREADS] __attribute__((aligned(64)));
 
     void *value;                    /* Associated value */
     struct hnswNode *prev, *next;   /* Prev/Next node in the list starting at
@@ -93,7 +96,9 @@ typedef struct HNSW {
     uint32_t vector_dim;     /* Dimensionality of stored vectors */
     uint64_t node_count;     /* Total number of nodes */
     _Atomic uint64_t last_id; /* Last node ID used */
-    uint64_t current_epoch[HNSW_MAX_THREADS];  /* Current epoch for visit tracking */
+    struct {
+        uint64_t epoch __attribute__((aligned(64)));
+    } current_epoch[HNSW_MAX_THREADS] __attribute__((aligned(64)));
     hnswNode *head;             /* Linked list of nodes. Last first */
 
     /* We have two locks here:
@@ -102,7 +107,10 @@ typedef struct HNSW {
      * 2. One mutex per epoch slot, in order for read operations to acquire
      * a lock on a specific slot to use epochs tracking of visited nodes. */
     pthread_rwlock_t global_lock;  /* Global read-write lock */
-    pthread_mutex_t slot_locks[HNSW_MAX_THREADS];  /* Per-slot locks */
+    struct {
+        pthread_mutex_t lock __attribute__((aligned(64)));
+    } slot_locks[HNSW_MAX_THREADS] __attribute__((aligned(64)));
+    
 
     _Atomic uint32_t next_slot; /* Next thread slot to try */
     _Atomic uint64_t version;   /* Version for optimistic concurrency, this is

@@ -396,7 +396,7 @@ HNSW *hnsw_new(uint32_t vector_dim, uint32_t quant_type, uint32_t m) {
 
     /* Initialize epochs array. */
     for (int i = 0; i < HNSW_MAX_THREADS; i++)
-        index->current_epoch[i] = 0;
+        index->current_epoch[i].epoch = 0;
 
     /* Initialize locks. */
     if (pthread_rwlock_init(&index->global_lock, NULL) != 0) {
@@ -405,10 +405,10 @@ HNSW *hnsw_new(uint32_t vector_dim, uint32_t quant_type, uint32_t m) {
     }
 
     for (int i = 0; i < HNSW_MAX_THREADS; i++) {
-        if (pthread_mutex_init(&index->slot_locks[i], NULL) != 0) {
+        if (pthread_mutex_init(&index->slot_locks[i].lock, NULL) != 0) {
             /* Clean up previously initialized mutexes. */
             for (int j = 0; j < i; j++)
-                pthread_mutex_destroy(&index->slot_locks[j]);
+                pthread_mutex_destroy(&index->slot_locks[j].lock);
             pthread_rwlock_destroy(&index->global_lock);
             hfree(index);
             return NULL;
@@ -492,7 +492,7 @@ hnswNode *hnsw_node_new(HNSW *index, uint64_t id, const float *vector, const int
 
     /* Initialize visited epoch array. */
     for (int i = 0; i < HNSW_MAX_THREADS; i++)
-        node->visited_epoch[i] = 0;
+        node->visited_epoch[i].epoch = 0;
 
     if (qvector == NULL) {
         /* Copy input vector. */
@@ -589,7 +589,7 @@ void hnsw_free(HNSW *index,void(*free_value)(void*value)) {
     /* Destroy locks */
     pthread_rwlock_destroy(&index->global_lock);
     for (int i = 0; i < HNSW_MAX_THREADS; i++) {
-        pthread_mutex_destroy(&index->slot_locks[i]);
+        pthread_mutex_destroy(&index->slot_locks[i].lock);
     }
 
     hfree(index);
@@ -623,7 +623,7 @@ pqueue *search_layer_with_filter(
                     void *filter_privdata, uint32_t max_candidates)
 {
     // Mark visited nodes with a never seen epoch.
-    index->current_epoch[slot]++;
+    index->current_epoch[slot].epoch++;
 
     pqueue *candidates = pq_new(HNSW_MAX_CANDIDATES);
     pqueue *results = pq_new(ef);
@@ -645,7 +645,7 @@ pqueue *search_layer_with_filter(
     {
         pq_push(results, entry_point, dist);
     }
-    entry_point->visited_epoch[slot] = index->current_epoch[slot];
+    entry_point->visited_epoch[slot].epoch = index->current_epoch[slot].epoch;
 
     // Process candidates.
     while (candidates->count > 0) {
@@ -665,10 +665,10 @@ pqueue *search_layer_with_filter(
         for (uint32_t i = 0; i < current->layers[layer].num_links; i++) {
             hnswNode *neighbor = current->layers[layer].links[i];
 
-            if (neighbor->visited_epoch[slot] == index->current_epoch[slot])
+            if (neighbor->visited_epoch[slot].epoch == index->current_epoch[slot].epoch)
                 continue; // Already visited during this scan.
 
-            neighbor->visited_epoch[slot] = index->current_epoch[slot];
+            neighbor->visited_epoch[slot].epoch = index->current_epoch[slot].epoch;
             float neighbor_dist = hnsw_distance(index, query, neighbor);
 
             furthest = pq_max_distance(results);
@@ -1582,9 +1582,9 @@ int hnsw_delete_node(HNSW *index, hnswNode *node, void(*free_value)(void*value))
 int hnsw_acquire_read_slot(HNSW *index) {
     /* First try a non-blocking approach on all slots. */
     for (uint32_t i = 0; i < HNSW_MAX_THREADS; i++) {
-        if (pthread_mutex_trylock(&index->slot_locks[i]) == 0) {
+        if (pthread_mutex_trylock(&index->slot_locks[i].lock) == 0) {
             if (pthread_rwlock_rdlock(&index->global_lock) != 0) {
-                pthread_mutex_unlock(&index->slot_locks[i]);
+                pthread_mutex_unlock(&index->slot_locks[i].lock);
                 return -1;
             }
             return i;
@@ -1595,11 +1595,11 @@ int hnsw_acquire_read_slot(HNSW *index) {
     uint32_t slot = index->next_slot++ % HNSW_MAX_THREADS;
 
     /* Try to lock the selected slot. */
-    if (pthread_mutex_lock(&index->slot_locks[slot]) != 0) return -1;
+    if (pthread_mutex_lock(&index->slot_locks[slot].lock) != 0) return -1;
 
     /* Get read lock. */
     if (pthread_rwlock_rdlock(&index->global_lock) != 0) {
-        pthread_mutex_unlock(&index->slot_locks[slot]);
+        pthread_mutex_unlock(&index->slot_locks[slot].lock);
         return -1;
     }
 
@@ -1612,7 +1612,7 @@ int hnsw_acquire_read_slot(HNSW *index) {
 void hnsw_release_read_slot(HNSW *index, int slot) {
     if (slot < 0 || slot >= HNSW_MAX_THREADS) return;
     pthread_rwlock_unlock(&index->global_lock);
-    pthread_mutex_unlock(&index->slot_locks[slot]);
+    pthread_mutex_unlock(&index->slot_locks[slot].lock);
 }
 
 /* ============================ Nodes insertion =============================
@@ -2414,7 +2414,7 @@ int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_
     }
 
     // Initialize connectivity check.
-    index->current_epoch[0]++;
+    index->current_epoch[0].epoch++;
     *connected_nodes = 0;
     *reciprocal_links = 1;
 
@@ -2425,7 +2425,7 @@ int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_
     uint64_t stack_top = 0;
 
     // Start from entry point.
-    index->enter_point->visited_epoch[0] = index->current_epoch[0];
+    index->enter_point->visited_epoch[0].epoch = index->current_epoch[0].epoch;
     (*connected_nodes)++;
     stack[stack_top++] = index->enter_point;
 
@@ -2451,8 +2451,8 @@ int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_
                 }
 
                 // If we haven't visited this neighbor yet.
-                if (neighbor->visited_epoch[0] != index->current_epoch[0]) {
-                    neighbor->visited_epoch[0] = index->current_epoch[0];
+                if (neighbor->visited_epoch[0].epoch != index->current_epoch[0].epoch) {
+                    neighbor->visited_epoch[0].epoch = index->current_epoch[0].epoch;
                     (*connected_nodes)++;
                     if (stack_top < stack_size) {
                         stack[stack_top++] = neighbor;
@@ -2474,7 +2474,7 @@ int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_
 
     hnswNode *current = index->head;
     while (current) {
-        if (current->visited_epoch[0] != index->current_epoch[0]) {
+        if (current->visited_epoch[0].epoch != index->current_epoch[0].epoch) {
             printf("\nUnreachable node found:\n");
             printf("- Node pointer: %p\n", (void*)current);
             printf("- Node ID: %llu\n", (unsigned long long)current->id);
@@ -2497,7 +2497,7 @@ int hnsw_validate_graph(HNSW *index, uint64_t *connected_nodes, int *reciprocal_
                     printf("    - Link %llu: pointer=%p, id=%llu, visited=%s,recpr=%s\n",
                            (unsigned long long)i, (void*)neighbor,
                            (unsigned long long)neighbor->id,
-                           neighbor->visited_epoch[0] == index->current_epoch[0] ?
+                           neighbor->visited_epoch[0].epoch == index->current_epoch[0].epoch ?
                            "yes" : "no",
                            found_backlink ? "yes" : "no");
                 }
