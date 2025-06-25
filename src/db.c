@@ -17,6 +17,7 @@
 #include "script.h"
 #include "functions.h"
 #include "redisassert.h"
+#include "listpack.h"
 
 #include <signal.h>
 #include <ctype.h>
@@ -1260,7 +1261,7 @@ void keysCommand(client *c) {
 
 /* Data used by the dict scan callback. */
 typedef struct {
-    list *keys;   /* elements that collect from dict */
+    unsigned char **keys_lp;   /* pointer to listpack that collects elements from dict */
     robj *o;      /* o must be a hash/set/zset object, NULL means current db */
     long long type; /* the particular type when scan the db */
     sds pattern;  /* pattern string, NULL means no pattern */
@@ -1287,11 +1288,11 @@ int objectTypeCompare(robj *o, long long target) {
         return 1;
 }
 /* This callback is used by scanGenericCommand in order to collect elements
- * returned by the dictionary iterator into a list. */
+ * returned by the dictionary iterator into a listpack. */
 void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     UNUSED(plink);
     scanData *data = (scanData *)privdata;
-    list *keys = data->keys;
+    unsigned char **keys_lp = data->keys_lp;
     robj *o = data->o;
     sds val = NULL;
     void *key = NULL;  /* if OBJ_HASH then key is of type `hfield`. Otherwise, `sds` */
@@ -1352,8 +1353,18 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
         serverPanic("Type not handled in SCAN callback.");
     }
 
-    listAddNodeTail(keys, key);
-    if (val && !data->no_values) listAddNodeTail(keys, val);
+    /* Store the actual string data in listpack, not pointers */
+    size_t keylen = data->strlen ? data->strlen(key) : sdslen(key);
+    *keys_lp = lpAppend(*keys_lp, (unsigned char*)key, keylen);
+    if (val && !data->no_values) {
+        *keys_lp = lpAppend(*keys_lp, (unsigned char*)val, sdslen(val));
+    }
+
+    /* Free temporary strings if they were allocated (e.g., for ZSET) */
+    if (o && o->type == OBJ_ZSET) {
+        if (key) sdsfree(key);
+        if (val) sdsfree(val);
+    }
 }
 
 /* Try to parse a SCAN cursor stored at object 'o':
@@ -1422,7 +1433,6 @@ char *getObjectTypeName(robj *o) {
 void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     int isKeysHfield = 0;
     int i, j;
-    listNode *node;
     long count = 10;
     sds pat = NULL;
     sds typename = NULL;
@@ -1508,18 +1518,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         ht = zs->dict;
     }
 
-    list *keys = listCreate();
-    /* Set a free callback for the contents of the collected keys list.
-     * For the main keyspace dict, and when we scan a key that's dict encoded
-     * (we have 'ht'), we don't need to define free method because the strings
-     * in the list are just a shallow copy from the pointer in the dictEntry.
-     * When scanning a key with other encodings (e.g. listpack), we need to
-     * free the temporary strings we add to that list.
-     * The exception to the above is ZSET, where we do allocate temporary
-     * strings even when scanning a dict. */
-    if (o && (!ht || o->type == OBJ_ZSET)) {
-        listSetFreeMethod(keys, sdsfreegeneric);
-    }
+    unsigned char *keys = lpNew(64);  /* Start with 64 bytes allocated */
 
     /* For main dictionary scan or data structure using hashtable. */
     if (!o || ht) {
@@ -1543,7 +1542,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
          * 6. data.no_values: to control whether values will be returned or
          * only keys are returned. */
         scanData data = {
-            .keys = keys,
+            .keys_lp = &keys,
             .o = o,
             .type = type,
             .pattern = use_pattern ? pat : NULL,
@@ -1571,7 +1570,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     } else if (o->type == OBJ_SET) {
         unsigned long array_reply_len = 0;
         void *replylen = NULL;
-        listRelease(keys);
+        lpFree(keys);
         char *str;
         char buf[LONG_STR_SIZE];
         size_t len;
@@ -1616,7 +1615,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         unsigned long array_reply_len = 0;
         unsigned char intbuf[LP_INTBUF_SIZE];
         void *replylen = NULL;
-        listRelease(keys);
+        lpFree(keys);
 
         /* Reply to the client. */
         addReplyArrayLen(c, 2);
@@ -1667,7 +1666,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         unsigned char intbuf[LP_INTBUF_SIZE];
         void *replylen = NULL;
 
-        listRelease(keys);
+        lpFree(keys);
         /* Reply to the client. */
         addReplyArrayLen(c, 2);
         /* Cursor is always 0 given we iterate over all set */
@@ -1713,18 +1712,30 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     addReplyArrayLen(c, 2);
     addReplyBulkLongLong(c,cursor);
 
-    unsigned long long idx = 0;
-    addReplyArrayLen(c, listLength(keys));
-    while ((node = listFirst(keys)) != NULL) {
-        void *key = listNodeValue(node);
-        /* For HSCAN, list will contain keys value pairs unless no_values arg
-         * was given. We should call mstrlen for the keys only. */
-        int hfieldkey = isKeysHfield && (no_values || (idx++ % 2 == 0));
-        addReplyBulkCBuffer(c, key, hfieldkey ? mstrlen(key) : sdslen(key));
-        listDelNode(keys, node);
+    unsigned long num_elements = lpLength(keys);
+    addReplyArrayLen(c, num_elements);
+
+    unsigned char *p = lpFirst(keys);
+    while (p != NULL) {
+        unsigned int slen;
+        long long lval;
+        unsigned char *key = lpGetValue(p, &slen, &lval);
+
+        if (key) {
+            /* String value - use slen since key is raw string data from listpack */
+            addReplyBulkCBuffer(c, key, slen);
+        } else {
+            /* Integer value - this shouldn't happen in scan results, but handle it */
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%lld", lval);
+            addReplyBulkCBuffer(c, buf, len);
+        }
+
+        p = lpNext(keys, p);
     }
 
-    listRelease(keys);
+    /* No need to free strings since they're stored as data in listpack, not pointers */
+    lpFree(keys);
 }
 
 /* The SCAN command completely relies on scanGenericCommand. */
