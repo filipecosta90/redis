@@ -17,7 +17,7 @@
 #include "script.h"
 #include "functions.h"
 #include "redisassert.h"
-#include "listpack.h"
+#include "vector.h"
 
 #include <signal.h>
 #include <ctype.h>
@@ -1259,9 +1259,17 @@ void keysCommand(client *c) {
     setDeferredArrayLen(c,replylen,numkeys);
 }
 
+#define DEFAULT_SCAN_COMMAND_COUNT 10
+
+/* The SCAN command's default COUNT is 10.
+ * Since it may store keys + values, the
+ * buffer size is roughly 10 * 2 = 20.
+ * Adding a 20% buffer (20 * 1.2) gives 24. */
+#define SCAN_VECTOR_INITIAL_ALLOC 24
+
 /* Data used by the dict scan callback. */
 typedef struct {
-    unsigned char **keys_lp;   /* pointer to listpack that collects elements from dict */
+    vector *result; /* elements that collect from dict */
     robj *o;      /* o must be a hash/set/zset object, NULL means current db */
     long long type; /* the particular type when scan the db */
     sds pattern;  /* pattern string, NULL means no pattern */
@@ -1288,14 +1296,13 @@ int objectTypeCompare(robj *o, long long target) {
         return 1;
 }
 /* This callback is used by scanGenericCommand in order to collect elements
- * returned by the dictionary iterator into a listpack. */
+ * returned by the dictionary iterator into a vector. */
 void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     UNUSED(plink);
     scanData *data = (scanData *)privdata;
-    unsigned char **keys_lp = data->keys_lp;
     robj *o = data->o;
     sds val = NULL;
-    void *key = NULL;  /* if OBJ_HASH then key is of type `hfield`. Otherwise, `sds` */
+    sds key = NULL;
     void *keyStr;
     data->sampled++;
 
@@ -1337,12 +1344,13 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     } else if (o->type == OBJ_SET) {
         key = keyStr;
     } else if (o->type == OBJ_HASH) {
-        key = keyStr;
-        val = dictGetVal(de);
-
         /* If field is expired, then ignore */
-        if (hfieldIsExpired(key))
+        if (hfieldIsExpired(keyStr))
             return;
+
+        /* For hash fields, keyStr is an hfield (mstr), we need to create an sds from the string data */
+        key = sdsnewlen(keyStr, hfieldlen(keyStr));
+        val = dictGetVal(de);
 
     } else if (o->type == OBJ_ZSET) {
         char buf[MAX_LONG_DOUBLE_CHARS];
@@ -1353,17 +1361,11 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
         serverPanic("Type not handled in SCAN callback.");
     }
 
-    /* Store the actual string data in listpack, not pointers */
-    size_t keylen = data->strlen ? data->strlen(key) : sdslen(key);
-    *keys_lp = lpAppend(*keys_lp, (unsigned char*)key, keylen);
+    sds *item = vectorPush(data->result);
+    *item = key;
     if (val && !data->no_values) {
-        *keys_lp = lpAppend(*keys_lp, (unsigned char*)val, sdslen(val));
-    }
-
-    /* Free temporary strings if they were allocated (e.g., for ZSET) */
-    if (o && o->type == OBJ_ZSET) {
-        if (key) sdsfree(key);
-        if (val) sdsfree(val);
+        item = vectorPush(data->result);
+        *item = val;
     }
 }
 
@@ -1433,11 +1435,12 @@ char *getObjectTypeName(robj *o) {
 void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     int isKeysHfield = 0;
     int i, j;
-    long count = 10;
+    long count = DEFAULT_SCAN_COMMAND_COUNT;
     sds pat = NULL;
     sds typename = NULL;
     long long type = LLONG_MAX;
     int patlen = 0, use_pattern = 0, no_values = 0;
+    vector result;
     dict *ht;
 
     /* Object must be NULL (to iterate keys names), or the type of the object
@@ -1518,7 +1521,22 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         ht = zs->dict;
     }
 
-    unsigned char *keys = lpNew(64);  /* Start with 64 bytes allocated */
+    /* Set a free callback for the contents of the collected keys list if they
+     * are deep copied temporary strings. We must not free them if they are just
+     * a shallow copy - a pointer to the actual data in the data structure */
+    void (*free_callback)(sds) = sdsfree;
+    if (o == NULL) {
+        free_callback = NULL;
+    } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HT) {
+        free_callback = NULL;
+    } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
+        /* scanning HASH allocates temporary strings for field names */
+        free_callback = sdsfree;
+    } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_SKIPLIST) {
+        /* scanning ZSET allocates temporary strings even though it's a dict */
+        free_callback = sdsfree;
+    }
+    vectorInit(&result, SCAN_VECTOR_INITIAL_ALLOC, sizeof(sds));
 
     /* For main dictionary scan or data structure using hashtable. */
     if (!o || ht) {
@@ -1542,7 +1560,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
          * 6. data.no_values: to control whether values will be returned or
          * only keys are returned. */
         scanData data = {
-            .keys_lp = &keys,
+            .result = &result,
             .o = o,
             .type = type,
             .pattern = use_pattern ? pat : NULL,
@@ -1568,70 +1586,32 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
             }
         } while (cursor && maxiterations-- && data.sampled < count);
     } else if (o->type == OBJ_SET) {
-        unsigned long array_reply_len = 0;
-        void *replylen = NULL;
-        lpFree(keys);
         char *str;
         char buf[LONG_STR_SIZE];
         size_t len;
         int64_t llele;
-        /* Reply to the client. */
-        addReplyArrayLen(c, 2);
-        /* Cursor is always 0 given we iterate over all set */
-        addReplyBulkLongLong(c,0);
-        /* If there is no pattern the length is the entire set size, otherwise we defer the reply size */
-        if (use_pattern)
-            replylen = addReplyDeferredLen(c);
-        else {
-            array_reply_len = setTypeSize(o);
-            addReplyArrayLen(c, array_reply_len);
-        }
-
         setTypeIterator *si = setTypeInitIterator(o);
-        unsigned long cur_length = 0;
         while (setTypeNext(si, &str, &len, &llele) != -1) {
             if (str == NULL) {
                 len = ll2string(buf, sizeof(buf), llele);
+                str = buf;
             }
-            char *key = str ? str : buf;
-            if (use_pattern && !stringmatchlen(pat, patlen, key, len, 0)) {
+            if (use_pattern && !stringmatchlen(pat, patlen, str, len, 0)) {
                 continue;
             }
-            addReplyBulkCBuffer(c, key, len);
-            cur_length++;
+            sds *item = vectorPush(&result);
+            *item = sdsnewlen(str, len);
         }
         setTypeReleaseIterator(si);
-        if (use_pattern)
-            setDeferredArrayLen(c,replylen,cur_length);
-        else
-            serverAssert(cur_length == array_reply_len); /* fail on corrupt data */
-        return;
+        cursor = 0;
     } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) &&
                o->encoding == OBJ_ENCODING_LISTPACK)
     {
         unsigned char *p = lpFirst(o->ptr);
         unsigned char *str;
         int64_t len;
-        unsigned long array_reply_len = 0;
         unsigned char intbuf[LP_INTBUF_SIZE];
-        void *replylen = NULL;
-        lpFree(keys);
 
-        /* Reply to the client. */
-        addReplyArrayLen(c, 2);
-        /* Cursor is always 0 given we iterate over all set */
-        addReplyBulkLongLong(c,0);
-        /* If there is no pattern the length is the entire set size, otherwise we defer the reply size */
-        if (use_pattern)
-            replylen = addReplyDeferredLen(c);
-        else {
-            array_reply_len = o->type == OBJ_HASH ? hashTypeLength(o, 0) : zsetLength(o);
-            if (!no_values) {
-                array_reply_len *= 2;
-            }
-            addReplyArrayLen(c, array_reply_len);
-        }
-        unsigned long cur_length = 0;
         while(p) {
             str = lpGet(p, &len, intbuf);
             /* point to the value */
@@ -1641,22 +1621,17 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
                 p = lpNext(o->ptr, p);
                 continue;
             }
-            /* add key object */
-            addReplyBulkCBuffer(c, str, len);
-            cur_length++;
+            sds *item = vectorPush(&result);
+            *item = sdsnewlen(str, len);
             /* add value object */
             if (!no_values) {
                 str = lpGet(p, &len, intbuf);
-                addReplyBulkCBuffer(c, str, len);
-                cur_length++;
+                item = vectorPush(&result);
+                *item = sdsnewlen(str, len);
             }
             p = lpNext(o->ptr, p);
         }
-        if (use_pattern)
-            setDeferredArrayLen(c,replylen,cur_length);
-        else
-            serverAssert(cur_length == array_reply_len); /* fail on corrupt data */
-        return;
+        cursor = 0;
     } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         int64_t len;
         long long expire_at;
@@ -1664,16 +1639,6 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         unsigned char *p = lpFirst(lp);
         unsigned char *str, *val;
         unsigned char intbuf[LP_INTBUF_SIZE];
-        void *replylen = NULL;
-
-        lpFree(keys);
-        /* Reply to the client. */
-        addReplyArrayLen(c, 2);
-        /* Cursor is always 0 given we iterate over all set */
-        addReplyBulkLongLong(c,0);
-        /* In the case of OBJ_ENCODING_LISTPACK_EX we always defer the reply size given some fields might be expired */
-        replylen = addReplyDeferredLen(c);
-        unsigned long cur_length = 0;
 
         while (p) {
             str = lpGet(p, &len, intbuf);
@@ -1691,19 +1656,17 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
                 continue;
             }
 
-            /* add key object */
-            addReplyBulkCBuffer(c, str, len);
-            cur_length++;
+            sds *item = vectorPush(&result);
+            *item = sdsnewlen(str, len);
             /* add value object */
             if (!no_values) {
                 str = lpGet(val, &len, intbuf);
-                addReplyBulkCBuffer(c, str, len);
-                cur_length++;
+                item = vectorPush(&result);
+                *item = sdsnewlen(str, len);
             }
             p = lpNext(lp, p);
         }
-        setDeferredArrayLen(c,replylen,cur_length);
-        return;
+        cursor = 0;
     } else {
         serverPanic("Not handled encoding in SCAN.");
     }
@@ -1712,30 +1675,16 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     addReplyArrayLen(c, 2);
     addReplyBulkLongLong(c,cursor);
 
-    unsigned long num_elements = lpLength(keys);
-    addReplyArrayLen(c, num_elements);
-
-    unsigned char *p = lpFirst(keys);
-    while (p != NULL) {
-        unsigned int slen;
-        long long lval;
-        unsigned char *key = lpGetValue(p, &slen, &lval);
-
-        if (key) {
-            /* String value - use slen since key is raw string data from listpack */
-            addReplyBulkCBuffer(c, key, slen);
-        } else {
-            /* Integer value - this shouldn't happen in scan results, but handle it */
-            char buf[32];
-            int len = snprintf(buf, sizeof(buf), "%lld", lval);
-            addReplyBulkCBuffer(c, buf, len);
+    addReplyArrayLen(c, vectorLen(&result));
+    for (uint32_t i = 0; i < vectorLen(&result); i++) {
+        sds *key = vectorGet(&result, i);
+        addReplyBulkCBuffer(c, *key, sdslen(*key));
+        if (free_callback) {
+            free_callback(*key);
         }
-
-        p = lpNext(keys, p);
     }
 
-    /* No need to free strings since they're stored as data in listpack, not pointers */
-    lpFree(keys);
+    vectorCleanup(&result);
 }
 
 /* The SCAN command completely relies on scanGenericCommand. */
