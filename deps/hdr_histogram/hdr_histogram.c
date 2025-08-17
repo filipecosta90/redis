@@ -141,7 +141,7 @@ static int64_t power(int64_t base, int64_t exp)
 #   endif
 #endif
 
-static int32_t count_leading_zeros_64(int64_t value)
+static always_inline int32_t count_leading_zeros_64(int64_t value)
 {
 #if defined(_MSC_VER)
     uint32_t leading_zero = 0;
@@ -171,12 +171,12 @@ static int32_t get_bucket_index(const struct hdr_histogram* h, int64_t value)
     return pow2ceiling - h->unit_magnitude - (h->sub_bucket_half_count_magnitude + 1);
 }
 
-static int32_t get_sub_bucket_index(int64_t value, int32_t bucket_index, int32_t unit_magnitude)
+static always_inline int32_t get_sub_bucket_index(int64_t value, int32_t bucket_index, int32_t unit_magnitude)
 {
     return (int32_t)(value >> (bucket_index + unit_magnitude));
 }
 
-static int32_t counts_index(const struct hdr_histogram* h, int32_t bucket_index, int32_t sub_bucket_index)
+static always_inline int32_t counts_index(const struct hdr_histogram* h, int32_t bucket_index, int32_t sub_bucket_index)
 {
     /* Calculate the index for the first entry in the bucket: */
     /* (The following is the equivalent of ((bucket_index + 1) * subBucketHalfCount) ): */
