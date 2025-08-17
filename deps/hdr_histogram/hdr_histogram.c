@@ -23,6 +23,11 @@
 
 #include HDR_MALLOC_INCLUDE
 
+/* Performance optimization macros */
+#define always_inline inline __attribute__((always_inline))
+#define likely(x)     __builtin_expect(!!(x), 1)
+#define unlikely(x)   __builtin_expect(!!(x), 0)
+
 /*  ######   #######  ##     ## ##    ## ########  ######  */
 /* ##    ## ##     ## ##     ## ###   ##    ##    ##    ## */
 /* ##       ##     ## ##     ## ####  ##    ##    ##       */
@@ -31,25 +36,19 @@
 /* ##    ## ##     ## ##     ## ##   ###    ##    ##    ## */
 /*  ######   #######   #######  ##    ##    ##     ######  */
 
-static int32_t normalize_index(const struct hdr_histogram* h, int32_t index)
+static always_inline int32_t normalize_index(const struct hdr_histogram* h, int32_t index)
 {
-    int32_t normalized_index;
-    int32_t adjustment = 0;
-    if (h->normalizing_index_offset == 0)
+    // Optimize for the common path: no normalization needed
+    if (likely(h->normalizing_index_offset == 0))
     {
         return index;
     }
 
-    normalized_index = index - h->normalizing_index_offset;
+    int32_t normalized_index = index - h->normalizing_index_offset;
 
-    if (normalized_index < 0)
-    {
-        adjustment = h->counts_len;
-    }
-    else if (normalized_index >= h->counts_len)
-    {
-        adjustment = -h->counts_len;
-    }
+    // Use branchless ternary for adjustment calculation
+    int32_t adjustment = (normalized_index < 0) ? h->counts_len :
+                        (normalized_index >= h->counts_len) ? -h->counts_len : 0;
 
     return normalized_index + adjustment;
 }
@@ -64,7 +63,7 @@ static int64_t counts_get_normalised(const struct hdr_histogram* h, int32_t inde
     return counts_get_direct(h, normalize_index(h, index));
 }
 
-static void counts_inc_normalised(
+static always_inline void counts_inc_normalised(
     struct hdr_histogram* h, int32_t index, int64_t value)
 {
     int32_t normalised_index = normalize_index(h, index);
@@ -81,8 +80,9 @@ static void counts_inc_normalised_atomic(
     hdr_atomic_add_fetch_64(&h->total_count, value);
 }
 
-static void update_min_max(struct hdr_histogram* h, int64_t value)
+static always_inline void update_min_max(struct hdr_histogram* h, int64_t value)
 {
+    // Branchless min/max update using ternary operators
     h->min_value = (value < h->min_value && value != 0) ? value : h->min_value;
     h->max_value = (value > h->max_value) ? value : h->max_value;
 }
@@ -192,7 +192,7 @@ static int64_t value_from_index(int32_t bucket_index, int32_t sub_bucket_index, 
     return ((int64_t) sub_bucket_index) << (bucket_index + unit_magnitude);
 }
 
-int32_t counts_index_for(const struct hdr_histogram* h, int64_t value)
+always_inline int32_t counts_index_for(const struct hdr_histogram* h, int64_t value)
 {
     int32_t bucket_index     = get_bucket_index(h, value);
     int32_t sub_bucket_index = get_sub_bucket_index(value, bucket_index, h->unit_magnitude);
@@ -490,16 +490,15 @@ bool hdr_record_value_atomic(struct hdr_histogram* h, int64_t value)
 
 bool hdr_record_values(struct hdr_histogram* h, int64_t value, int64_t count)
 {
-    int32_t counts_index;
-
-    if (value < 0)
+    // Optimize for the common path: valid positive values
+    if (unlikely(value < 0))
     {
         return false;
     }
 
-    counts_index = counts_index_for(h, value);
+    int32_t counts_index = counts_index_for(h, value);
 
-    if (counts_index < 0 || h->counts_len <= counts_index)
+    if (unlikely(counts_index < 0 || h->counts_len <= counts_index))
     {
         return false;
     }
