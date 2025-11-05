@@ -890,6 +890,37 @@ int hashTypeExists(redisDb *db, kvobj *o, sds field, int hfeFlags, int *isHashDe
     return (res == GETF_OK) ? 1 : 0;
 }
 
+/* Return the number of elements in a hash with OBJ_ENCODING_LISTPACK encoding. */
+static inline unsigned long hashTypeLengthListpack(const robj *o) {
+    return lpLength(o->ptr) / 2;
+}
+
+/* Return the number of elements in a hash with OBJ_ENCODING_LISTPACK_EX encoding. */
+static inline unsigned long hashTypeLengthListpackEx(const robj *o, int subtractExpiredFields) {
+    listpackEx *lpt = o->ptr;
+    unsigned long length = lpLength(lpt->lp) / 3;
+
+    if (subtractExpiredFields && lpt->meta.trash == 0)
+        length -= listpackExExpireDryRun(o);
+
+    return length;
+}
+
+/* Return the number of elements in a hash with OBJ_ENCODING_HT encoding. */
+static inline unsigned long hashTypeLengthHt(const robj *o, int subtractExpiredFields) {
+    uint64_t expiredItems = 0;
+    dict *d = (dict*)o->ptr;
+    if (subtractExpiredFields && isDictWithMetaHFE(d)) {
+        htMetadataEx *meta = htGetMetadataEx(d);
+        /* If dict registered in global HFE DS */
+        if (meta->expireMeta.trash == 0)
+            expiredItems = ebExpireDryRun(meta->hfe,
+                                          &hashFieldExpireBucketsType,
+                                          commandTimeSnapshot());
+    }
+    return dictSize(d) - expiredItems;
+}
+
 /* Add a new field, overwrite the old with the new value if it already exists.
  * Return 0 on insert and 1 on update.
  *
@@ -914,13 +945,15 @@ int hashTypeExists(redisDb *db, kvobj *o, sds field, int hfeFlags, int *isHashDe
 #define HASH_SET_KEEP_TTL (1<<2)
 int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
     int update = 0;
+    const size_t fieldlen = sdslen(field);
+    const size_t valuelen = sdslen(value);
 
     /* Check if the field is too long for listpack, and convert before adding the item.
      * This is needed for HINCRBY* case since in other commands this is handled early by
      * hashTypeTryConversion, so this check will be a NOP. */
     if (o->encoding == OBJ_ENCODING_LISTPACK  ||
         o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-        if (sdslen(field) > server.hash_max_listpack_value || sdslen(value) > server.hash_max_listpack_value)
+        if (fieldlen > server.hash_max_listpack_value || valuelen > server.hash_max_listpack_value)
             hashTypeConvert(db, o, OBJ_ENCODING_HT);
     }
 
@@ -930,22 +963,22 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
         zl = o->ptr;
         fptr = lpFirst(zl);
         if (fptr != NULL) {
-            fptr = lpFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
+            fptr = lpFind(zl, fptr, (unsigned char*)field, fieldlen, 1);
             if (fptr != NULL) {
                 /* Grab pointer to the value (fptr points to the field) */
                 vptr = lpNext(zl, fptr);
                 serverAssert(vptr != NULL);
 
                 /* Replace value */
-                zl = lpReplace(zl, &vptr, (unsigned char*)value, sdslen(value));
+                zl = lpReplace(zl, &vptr, (unsigned char*)value, valuelen);
                 update = 1;
             }
         }
 
         if (!update) {
             listpackEntry entries[2] = {
-                {.sval = (unsigned char*) field, .slen = sdslen(field)},
-                {.sval = (unsigned char*) value, .slen = sdslen(value)},
+                {.sval = (unsigned char*) field, .slen = fieldlen},
+                {.sval = (unsigned char*) value, .slen = valuelen},
             };
 
             /* Push new field/value pair onto the tail of the listpack */
@@ -954,7 +987,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
         o->ptr = zl;
 
         /* Check if the listpack needs to be converted to a hash table */
-        if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+        if (hashTypeLengthListpack(o) > server.hash_max_listpack_entries)
             hashTypeConvert(db, o, OBJ_ENCODING_HT);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
         unsigned char *fptr = NULL, *vptr = NULL, *tptr = NULL;
@@ -963,14 +996,14 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
 
         fptr = lpFirst(lpt->lp);
         if (fptr != NULL) {
-            fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, sdslen(field), 2);
+            fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, fieldlen, 2);
             if (fptr != NULL) {
                 /* Grab pointer to the value (fptr points to the field) */
                 vptr = lpNext(lpt->lp, fptr);
                 serverAssert(vptr != NULL);
 
                 /* Replace value */
-                lpt->lp = lpReplace(lpt->lp, &vptr, (unsigned char *) value, sdslen(value));
+                lpt->lp = lpReplace(lpt->lp, &vptr, (unsigned char *) value, valuelen);
                 update = 1;
 
                 fptr = lpPrev(lpt->lp, vptr);
@@ -989,11 +1022,11 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
         }
 
         if (!update)
-            listpackExAddNew(o, field, sdslen(field), value, sdslen(value),
+            listpackExAddNew(o, field, fieldlen, value, valuelen,
                              HASH_LP_NO_TTL);
 
         /* Check if the listpack needs to be converted to a hash table */
-        if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+        if (hashTypeLengthListpackEx(o, 0) > server.hash_max_listpack_entries)
             hashTypeConvert(db, o, OBJ_ENCODING_HT);
 
     } else if (o->encoding == OBJ_ENCODING_HT) {
@@ -1004,7 +1037,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
         size_t usable, *alloc_size = htGetMetadataSize(ht);
         /* check if field already exists */
         if (link == NULL) {
-            hfield newField = hfieldNew(field, sdslen(field), 0, &usable);
+            hfield newField = hfieldNew(field, fieldlen, 0, &usable);
             dictSetKeyAtLink(ht, newField, &bucket, 1);
             *alloc_size += usable;
             de = *bucket;
@@ -1309,35 +1342,19 @@ int hashTypeDelete(robj *o, void *field, int isSdsField) {
  * Note, subtractExpiredFields=1 might be pricy in case there are many HFEs
  */
 unsigned long hashTypeLength(const robj *o, int subtractExpiredFields) {
-    unsigned long length = ULONG_MAX;
     /* If expired field access is allowed, don't subtract expired fields from the count. */
     if (server.allow_access_expired)
         subtractExpiredFields = 0;
 
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        length = lpLength(o->ptr) / 2;
+        return hashTypeLengthListpack(o);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-        listpackEx *lpt = o->ptr;
-        length = lpLength(lpt->lp) / 3;
-
-        if (subtractExpiredFields && lpt->meta.trash == 0)
-            length -= listpackExExpireDryRun(o);
+        return hashTypeLengthListpackEx(o, subtractExpiredFields);
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        uint64_t expiredItems = 0;
-        dict *d = (dict*)o->ptr;
-        if (subtractExpiredFields && isDictWithMetaHFE(d)) {
-            htMetadataEx *meta = htGetMetadataEx(d);
-            /* If dict registered in global HFE DS */
-            if (meta->expireMeta.trash == 0)
-                expiredItems = ebExpireDryRun(meta->hfe,
-                                              &hashFieldExpireBucketsType,
-                                              commandTimeSnapshot());
-        }
-        length = dictSize(d) - expiredItems;
+        return hashTypeLengthHt(o, subtractExpiredFields);
     } else {
         serverPanic("Unknown hash encoding");
     }
-    return length;
 }
 
 size_t hashTypeAllocSize(const robj *o) {
