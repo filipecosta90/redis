@@ -101,12 +101,21 @@ static void monotonicInit_x86linux(void) {
 #if defined(__aarch64__)
 static long mono_ticksPerMicrosecond = 0;
 
-/* Read the clock value.
- * CNTVCT_EL0 is a system counter register, that provides the monotonic
- * timestamp as a 64-bit count value. */
+/* Read the clock value with an instruction synchronization barrier.
+ *
+ * CNTVCT_EL0 is a system counter register that provides a monotonic
+ * timestamp as a 64-bit count value.
+ *
+ * The ISB (Instruction Synchronization Barrier) ensures that the read of
+ * CNTVCT_EL0 is not executed "too early" relative to preceding instructions
+ * in the program order. Without ISB, out-of-order and speculative execution
+ * may allow the counter read to be performed before earlier instructions
+ * (e.g. polling a signal/flag), which can break the intended semantics of
+ * timing loops and latency measurements.
+ */
 static inline uint64_t __cntvct(void) {
     uint64_t virtual_timer_value;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(virtual_timer_value) :: "memory");
     return virtual_timer_value;
 }
 
