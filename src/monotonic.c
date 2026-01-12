@@ -26,9 +26,8 @@ static char monotonic_info_string[32];
  * To use the processor clock on other architectures, either uncomment this line,
  * or build with
  *   CFLAGS="-DUSE_PROCESSOR_CLOCK"
-#define USE_PROCESSOR_CLOCK
  */
-
+#define USE_PROCESSOR_CLOCK
 
 #if defined(USE_PROCESSOR_CLOCK) && defined(__x86_64__) && defined(__linux__)
 #include <regex.h>
