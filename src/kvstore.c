@@ -79,6 +79,15 @@ static int getAndClearDictIndexFromCursor(kvstore *kvs, unsigned long long *curs
     return didx;
 }
 
+/* Get the dict index (slot) from cursor without modifying the cursor.
+ * The cursor format is: 48 upper bits for HT position, lower bits for dict index.
+ * See kvstoreScan() for full cursor format documentation. */
+int kvstoreGetDictIndexFromCursor(kvstore *kvs, unsigned long long cursor) {
+    if (kvs->num_dicts == 1)
+        return 0;
+    return (int) (cursor & (kvs->num_dicts-1));
+}
+
 /* Updates binary index tree (Fenwick tree), updates key count for a given dict */
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
     kvs->key_count += delta;

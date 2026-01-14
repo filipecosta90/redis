@@ -393,7 +393,7 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
     kvstoreDictSetAtLink(db->keys, slot, kv, link, 1);
 
     /* Add to expires. Leverage setExpireByLink() to reuse the key link. */
-    if (hasExpire) kv = setExpireByLink(NULL, db, key->ptr, expire, *link);
+    if (hasExpire) kv = setExpireByLink(NULL, db, key->ptr, expire, *link, slot);
 
     signalKeyAsReady(db, key, kv->type);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
@@ -483,7 +483,7 @@ kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, long long expire) {
 
     /* Set the expire time if needed */
     if (expire != -1)
-        kv = setExpireByLink(NULL, db, key, expire, bucket);
+        kv = setExpireByLink(NULL, db, key, expire, bucket, slot);
 
     updateKeysizesHist(db, slot, kv->type, -1, (int64_t) getObjectLength(kv));
     if (server.memory_tracking_per_slot)
@@ -747,11 +747,10 @@ robj *dbRandomKey(redisDb *db) {
     }
 }
 
-/* Helper for sync and async delete. */
-int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
+/* Helper for sync and async delete. Like dbGenericDelete(), but accepts slot to save lookup */
+int dbGenericDeleteBySlot(redisDb *db, robj *key, int async, int flags, int slot) {
     dictEntryLink link;
     int table;
-    int slot = getKeySlot(key->ptr);
     link = kvstoreDictTwoPhaseUnlinkFind(db->keys, slot, key->ptr, &table);
 
     if (link) {
@@ -798,6 +797,12 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     } else {
         return 0;
     }
+}
+
+/* Helper for sync and async delete. */
+int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
+    int slot = getKeySlot(key->ptr);
+    return dbGenericDeleteBySlot(db, key, async, flags, slot);
 }
 
 /* Delete a key, value, and associated expiration entry if any, from the DB */
@@ -2166,7 +2171,7 @@ void moveCommand(client *c) {
 
     dbAddByLink(dst, c->argv[1], &kv, &dstBucket);
     if (expire != -1)
-        kv = setExpireByLink(c, dst, c->argv[1]->ptr, expire, dstBucket);
+        kv = setExpireByLink(c, dst, c->argv[1]->ptr, expire, dstBucket, slot);
 
     /* If object of type hash with expiration on fields. Taken care to add the
      * hash to subexpires of `dst` only after dbDelete(). */
@@ -2517,16 +2522,16 @@ int removeExpire(redisDb *db, robj *key) {
  * of an user calling a command 'c' is the client, otherwise 'c' is set
  * to NULL. The 'when' parameter is the absolute unix time in milliseconds
  * after which the key will no longer be considered valid.
- * 
+ *
  * Note: It may reallocate kvobj. The returned ref may point to a new object. */
 kvobj *setExpire(client *c, redisDb *db, robj *key, long long when) {
-    return setExpireByLink(c,db,key->ptr,when,NULL);
+    int slot = getKeySlot(key->ptr);
+    return setExpireByLink(c,db,key->ptr,when,NULL,slot);
 }
 
-/* Like setExpire(), but accepts an optional `keyLink` to save lookup */
-kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntryLink keyLink) {
+/* Like setExpire(), but accepts an optional `keyLink` and `slot` to save lookup */
+kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntryLink keyLink, int slot) {
     /* Reuse the sds from the main dict in the expire dict */
-    int slot = getKeySlot(key);
     size_t oldsize = 0;
     if (!keyLink) {
         keyLink = kvstoreDictFindLink(db->keys, slot, key, NULL);
@@ -2574,6 +2579,21 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
  * Returns -1 if the key has no expiration set or doesn't exists
  *
  * To avoid lookup, pass key-value object (`kv`) instead of `key`.
+ * Like getExpire(), but accepts slot to save lookup.
+ */
+long long getExpireBySlot(redisDb *db, sds key, kvobj *kv, int slot) {
+    if (kv == NULL) {
+        dictEntry *de = kvstoreDictFind(db->expires, slot, key);
+        kv = de ? dictGetKey(de) : NULL;
+    }
+    if (kv == NULL) return -1;
+    return kvobjGetExpire(kv);
+}
+
+/* Retrieve the expiration time for the specified key.
+ * Returns -1 if the key has no expiration set or doesn't exists
+ *
+ * To avoid lookup, pass key-value object (`kv`) instead of `key`.
  */
 long long getExpire(redisDb *db, sds key, kvobj *kv) {
     if (kv == NULL) kv = dbFindExpires(db, key);
@@ -2587,8 +2607,10 @@ long long getExpire(redisDb *db, sds key, kvobj *kv) {
  * which config to look for lazy free, stats var to increment, and so on.
  *
  * key_mem_freed is an out parameter which contains the estimated
- * amount of memory freed due to the trimming (may be NULL) */
-static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, long long *key_mem_freed) {
+ * amount of memory freed due to the trimming (may be NULL)
+ *
+ * Like deleteKeyAndPropagate(), but accepts slot to save lookup */
+static void deleteKeyAndPropagateBySlot(redisDb *db, robj *keyobj, int notify_type, long long *key_mem_freed, int slot) {
     mstime_t latency;
     int del_flag = notify_type == NOTIFY_EXPIRED ? DB_FLAG_KEY_EXPIRED : DB_FLAG_KEY_EVICTED;
     int lazy_flag = notify_type == NOTIFY_EXPIRED ? server.lazyfree_lazy_expire : server.lazyfree_lazy_eviction;
@@ -2620,7 +2642,7 @@ static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, lo
      * AOF and slave buffers */
     if (key_mem_freed) *key_mem_freed = (long long) zmalloc_used_memory() - freeMemoryGetNotCountedMemory();
     latencyStartMonitor(latency);
-    dbGenericDelete(db, keyobj, lazy_flag, del_flag);
+    dbGenericDeleteBySlot(db, keyobj, lazy_flag, del_flag, slot);
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded(latency_name, latency);
     if (key_mem_freed) *key_mem_freed -= (long long) zmalloc_used_memory() - freeMemoryGetNotCountedMemory();
@@ -2638,14 +2660,29 @@ static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, lo
         decrRefCount(keyobj);
 }
 
+static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, long long *key_mem_freed) {
+    int slot = getKeySlot(keyobj->ptr);
+    deleteKeyAndPropagateBySlot(db, keyobj, notify_type, key_mem_freed, slot);
+}
+
 /* Delete the specified expired key and propagate. */
 void deleteExpiredKeyAndPropagate(redisDb *db, robj *keyobj) {
     deleteKeyAndPropagate(db, keyobj, NOTIFY_EXPIRED, NULL);
 }
 
+/* Like deleteExpiredKeyAndPropagate(), but accepts slot to save lookup */
+void deleteExpiredKeyAndPropagateBySlot(redisDb *db, robj *keyobj, int slot) {
+    deleteKeyAndPropagateBySlot(db, keyobj, NOTIFY_EXPIRED, NULL, slot);
+}
+
 /* Delete the specified evicted key and propagate. */
 void deleteEvictedKeyAndPropagate(redisDb *db, robj *keyobj, long long *key_mem_freed) {
     deleteKeyAndPropagate(db, keyobj, NOTIFY_EVICTED, key_mem_freed);
+}
+
+/* Like deleteEvictedKeyAndPropagate(), but accepts slot to save lookup */
+void deleteEvictedKeyAndPropagateBySlot(redisDb *db, robj *keyobj, long long *key_mem_freed, int slot) {
+    deleteKeyAndPropagateBySlot(db, keyobj, NOTIFY_EVICTED, key_mem_freed, slot);
 }
 
 /* Propagate an implicit key deletion into replicas and the AOF file.
@@ -2684,6 +2721,22 @@ void propagateDeletion(redisDb *db, robj *key, int lazy) {
 
     decrRefCount(argv[0]);
     decrRefCount(argv[1]);
+}
+
+/* Check if the key is expired
+ *
+ * Provide either the key name for a lookup or KV object (to save lookup)
+ * Like keyIsExpired(), but accepts slot to save lookup.
+ */
+int keyIsExpiredBySlot(redisDb *db, sds key, kvobj *kv, int slot) {
+    /* Don't expire anything while loading. It will be done later. */
+    if (server.loading || server.allow_access_expired) return 0;
+    mstime_t when = getExpireBySlot(db, key, kv, slot);
+    if (when < 0) return 0; /* No expire for this key */
+    const mstime_t now = commandTimeSnapshot();
+    /* The key expired if the current (virtual or real) time is greater
+     * than the expire time of the key. */
+    return now > when;
 }
 
 /* Check if the key is expired

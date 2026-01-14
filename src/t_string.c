@@ -154,7 +154,10 @@ void setGenericCommand(client *c, int flags, robj *key, robj **valref, robj *exp
     setKeyByLink(c, c->db, key, valref, setkey_flags, &link);
     /* If there's an expiration, setExpireByLink may reallocate the object.
      * We must update valref to reflect the new object if that happens. */
-    if (expire) *valref = setExpireByLink(c, c->db, key->ptr, milliseconds, link);
+    if (expire) {
+        int slot = getKeySlot(key->ptr);
+        *valref = setExpireByLink(c, c->db, key->ptr, milliseconds, link, slot);
+    }
     /* The client still holds a reference to the original object via c->argv[i],
      * and will call decrRefCount() at the end of call(). We increment the refcount
      * from 1 to 2 to ensure both DB and client have valid references. */

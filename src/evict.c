@@ -569,6 +569,7 @@ int performEvictions(void) {
         static unsigned int next_db = 0;
         sds bestkey = NULL;
         int bestdbid;
+        int bestslot = 0;
         redisDb *db;
         dictEntry *de;
 
@@ -640,6 +641,7 @@ int performEvictions(void) {
                      * a ghost and we need to try the next element. */
                     if (de) {
                         bestkey = kvobjGetKey(dictGetKV(de));
+                        bestslot = pool[k].slot;
                         break;
                     } else {
                         /* Ghost... Iterate again. */
@@ -671,6 +673,7 @@ int performEvictions(void) {
                     kvobj *kv = dictGetKV(de);
                     bestkey = kvobjGetKey(kv);
                     bestdbid = j;
+                    bestslot = slot;
                     break;
                 }
             }
@@ -683,7 +686,7 @@ int performEvictions(void) {
 
             enterExecutionUnit(1, 0);
             robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
-            deleteEvictedKeyAndPropagate(db, keyobj, &key_mem_freed);
+            deleteEvictedKeyAndPropagateBySlot(db, keyobj, &key_mem_freed, bestslot);
             decrRefCount(keyobj);
             exitExecutionUnit();
             /* Propagate the DEL command */

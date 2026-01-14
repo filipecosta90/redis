@@ -27,7 +27,7 @@
 static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 0.885842, 0.868126, 0.850763, 0.833748, 0.817073, 0.800731, 0.784717, 0.769022, 0.753642, 0.738569, 0.723798};
 
 /* Helper function for the activeExpireCycle() function.
- * This function will try to expire the key-value entry that is stored in the 
+ * This function will try to expire the key-value entry that is stored in the
  * hash table entry 'de' of the 'expires' hash table of a Redis database.
  *
  * If the key is found to be expired, it is removed from the database and
@@ -36,20 +36,28 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
  * When a key is expired, server.stat_expiredkeys is incremented.
  *
  * The parameter 'now' is the current time in milliseconds as is passed
- * to the function to avoid too many gettimeofday() syscalls. */
-int activeExpireCycleTryExpire(redisDb *db, kvobj *kv, long long now) {
+ * to the function to avoid too many gettimeofday() syscalls.
+ *
+ * Like activeExpireCycleTryExpire(), but accepts slot to save lookup */
+int activeExpireCycleTryExpireBySlot(redisDb *db, kvobj *kv, long long now, int slot) {
     if (now < kvobjGetExpire(kv))
         return 0;
 
     enterExecutionUnit(1, 0);
     sds key = kvobjGetKey(kv);
     robj *keyobj = createStringObject(key,sdslen(key));
-    deleteExpiredKeyAndPropagate(db,keyobj);
+    deleteExpiredKeyAndPropagateBySlot(db, keyobj, slot);
     decrRefCount(keyobj);
     exitExecutionUnit();
     /* Propagate the DEL command */
     postExecutionUnitOperations();
     return 1;
+}
+
+int activeExpireCycleTryExpire(redisDb *db, kvobj *kv, long long now) {
+    sds key = kvobjGetKey(kv);
+    int slot = getKeySlot(key);
+    return activeExpireCycleTryExpireBySlot(db, kv, now, slot);
 }
 
 /* Try to expire a few timed out keys. The algorithm used is adaptive and
@@ -108,6 +116,7 @@ typedef struct {
     unsigned long expired; /* num keys expired */
     long long ttl_sum; /* sum of ttl for key with ttl not yet expired */
     int ttl_samples; /* num keys with ttl not yet expired */
+    int slot; /* current slot being scanned */
 } expireScanData;
 
 void expireScanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
@@ -115,7 +124,7 @@ void expireScanCallback(void *privdata, const dictEntry *de, dictEntryLink plink
     kvobj *kv = dictGetKV(de);
     expireScanData *data = privdata;
     long long ttl  = kvobjGetExpire(kv) - data->now;
-    if (activeExpireCycleTryExpire(data->db, kv, data->now)) {
+    if (activeExpireCycleTryExpireBySlot(data->db, kv, data->now, data->slot)) {
         data->expired++;
     }
     if (ttl > 0) {
@@ -428,6 +437,10 @@ void activeExpireCycle(int type) {
             int origin_ttl_samples = data.ttl_samples;
 
             while (data.sampled < num && checked_buckets < max_buckets) {
+                /* The lower bits of the cursor encode the dict index (slot).
+                 * See kvstoreScan() for cursor format documentation.
+                 * If this slot is skipped, the callback won't be invoked. */
+                data.slot = kvstoreGetDictIndexFromCursor(db->expires, db->expires_cursor);
                 db->expires_cursor = kvstoreScan(db->expires, db->expires_cursor, -1, expireScanCallback, expirySamplingShouldSkipDict, &data);
                 if (db->expires_cursor == 0) {
                     db_done = 1;
