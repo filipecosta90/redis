@@ -66,6 +66,7 @@ typedef struct KeyPrefetchInfo {
     uint64_t key_hash;        /* Hash value of the key being prefetched */
     dictEntry *current_entry; /* Pointer to the current entry being processed */
     kvobj *current_kv;        /* Pointer to the kv object being prefetched */
+    int is_write_command;     /* Flag indicating if this is a write command (affects value data prefetch) */
 } KeyPrefetchInfo;
 
 /* PrefetchCommandsBatch structure holds the state of the current batch of client commands being processed. */
@@ -401,6 +402,9 @@ int addCommandToBatch(client *c) {
 
         serverAssert(pcmd->flags & PENDING_CMD_KEYS_RESULT_VALID);
         for (int i = 0; i < pcmd->keys_result.numkeys && batch->key_count < batch->max_prefetch_size; i++) {
+            /* Track whether this is a write command for value data prefetch optimization.
+             * Value data (kv->ptr) is only prefetched for writes based on performance heuristics. */
+            batch->prefetch_info[batch->key_count].is_write_command = (pcmd->cmd->flags & CMD_WRITE) ? 1 : 0;
             batch->keys[batch->key_count] = pcmd->argv[pcmd->keys_result.keys[i].pos];
             batch->keys_dicts[batch->key_count] =
                 kvstoreGetDict(c->db->keys, pcmd->slot > 0 ? pcmd->slot : 0);
