@@ -238,7 +238,7 @@ static void prefetchValueData(KeyPrefetchInfo *info) {
     if ((!dictGetNext(info->current_entry) && !dictIsRehashing(batch->current_dicts[i])) ||
         dictCompareKeys(batch->current_dicts[i], batch->keys[i], key))
     {
-        if (batch->get_value_data_func) {
+        if (batch->get_value_data_func && info->is_write_command) {
             void *value_data = batch->get_value_data_func(kv);
             if (value_data) prefetchAndMoveToNextKey(value_data);
         }
