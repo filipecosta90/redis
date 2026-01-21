@@ -4235,19 +4235,27 @@ int commandCheckArity(struct redisCommand *cmd, int argc, sds *err) {
 
 /* If we're executing a script, try to extract a set of command flags from
  * it, in case it declared them. Note this is just an attempt, we don't yet
- * know the script command is well formed.*/
-uint64_t getCommandFlags(client *c) {
-    uint64_t cmd_flags = c->cmd->flags;
-
-    if (c->cmd->proc == fcallCommand || c->cmd->proc == fcallroCommand) {
-        cmd_flags = fcallGetCommandFlags(c, cmd_flags);
-    } else if (c->cmd->proc == evalCommand || c->cmd->proc == evalRoCommand ||
-               c->cmd->proc == evalShaCommand || c->cmd->proc == evalShaRoCommand)
-    {
-        cmd_flags = evalGetCommandFlags(c, cmd_flags);
+ * know the script command is well formed.
+ *
+ * This is the internal inline version for use within server.c on the hot path.
+ * The non-inline version below is exported for use by other modules. */
+static inline uint64_t getCommandFlagsInternal(client *c) {
+    if (unlikely(c->cmd->proc == fcallCommand || c->cmd->proc == fcallroCommand)) {
+        return fcallGetCommandFlags(c, c->cmd->flags);
     }
 
-    return cmd_flags;
+    if (unlikely(c->cmd->proc == evalCommand || c->cmd->proc == evalRoCommand ||
+                 c->cmd->proc == evalShaCommand || c->cmd->proc == evalShaRoCommand))
+    {
+        return evalGetCommandFlags(c, c->cmd->flags);
+    }
+
+    return c->cmd->flags;
+}
+
+/* Non-inline version for external callers (script.c, module.c, etc.) */
+uint64_t getCommandFlags(client *c) {
+    return getCommandFlagsInternal(c);
 }
 
 void preprocessCommand(client *c, pendingCommand *pcmd) {
@@ -4388,7 +4396,7 @@ int processCommand(client *c) {
         }
     }
 
-    const uint64_t cmd_flags = getCommandFlags(c);
+    const uint64_t cmd_flags = getCommandFlagsInternal(c);
 
     int is_read_command = (cmd_flags & CMD_READONLY) ||
                            (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_READONLY));
