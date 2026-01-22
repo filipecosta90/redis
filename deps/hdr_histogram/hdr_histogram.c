@@ -31,22 +31,23 @@
 /* ##    ## ##     ## ##     ## ##   ###    ##    ##    ## */
 /*  ######   #######   #######  ##    ##    ##     ######  */
 
-static int32_t normalize_index(const struct hdr_histogram* h, int32_t index)
+HDR_INLINE int32_t normalize_index(const struct hdr_histogram* h, int32_t index)
 {
     int32_t normalized_index;
     int32_t adjustment = 0;
-    if (h->normalizing_index_offset == 0)
+    /* The common case is no offset, so optimise for that */
+    if (hdr_likely(h->normalizing_index_offset == 0))
     {
         return index;
     }
 
     normalized_index = index - h->normalizing_index_offset;
 
-    if (normalized_index < 0)
+    if (hdr_unlikely(normalized_index < 0))
     {
         adjustment = h->counts_len;
     }
-    else if (normalized_index >= h->counts_len)
+    else if (hdr_unlikely(normalized_index >= h->counts_len))
     {
         adjustment = -h->counts_len;
     }
@@ -64,11 +65,12 @@ static int64_t counts_get_normalised(const struct hdr_histogram* h, int32_t inde
     return counts_get_direct(h, normalize_index(h, index));
 }
 
-static void counts_inc_normalised(
-    struct hdr_histogram* h, int32_t index, int64_t value)
+HDR_INLINE void counts_inc_normalised(
+    struct hdr_histogram* restrict h, int32_t index, int64_t value)
 {
     int32_t normalised_index = normalize_index(h, index);
-    h->counts[normalised_index] += value;
+    int64_t* restrict counts = h->counts;
+    counts[normalised_index] += value;
     h->total_count += value;
 }
 
@@ -81,10 +83,10 @@ static void counts_inc_normalised_atomic(
     hdr_atomic_add_fetch_64(&h->total_count, value);
 }
 
-static void update_min_max(struct hdr_histogram* h, int64_t value)
+HDR_INLINE void update_min_max(struct hdr_histogram* h, int64_t value)
 {
-    h->min_value = (value < h->min_value && value != 0) ? value : h->min_value;
-    h->max_value = (value > h->max_value) ? value : h->max_value;
+    h->min_value = (hdr_unlikely(value < h->min_value && value != 0)) ? value : h->min_value;
+    h->max_value = (hdr_unlikely(value > h->max_value)) ? value : h->max_value;
 }
 
 static void update_min_max_atomic(struct hdr_histogram* h, int64_t value)
@@ -141,7 +143,7 @@ static int64_t power(int64_t base, int64_t exp)
 #   endif
 #endif
 
-static int32_t count_leading_zeros_64(int64_t value)
+HDR_INLINE int32_t count_leading_zeros_64(int64_t value)
 {
 #if defined(_MSC_VER)
     uint32_t leading_zero = 0;
@@ -161,22 +163,23 @@ static int32_t count_leading_zeros_64(int64_t value)
 #endif
     return 63 - leading_zero; /* smallest power of 2 containing value */
 #else
+    /* GCC/Clang builtin maps to CLZ instruction on ARM */
     return __builtin_clzll(value); /* smallest power of 2 containing value */
 #endif
 }
 
-static int32_t get_bucket_index(const struct hdr_histogram* h, int64_t value)
+HDR_INLINE int32_t get_bucket_index(const struct hdr_histogram* h, int64_t value)
 {
     int32_t pow2ceiling = 64 - count_leading_zeros_64(value | h->sub_bucket_mask); /* smallest power of 2 containing value */
     return pow2ceiling - h->unit_magnitude - (h->sub_bucket_half_count_magnitude + 1);
 }
 
-static int32_t get_sub_bucket_index(int64_t value, int32_t bucket_index, int32_t unit_magnitude)
+HDR_INLINE int32_t get_sub_bucket_index(int64_t value, int32_t bucket_index, int32_t unit_magnitude)
 {
     return (int32_t)(value >> (bucket_index + unit_magnitude));
 }
 
-static int32_t counts_index(const struct hdr_histogram* h, int32_t bucket_index, int32_t sub_bucket_index)
+HDR_INLINE int32_t counts_index(const struct hdr_histogram* h, int32_t bucket_index, int32_t sub_bucket_index)
 {
     /* Calculate the index for the first entry in the bucket: */
     /* (The following is the equivalent of ((bucket_index + 1) * subBucketHalfCount) ): */
@@ -192,7 +195,7 @@ static int64_t value_from_index(int32_t bucket_index, int32_t sub_bucket_index, 
     return ((int64_t) sub_bucket_index) << (bucket_index + unit_magnitude);
 }
 
-int32_t counts_index_for(const struct hdr_histogram* h, int64_t value)
+inline __attribute__((always_inline)) int32_t counts_index_for(const struct hdr_histogram* h, int64_t value)
 {
     int32_t bucket_index     = get_bucket_index(h, value);
     int32_t sub_bucket_index = get_sub_bucket_index(value, bucket_index, h->unit_magnitude);
@@ -488,18 +491,18 @@ bool hdr_record_value_atomic(struct hdr_histogram* h, int64_t value)
     return hdr_record_values_atomic(h, value, 1);
 }
 
-bool hdr_record_values(struct hdr_histogram* h, int64_t value, int64_t count)
+inline __attribute__((always_inline)) bool hdr_record_values(struct hdr_histogram* h, int64_t value, int64_t count)
 {
     int32_t counts_index;
 
-    if (value < 0)
+    if (hdr_unlikely(value < 0))
     {
         return false;
     }
 
     counts_index = counts_index_for(h, value);
 
-    if (counts_index < 0 || h->counts_len <= counts_index)
+    if (hdr_unlikely(counts_index < 0 || h->counts_len <= counts_index))
     {
         return false;
     }
@@ -514,14 +517,14 @@ bool hdr_record_values_atomic(struct hdr_histogram* h, int64_t value, int64_t co
 {
     int32_t counts_index;
 
-    if (value < 0)
+    if (hdr_unlikely(value < 0))
     {
         return false;
     }
 
     counts_index = counts_index_for(h, value);
 
-    if (counts_index < 0 || h->counts_len <= counts_index)
+    if (hdr_unlikely(counts_index < 0 || h->counts_len <= counts_index))
     {
         return false;
     }

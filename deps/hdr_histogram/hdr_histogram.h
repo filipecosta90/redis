@@ -14,6 +14,40 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+/* Inline macro */
+#ifndef HDR_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define HDR_INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define HDR_INLINE static __forceinline
+#else
+#define HDR_INLINE static inline
+#endif
+#endif
+
+/* Branch prediction macros */
+#ifndef hdr_likely
+#if (defined(__GNUC__)  && __GNUC__ >= 3)|| defined(__clang__)
+#define hdr_likely(x) __builtin_expect(!!(x), 1)
+#define hdr_unlikely(x) __builtin_expect(!!(x), 0)
+#else
+#define hdr_likely(x) (x)
+#define hdr_unlikely(x) (x)
+#endif
+#endif
+
+/*
+ * Force inline hint for performance-critical functions.
+ * HDR_REALLY_INLINE: Strongly suggests the compiler to inline the function.
+ * Uses compiler-specific attributes to maximize the likelihood of inlining.
+ */
+#ifdef _MSC_VER
+#define HDR_REALLY_INLINE __forceinline
+#else
+#define HDR_REALLY_INLINE inline __attribute__((always_inline))
+#endif
+
+
 struct hdr_histogram
 {
     int64_t lowest_discernible_value;

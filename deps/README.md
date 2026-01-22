@@ -104,3 +104,5 @@ We use a customized version based on master branch commit e4448cf6d1cd08fff51981
 2. Copy updated files from newer version onto files in /hdr_histogram.
 3. Apply the changes from 1 above to the updated files.
 
+We've further optimized hdr_histogram for performance by using function inlining and likely/unlikely branch prediction macros.
+
