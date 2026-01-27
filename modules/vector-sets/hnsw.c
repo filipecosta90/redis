@@ -195,30 +195,49 @@ void pq_free(pqueue *pq) {
     hfree(pq);
 }
 
+/* Binary search to find insertion point for distance (descending order).
+ * Returns the index where the new element should be inserted. */
+static inline uint32_t pq_find_insert_pos(pqueue *pq, float distance, uint32_t count) {
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (pq->items[mid].distance > distance) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 /* Insert maintaining distance order (higher distances first). */
 void pq_push(pqueue *pq, hnswNode *node, float distance) {
     if (pq->count < pq->cap) {
-        /* Queue not full: shift right from high distances to make room. */
-        uint32_t i = pq->count;
-        while (i > 0 && pq->items[i-1].distance < distance) {
-            pq->items[i] = pq->items[i-1];
-            i--;
+        /* Queue not full: find insertion point and shift right. */
+        uint32_t pos = pq_find_insert_pos(pq, distance, pq->count);
+
+        /* Shift elements right using memmove (optimized by compiler) */
+        if (pos < pq->count) {
+            memmove(&pq->items[pos + 1], &pq->items[pos],
+                    (pq->count - pos) * sizeof(pq->items[0]));
         }
-        pq->items[i].node = node;
-        pq->items[i].distance = distance;
+        pq->items[pos].node = node;
+        pq->items[pos].distance = distance;
         pq->count++;
     } else {
         /* Queue full: if new item is worse than worst, ignore it. */
         if (distance >= pq->items[0].distance) return;
 
-        /* Otherwise shift left from low distances to drop worst. */
-        uint32_t i = 0;
-        while (i < pq->cap-1 && pq->items[i+1].distance > distance) {
-            pq->items[i] = pq->items[i+1];
-            i++;
+        /* Find insertion point (skip position 0 which will be dropped) */
+        uint32_t pos = pq_find_insert_pos(pq, distance, pq->cap);
+        if (pos > 0) pos--;  /* Adjust since we're dropping element 0 */
+
+        /* Shift elements left to drop worst (position 0) */
+        if (pos > 0) {
+            memmove(&pq->items[0], &pq->items[1], pos * sizeof(pq->items[0]));
         }
-        pq->items[i].node = node;
-        pq->items[i].distance = distance;
+        pq->items[pos].node = node;
+        pq->items[pos].distance = distance;
     }
 }
 
