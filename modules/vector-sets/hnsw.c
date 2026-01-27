@@ -612,6 +612,13 @@ float vectors_distance_bin(const uint64_t *x, const uint64_t *y, uint32_t dim) {
     return hnsw_vectors_distance_bin(x, y, dim);
 }
 
+/* Direct binary distance function - avoids loading full hnswNode structure.
+ * Use this in hot loops where you already have the vector pointers. */
+ATTRIBUTE_TARGET_POPCNT
+static inline float hnsw_distance_bin_direct(const uint64_t *vec_a, const uint64_t *vec_b, uint32_t dim) {
+    return hnsw_vectors_distance_bin(vec_a, vec_b, dim);
+}
+
 /* Dot product between nodes. Will call the right version depending on the
  * quantization used. */
 float hnsw_distance(HNSW *index, hnswNode *a, hnswNode *b) {
@@ -963,6 +970,12 @@ pqueue *search_layer_with_filter(
     // a callback to have a bound effort.
     uint32_t evaluated_candidates = 1;
 
+    /* Extract query vector and dimension once for the hot loop.
+     * For binary vectors, this avoids repeatedly dereferencing query->vector. */
+    const int is_binary = (index->quant_type == HNSW_QUANT_BIN);
+    const uint64_t *query_vec_bin = is_binary ? (const uint64_t *)query->vector : NULL;
+    const uint32_t dim = index->vector_dim;
+
     // Add entry point.
     float dist = hnsw_distance(index, query, entry_point);
     pq_push(candidates, entry_point, dist);
@@ -995,7 +1008,16 @@ pqueue *search_layer_with_filter(
                 continue; // Already visited during this scan.
 
             neighbor->visited_epoch[slot] = index->current_epoch[slot];
-            float neighbor_dist = hnsw_distance(index, query, neighbor);
+
+            /* Compute distance - use direct function for binary to reduce cache pressure */
+            float neighbor_dist;
+            if (is_binary) {
+                neighbor_dist = hnsw_distance_bin_direct(query_vec_bin,
+                                                         (const uint64_t *)neighbor->vector,
+                                                         dim);
+            } else {
+                neighbor_dist = hnsw_distance(index, query, neighbor);
+            }
 
             furthest = pq_max_distance(results);
             if (filter_callback == NULL) {
