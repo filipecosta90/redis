@@ -15,12 +15,21 @@
 #ifndef MEMORY_PREFETCH_H
 #define MEMORY_PREFETCH_H
 
+#include <stddef.h>
+
 struct client;
+struct dict;
+struct dictEntry;
 
 void prefetchCommandsBatchInit(void);
 int determinePrefetchCount(int len);
 int addCommandToBatch(struct client *c);
 void resetCommandsBatch(void);
 void prefetchCommands(void);
+
+/* Prefetch and find multiple keys in a dictionary.
+ * Returns dictEntry* for each key in results array (NULL if not found). */
+void dictPrefetchFind(struct dict *d, void **keys, size_t count, struct dictEntry **results,
+                      void *(*get_val_data_func)(const void *val));
 
 #endif /* MEMORY_PREFETCH_H */

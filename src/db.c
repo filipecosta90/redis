@@ -20,6 +20,7 @@
 #include "functions.h"
 #include "cluster_asm.h"
 #include "redisassert.h"
+#include "memory_prefetch.h"
 
 #include <signal.h>
 #include <ctype.h>
@@ -350,6 +351,138 @@ kvobj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
  * common case. */
 kvobj *lookupKeyRead(redisDb *db, robj *key) {
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
+}
+
+/* Helper function to get the value pointer of a kv object for prefetching. */
+static void *getKVObjectValuePtr(const void *val) {
+    kvobj *kv = (kvobj *)val;
+    return (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_RAW) ? kv->ptr : NULL;
+}
+
+/* Lookup multiple keys for read operations with prefetching.
+ *
+ * This function performs interleaved prefetching while looking up multiple keys,
+ * which improves performance by hiding memory latency when accessing many keys.
+ *
+ * db      - The database to search
+ * keys    - Array of robj* keys to lookup
+ * count   - Number of keys
+ * results - Output array of kvobj* (NULL for not found/expired)
+ * flags   - Lookup flags (same as lookupKeyReadWithFlags)
+ *
+ * Side effects (per key, same as lookupKey):
+ * - Expired keys are deleted (on master) or marked as expired
+ * - LRU/LFU updated
+ * - Stats updated
+ */
+void lookupKeyReadVect(redisDb *db, robj **keys, int count, kvobj **results, int flags) {
+    serverAssert(!(flags & LOOKUP_WRITE));
+
+    if (count == 0) return;
+
+    /* For single key, use the regular path */
+    if (count == 1) {
+        results[0] = lookupKeyReadWithFlags(db, keys[0], flags);
+        return;
+    }
+
+    /* Get the slot (assuming all keys are in the same slot for cluster mode) */
+    int slot = getKeySlot(keys[0]->ptr);
+    dict *d = kvstoreGetDict(db->keys, slot);
+
+    if (!d || dictSize(d) == 0) {
+        /* Empty dict - all keys are misses */
+        for (int i = 0; i < count; i++) {
+            results[i] = NULL;
+            if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
+                notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", keys[i], db->id);
+            if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
+                server.stat_keyspace_misses++;
+        }
+        return;
+    }
+
+    /* Prepare sds keys array for prefetch */
+    sds *sds_keys;
+    sds stack_keys[16];
+    if (count <= 16) {
+        sds_keys = stack_keys;
+    } else {
+        sds_keys = zmalloc(count * sizeof(sds));
+    }
+    for (int i = 0; i < count; i++) {
+        sds_keys[i] = keys[i]->ptr;
+    }
+
+    /* Prefetch and find all keys */
+    dictEntry **entries;
+    dictEntry *stack_entries[16];
+    if (count <= 16) {
+        entries = stack_entries;
+    } else {
+        entries = zmalloc(count * sizeof(dictEntry *));
+    }
+
+    dictPrefetchFind(d, (void **)sds_keys, count, entries, getKVObjectValuePtr);
+
+    /* Compute expire flags once */
+    int is_ro_replica = server.masterhost && server.repl_slave_ro;
+    int expire_flags = 0;
+    if (flags & LOOKUP_WRITE && !is_ro_replica)
+        expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
+    if (flags & LOOKUP_NOEXPIRE)
+        expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
+    if (flags & LOOKUP_ACCESS_EXPIRED)
+        expire_flags |= EXPIRE_ALLOW_ACCESS_EXPIRED;
+    if (flags & LOOKUP_ACCESS_TRIMMED)
+        expire_flags |= EXPIRE_ALLOW_ACCESS_TRIMMED;
+
+    /* Check NOTOUCH conditions once */
+    int notouch = flags & LOOKUP_NOTOUCH;
+    if (!notouch &&
+        server.current_client && (server.current_client->flags & CLIENT_NO_TOUCH) &&
+        server.executing_client && server.executing_client->cmd->proc != touchCommand) {
+        notouch = 1;
+    }
+    int update_lru = !hasActiveChildProcess() && !notouch;
+
+    /* Process each result */
+    for (int i = 0; i < count; i++) {
+        kvobj *val = entries[i] ? dictGetKV(entries[i]) : NULL;
+
+        /* Check expiration */
+        if (val) {
+            if (expireIfNeeded(db, keys[i], val, expire_flags) != KEY_VALID) {
+                val = NULL;
+            }
+        }
+
+        /* Update LRU/LFU and stats */
+        if (val) {
+            if (update_lru) {
+                if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+                    updateLFU(val);
+                } else if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LRM)) {
+                    val->lru = LRU_CLOCK();
+                }
+            }
+            if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
+                server.stat_keyspace_hits++;
+        } else {
+            if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE)))
+                notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", keys[i], db->id);
+            if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE)))
+                server.stat_keyspace_misses++;
+        }
+
+        results[i] = val;
+    }
+
+    /* Free heap allocations if used */
+    if (count > 16) {
+        zfree(sds_keys);
+        zfree(entries);
+    }
 }
 
 /* Lookup a key for write operations, and as a side effect, if needed, expires
