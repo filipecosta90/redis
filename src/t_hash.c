@@ -1392,20 +1392,23 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         zl = hi->subject->ptr;
         fptr = hi->fptr;
         vptr = hi->vptr;
+        size_t lpbytes = lpBytes(zl);
 
         if (fptr == NULL) {
             /* Initialize cursor */
             serverAssert(vptr == NULL);
             fptr = lpFirst(zl);
         } else {
-            /* Advance cursor */
+            /* Advance cursor — use lpNextWithBytes to avoid re-reading
+             * lpBytes on every iteration (saves ~100 header reads for
+             * a 50-field hash HGETALL). */
             serverAssert(vptr != NULL);
-            fptr = lpNext(zl, vptr);
+            fptr = lpNextWithBytes(zl, vptr, lpbytes);
         }
         if (fptr == NULL) return C_ERR;
 
         /* Grab pointer to the value (fptr points to the field) */
-        vptr = lpNext(zl, fptr);
+        vptr = lpNextWithBytes(zl, fptr, lpbytes);
         serverAssert(vptr != NULL);
 
         /* fptr, vptr now point to the first or next pair */
@@ -1415,6 +1418,7 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         long long expire_time;
         unsigned char *zl = hashTypeListpackGetLp(hi->subject);
         unsigned char *fptr, *vptr, *tptr;
+        size_t lpbytes = lpBytes(zl);
 
         fptr = hi->fptr;
         vptr = hi->vptr;
@@ -1427,22 +1431,22 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         } else {
             /* Advance cursor */
             serverAssert(tptr != NULL);
-            fptr = lpNext(zl, tptr);
+            fptr = lpNextWithBytes(zl, tptr, lpbytes);
         }
         if (fptr == NULL) return C_ERR;
 
         while (fptr != NULL) {
             /* Grab pointer to the value (fptr points to the field) */
-            vptr = lpNext(zl, fptr);
+            vptr = lpNextWithBytes(zl, fptr, lpbytes);
             serverAssert(vptr != NULL);
 
-            tptr = lpNext(zl, vptr);
+            tptr = lpNextWithBytes(zl, vptr, lpbytes);
             serverAssert(tptr && lpGetIntegerValue(tptr, &expire_time));
 
             if (!skipExpiredFields || !hashTypeIsExpired(hi->subject, expire_time))
                 break;
 
-            fptr = lpNext(zl, tptr);
+            fptr = lpNextWithBytes(zl, tptr, lpbytes);
         }
         if (fptr == NULL) return C_ERR;
 
