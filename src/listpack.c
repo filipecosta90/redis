@@ -24,6 +24,29 @@
 #include "redisassert.h"
 #include "util.h"
 
+/* Portable memmem: use glibc's SIMD-optimized version when available,
+ * otherwise fall back to a simple implementation. */
+#ifndef _GNU_SOURCE
+static void *lp_memmem(const void *haystack, size_t hlen,
+                       const void *needle, size_t nlen) {
+    if (nlen == 0) return (void *)haystack;
+    if (nlen > hlen) return NULL;
+    const unsigned char *h = haystack;
+    const unsigned char *n = needle;
+    const unsigned char *end = h + hlen - nlen;
+    unsigned char first = n[0];
+    while (h <= end) {
+        h = memchr(h, first, end - h + 1);
+        if (!h) return NULL;
+        if (memcmp(h, n, nlen) == 0) return (void *)h;
+        h++;
+    }
+    return NULL;
+}
+#else
+#define lp_memmem memmem
+#endif
+
 #define LP_HDR_SIZE 6       /* 32 bit total len + 16 bit number of elements. */
 #define LP_HDR_NUMELE_UNKNOWN UINT16_MAX
 #define LP_MAX_INT_ENCODING_LEN 9
@@ -938,6 +961,67 @@ static inline int lpFindCmp(const unsigned char *lp, unsigned char *p,
 unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s,
                       uint32_t slen, unsigned int skip)
 {
+    /* Fast path: for short string fields (6BIT_STR, ≤63 bytes), search for
+     * the encoding byte + field bytes as a raw pattern using memmem().
+     * This replaces the entry-by-entry decode+compare loop with a single
+     * SIMD-accelerated memory scan on glibc (AVX2/NEON).
+     *
+     * The needle is [0x80|slen][field_data] which uniquely identifies a
+     * 6BIT_STR entry with this exact content.  We validate each candidate
+     * by decoding the entry and checking the backlen of the preceding
+     * entry for structural consistency. */
+    if (slen > 0 && slen <= 63 && skip == 0) {
+        unsigned char needle[64 + 1]; /* max 6BIT_STR len + encoding byte */
+        needle[0] = 0x80 | slen;
+        memcpy(needle + 1, s, slen);
+        uint32_t needle_len = 1 + slen;
+
+        uint32_t lp_bytes = lpBytes(lp);
+        unsigned char *start = p ? p : (lp + LP_HDR_SIZE);
+        unsigned char *end = lp + lp_bytes - 1; /* exclude LP_EOF */
+        size_t search_len = end - start;
+
+        while (search_len >= needle_len) {
+            unsigned char *match = lp_memmem(start, search_len, needle, needle_len);
+            if (!match) break;
+
+            /* Validate: the match must be at a real entry boundary.
+             * Check that the entry decodes correctly with expected size. */
+            int64_t ll;
+            uint64_t entry_size;
+            unsigned char *val = lpGetWithSize(match, &ll, NULL, &entry_size);
+            if (val && (uint32_t)ll == slen) {
+                /* Entry decodes as 6BIT_STR of correct length.
+                 * Verify structural consistency: the backlen of the
+                 * previous entry must point back correctly. */
+                int valid = 0;
+                if (match == lp + LP_HDR_SIZE) {
+                    /* First entry — always valid boundary */
+                    valid = 1;
+                } else {
+                    /* Decode backlen of previous entry and verify it
+                     * points to a valid entry start. */
+                    uint64_t prevlen = lpDecodeBacklen(match - 1);
+                    uint64_t prevlen_size = lpEncodeBacklenBytes(prevlen);
+                    unsigned char *prev_entry = match - prevlen - prevlen_size;
+                    if (prev_entry >= lp + LP_HDR_SIZE) {
+                        /* Verify the previous entry's encoded size matches */
+                        uint64_t prev_encoded = lpCurrentEncodedSizeUnsafe(prev_entry);
+                        if (prev_encoded + lpEncodeBacklenBytes(prev_encoded) == prevlen + prevlen_size)
+                            valid = 1;
+                    }
+                }
+
+                if (valid) return match;
+            }
+
+            /* Not a valid match — continue searching */
+            start = match + 1;
+            search_len = end - start;
+        }
+    }
+
+    /* Fall back to the generic entry-by-entry scan */
     struct lpFindArg arg = {
         .s = s,
         .slen = slen
