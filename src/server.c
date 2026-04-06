@@ -2243,6 +2243,7 @@ void createSharedObjects(void) {
     shared.hpersist = createStringObject("HPERSIST",8);
     shared.hdel = createStringObject("HDEL",4);
     shared.hsetex = createStringObject("HSETEX",6);
+    shared.zadd = createStringObject("ZADD",4);
 
     /* Shared command argument */
     shared.left = createStringObject("left",4);
