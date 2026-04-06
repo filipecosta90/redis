@@ -11,6 +11,12 @@ monotime (*getMonotonicUs)(void) = NULL;
 
 static char monotonic_info_string[32];
 
+/* Fixed-point reciprocal shift for converting HW ticks to microseconds.
+ * Instead of dividing by ticksPerMicrosecond (20-90 cycles), we multiply
+ * by a precomputed reciprocal and right-shift (3-5 cycles).
+ * Uses __uint128_t for the intermediate product to avoid overflow.  */
+#define MONOTONIC_FP_SHIFT 32
+
 
 /* Using the processor clock (aka TSC on x86) can provide improved performance
  * throughout Redis wherever the monotonic clock is used.  The processor clock
@@ -41,9 +47,10 @@ static char monotonic_info_string[32];
 #include <x86intrin.h>
 
 static long mono_ticksPerMicrosecond = 0;
+static uint64_t mono_ticksReciprocal = 0;
 
 static monotime getMonotonicUs_x86(void) {
-    return __rdtsc() / mono_ticksPerMicrosecond;
+    return (monotime)((__uint128_t)__rdtsc() * mono_ticksReciprocal >> MONOTONIC_FP_SHIFT);
 }
 
 static void monotonicInit_x86linux(void) {
@@ -108,6 +115,8 @@ static void monotonicInit_x86linux(void) {
         return;
     }
 
+    mono_ticksReciprocal = ((1ULL << MONOTONIC_FP_SHIFT) + mono_ticksPerMicrosecond - 1)
+                         / mono_ticksPerMicrosecond;
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "X86 TSC @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_x86;
@@ -116,6 +125,7 @@ static void monotonicInit_x86linux(void) {
 
 #if defined(__aarch64__)
 static long mono_ticksPerMicrosecond = 0;
+static uint64_t mono_ticksReciprocal = 0;
 
 /* Read the clock value.
  * CNTVCT_EL0 is a system counter register, that provides the monotonic
@@ -137,7 +147,7 @@ static inline uint32_t cntfrq_hz(void) {
 }
 
 static monotime getMonotonicUs_aarch64(void) {
-    return __cntvct() / mono_ticksPerMicrosecond;
+    return (monotime)((__uint128_t)__cntvct() * mono_ticksReciprocal >> MONOTONIC_FP_SHIFT);
 }
 
 static void monotonicInit_aarch64(void) {
@@ -147,6 +157,8 @@ static void monotonicInit_aarch64(void) {
         return;
     }
 
+    mono_ticksReciprocal = ((1ULL << MONOTONIC_FP_SHIFT) + mono_ticksPerMicrosecond - 1)
+                         / mono_ticksPerMicrosecond;
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "ARM CNTVCT @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_aarch64;
@@ -156,6 +168,7 @@ static void monotonicInit_aarch64(void) {
 
 #if defined(USE_PROCESSOR_CLOCK) && defined(__riscv) && defined(__linux__)
 static long mono_ticksPerMicrosecond = 0;
+static uint64_t mono_ticksReciprocal = 0;
 
 static inline uint64_t read_mtime(void) {
     uint64_t val;
@@ -194,7 +207,7 @@ static uint64_t get_timebase_frequency(void) {
 }
 
 static monotime getMonotonicUs_riscv(void) {
-    return read_mtime() / mono_ticksPerMicrosecond;
+    return (monotime)((__uint128_t)read_mtime() * mono_ticksReciprocal >> MONOTONIC_FP_SHIFT);
 }
 
 static void monotonicInit_riscv(void) {
@@ -203,6 +216,8 @@ static void monotonicInit_riscv(void) {
         fprintf(stderr, "monotonic: riscv, unable to determine clock rate\n");
         return;
     }
+    mono_ticksReciprocal = ((1ULL << MONOTONIC_FP_SHIFT) + mono_ticksPerMicrosecond - 1)
+                         / mono_ticksPerMicrosecond;
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "RISC-V mtime @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_riscv;
