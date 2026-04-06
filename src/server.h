@@ -1728,11 +1728,25 @@ typedef struct zskiplistNode {
 } zskiplistNode;
 
 typedef struct zskiplist {
-    struct zskiplistNode *header, *tail;
+    struct zskiplistNode *tail;
     unsigned long length;
     int level;
     size_t alloc_size;
+    /* Embedded header node (always ZSKIPLIST_MAXLEVEL levels).  Layout matches
+     * zskiplistNode followed by MAXLEVEL zskiplistLevel entries so it can be
+     * accessed via zslHeader() cast.  Eliminates one heap allocation and one
+     * pointer dereference on every skiplist operation. */
+    struct {
+        double score;
+        struct zskiplistNode *backward;
+        struct zskiplistLevel level[ZSKIPLIST_MAXLEVEL];
+    } _header;
 } zskiplist;
+
+/* Return typed pointer to the embedded header node. */
+static inline zskiplistNode *zslHeader(const zskiplist *zsl) {
+    return (zskiplistNode *)&zsl->_header;
+}
 
 typedef struct zset {
     dict *dict;

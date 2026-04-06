@@ -389,7 +389,7 @@ void zslUpdateNode(zskiplist *zsl, zskiplistNode *oldnode, zskiplistNode *newnod
         if (update[i]->level[i].forward == oldnode)
             update[i]->level[i].forward = newnode;
     }
-    serverAssert(zsl->header!=oldnode);
+    serverAssert(zslHeader(zsl)!=oldnode);
     if (newnode->level[0].forward) {
         serverAssert(newnode->level[0].forward->backward==oldnode);
         newnode->level[0].forward->backward = newnode;
@@ -414,7 +414,7 @@ void activeDefragZsetNode(zset *zs, dictEntry *de, dictEntryLink plink) {
     sds ele = zslGetNodeElement(newnode);
 
     /* Find all pointers that need to be updated */
-    iter = zs->zsl->header;
+    iter = zslHeader(zs->zsl);
     for (i = zs->zsl->level-1; i >= 0; i--) {
         while (iter->level[i].forward &&
             iter->level[i].forward != znode &&
@@ -702,14 +702,12 @@ void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
     zset *newzs;
     zskiplist *newzsl;
     dict *newdict;
-    struct zskiplistNode *newheader;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     if ((newzs = activeDefragAlloc(zs)))
         ob->ptr = zs = newzs;
     if ((newzsl = activeDefragAlloc(zs->zsl)))
         zs->zsl = newzsl;
-    if ((newheader = activeDefragAlloc(zs->zsl->header)))
-        zs->zsl->header = newheader;
+    /* Header node is embedded in zskiplist — defragged with zsl above. */
     if (dictSize(zs->dict) > server.active_defrag_max_scan_fields)
         defragLater(ctx, ob);
     else {

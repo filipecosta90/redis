@@ -460,7 +460,7 @@ void sortCommandGeneric(client *c, int readonly) {
             if (start > 0)
                 ln = zslGetElementByRank(zsl,zsetlen-start);
         } else {
-            ln = zsl->header->level[0].forward;
+            ln = zslHeader(zsl)->level[0].forward;
             if (start > 0)
                 ln = zslGetElementByRank(zsl,start+1);
         }
