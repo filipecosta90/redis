@@ -114,6 +114,29 @@ static inline int defaultClientPort(void) {
     return server.tls_cluster ? server.tls_port : server.port;
 }
 
+/* Return the position of the next set bit in a CLUSTER_SLOTS bitmap
+ * starting from position 'start' (inclusive). Returns -1 if no more
+ * set bits exist. Uses 64-bit word scanning to skip empty regions. */
+static inline int bitmapNextSetBit(unsigned char *bitmap, int start) {
+    int word_idx = start / 64;
+    int bit_ofs = start & 63;
+
+    for (; word_idx < CLUSTER_SLOTS / 64; word_idx++) {
+        uint64_t word;
+        memcpy(&word, bitmap + word_idx * 8, sizeof(uint64_t));
+
+        /* Mask off bits below the start position within first word. */
+        if (bit_ofs > 0) {
+            word &= ~((1ULL << bit_ofs) - 1);
+            bit_ofs = 0;
+        }
+
+        if (word == 0) continue;
+        return word_idx * 64 + __builtin_ctzll(word);
+    }
+    return -1;
+}
+
 #define isSlotUnclaimed(slot) \
     (server.cluster->slots[slot] == NULL || \
         bitmapTestBit(server.cluster->owner_not_claiming_slot, slot))
@@ -3199,25 +3222,24 @@ int clusterProcessPacket(clusterLink *link) {
         if (sender && dirty_slots) {
             int j;
 
-            for (j = 0; j < CLUSTER_SLOTS; j++) {
-                if (bitmapTestBit(hdr->myslots,j)) {
-                    if (server.cluster->slots[j] == sender ||
-                        isSlotUnclaimed(j)) continue;
-                    if (server.cluster->slots[j]->configEpoch >
-                        senderConfigEpoch)
-                    {
-                        serverLog(LL_VERBOSE,
-                            "Node %.40s has old slots configuration, sending "
-                            "an UPDATE message about %.40s",
-                                sender->name, server.cluster->slots[j]->name);
-                        clusterSendUpdate(sender->link,
-                            server.cluster->slots[j]);
+            for (j = bitmapNextSetBit(hdr->myslots, 0); j >= 0;
+                 j = bitmapNextSetBit(hdr->myslots, j + 1)) {
+                if (server.cluster->slots[j] == sender ||
+                    isSlotUnclaimed(j)) continue;
+                if (server.cluster->slots[j]->configEpoch >
+                    senderConfigEpoch)
+                {
+                    serverLog(LL_VERBOSE,
+                        "Node %.40s has old slots configuration, sending "
+                        "an UPDATE message about %.40s",
+                            sender->name, server.cluster->slots[j]->name);
+                    clusterSendUpdate(sender->link,
+                        server.cluster->slots[j]);
 
-                        /* TODO: instead of exiting the loop send every other
-                         * UPDATE packet for other nodes that are the new owner
-                         * of sender's slots. */
-                        break;
-                    }
+                    /* TODO: instead of exiting the loop send every other
+                     * UPDATE packet for other nodes that are the new owner
+                     * of sender's slots. */
+                    break;
                 }
             }
         }
@@ -4120,8 +4142,8 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
     /* The slave requesting the vote must have a configEpoch for the claimed
      * slots that is >= the one of the masters currently serving the same
      * slots in the current configuration. */
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        if (bitmapTestBit(claimed_slots, j) == 0) continue;
+    for (j = bitmapNextSetBit(claimed_slots, 0); j >= 0;
+         j = bitmapNextSetBit(claimed_slots, j + 1)) {
         if (isSlotUnclaimed(j) ||
             server.cluster->slots[j]->configEpoch <= requestConfigEpoch)
         {
@@ -4265,11 +4287,10 @@ void clusterFailoverReplaceYourMaster(void) {
     replicationUnsetMaster();
 
     /* 2) Claim all the slots assigned to our master. */
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        if (clusterNodeCoversSlot(oldmaster, j)) {
-            clusterDelSlot(j);
-            clusterAddSlot(myself,j);
-        }
+    for (j = bitmapNextSetBit(oldmaster->slots, 0); j >= 0;
+         j = bitmapNextSetBit(oldmaster->slots, j + 1)) {
+        clusterDelSlot(j);
+        clusterAddSlot(myself,j);
     }
 
     /* 3) Update state and save config. */
@@ -5118,11 +5139,10 @@ int clusterMoveNodeSlots(clusterNode *from_node, clusterNode *to_node) {
 int clusterDelNodeSlots(clusterNode *node) {
     int deleted = 0, j;
 
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        if (clusterNodeCoversSlot(node, j)) {
-            clusterDelSlot(j);
-            deleted++;
-        }
+    for (j = bitmapNextSetBit(node->slots, 0); j >= 0;
+         j = bitmapNextSetBit(node->slots, j + 1)) {
+        clusterDelSlot(j);
+        deleted++;
     }
     return deleted;
 }
