@@ -3740,11 +3740,13 @@ void clusterSendPing(clusterLink *link, int type) {
     if (!link->inbound && type == CLUSTERMSG_TYPE_PING)
         link->node->ping_sent = mstime();
 
-    /* Populate the gossip fields */
-    int maxiterations = wanted*3;
-    while(freshnodes > 0 && gossipcount < wanted && maxiterations--) {
-        dictEntry *de = dictGetRandomKey(server.cluster->nodes);
-        clusterNode *this = dictGetVal(de);
+    /* Populate the gossip fields using batch random selection.
+     * Over-sample by 3x to absorb filtering of ineligible nodes. */
+    int maxsamples = wanted * 3;
+    dictEntry **samples = zmalloc(sizeof(dictEntry*) * maxsamples);
+    unsigned int nsampled = dictGetSomeKeys(server.cluster->nodes, samples, maxsamples);
+    for (unsigned int i = 0; i < nsampled && gossipcount < wanted; i++) {
+        clusterNode *this = dictGetVal(samples[i]);
 
         /* Don't include this node: the whole packet header is about us
          * already, so we just gossip about other nodes.
@@ -3776,6 +3778,7 @@ void clusterSendPing(clusterLink *link, int type) {
         freshnodes--;
         gossipcount++;
     }
+    zfree(samples);
 
     /* If there are PFAIL nodes, add them at the end. */
     if (pfail_wanted) {
