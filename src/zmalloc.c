@@ -106,9 +106,16 @@ static void update_zmalloc_stat_alloc(long long bytes_delta) {
     init_my_thread_index();
 
     /* Per-thread allocation counter and the last counter value at which we ran a
-     * global peak check (throttles how often we call zmalloc_used_memory()). */
+     * global peak check (throttles how often we call zmalloc_used_memory()).
+     *
+     * These per-thread counters are only written by the owning thread, so we
+     * use relaxed load + store instead of atomic RMW (lock xadd on x86).
+     * Cross-thread readers (zmalloc_used_memory) use relaxed loads which see
+     * plain stores on both x86 (TSO) and ARM (eventual visibility). */
     long long thread_used, thread_last_peak_check_used;
-    atomicIncrGet(used_memory[my_thread_index].used_memory, thread_used, bytes_delta);
+    atomicGet(used_memory[my_thread_index].used_memory, thread_used);
+    thread_used += bytes_delta;
+    atomicSet(used_memory[my_thread_index].used_memory, thread_used);
     atomicGet(used_memory[my_thread_index].last_peak_check, thread_last_peak_check_used);
 
     /* Only run the (expensive) global used/peak check after this thread's
@@ -146,7 +153,10 @@ static void update_zmalloc_stat_alloc(long long bytes_delta) {
 
 static void update_zmalloc_stat_free(long long num) {
     init_my_thread_index();
-    atomicDecr(used_memory[my_thread_index].used_memory, num);
+    /* Single-writer: relaxed load + store instead of atomic RMW. */
+    long long cur;
+    atomicGet(used_memory[my_thread_index].used_memory, cur);
+    atomicSet(used_memory[my_thread_index].used_memory, cur - num);
 }
 
 static void zmalloc_default_oom(size_t size) {
