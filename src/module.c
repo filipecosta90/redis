@@ -4225,6 +4225,7 @@ int RM_KeyType(RedisModuleKey *key) {
     case OBJ_HASH: return REDISMODULE_KEYTYPE_HASH;
     case OBJ_MODULE: return REDISMODULE_KEYTYPE_MODULE;
     case OBJ_STREAM: return REDISMODULE_KEYTYPE_STREAM;
+    case OBJ_ARRAY: return REDISMODULE_KEYTYPE_ARRAY;
     default: return REDISMODULE_KEYTYPE_EMPTY;
     }
 }
