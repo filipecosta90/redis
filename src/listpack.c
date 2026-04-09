@@ -945,6 +945,60 @@ unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s,
     return lpFindCbInternal(lp, p, &arg, lpFindCmp, skip);
 }
 
+/* Find an integer value in a listpack. Like lpFind() but avoids the
+ * string-to-integer conversion overhead when the caller already has
+ * an integer value. Each entry is decoded: string entries are compared
+ * via lpStringToInt64 parsing, integer entries are compared directly.
+ * Skip 'skip' entries between every comparison. */
+unsigned char *lpFindInteger(unsigned char *lp, unsigned char *p, int64_t ival,
+                             unsigned int skip)
+{
+    int skipcnt = 0;
+    unsigned char *value;
+    int64_t ll;
+    uint64_t entry_size = 123456789;
+    uint32_t lp_bytes = lpBytes(lp);
+
+    /* Pre-convert the search integer to string once, for comparing against
+     * string-encoded entries without calling lpStringToInt64 per entry. */
+    char ival_str[LONG_STR_SIZE];
+    int ival_strlen = ll2string(ival_str, sizeof(ival_str), ival);
+
+    if (!p)
+        p = lpFirst(lp);
+
+    while (p) {
+        if (skipcnt == 0) {
+            value = lpGetWithSize(p, &ll, NULL, &entry_size);
+            if (value) {
+                /* String entry: compare against pre-converted string */
+                assert(p >= lp + LP_HDR_SIZE && p + entry_size < lp + lp_bytes);
+                if (ival_strlen == (int)ll && memcmp(value, ival_str, ll) == 0) {
+                    return p;
+                }
+            } else {
+                /* Integer entry: direct comparison, no conversion needed */
+                if (ll == ival) {
+                    return p;
+                }
+            }
+            skipcnt = skip;
+            p += entry_size;
+        } else {
+            skipcnt--;
+            p = lpSkip(p);
+        }
+
+        if (p + 8 >= lp + lp_bytes)
+            lpAssertValidEntry(lp, lp_bytes, p);
+        else
+            assert(p >= lp + LP_HDR_SIZE && p < lp + lp_bytes);
+        if (p[0] == LP_EOF) break;
+    }
+
+    return NULL;
+}
+
 /* Insert, delete or replace the specified string element 'elestr' of length
  * 'size' or integer element 'eleint' at the specified position 'p', with 'p'
  * being a listpack element pointer obtained with lpFirst(), lpLast(), lpNext(),
