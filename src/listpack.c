@@ -934,15 +934,79 @@ static inline int lpFindCmp(const unsigned char *lp, unsigned char *p,
 }
 
 /* Find pointer to the entry equal to the specified entry. Skip 'skip' entries
- * between every comparison. Returns NULL when the field could not be found. */
+ * between every comparison. Returns NULL when the field could not be found.
+ *
+ * This is the hot path for hash/set/zset field lookups on listpack-encoded
+ * data. The comparison is inlined (not via function pointer) to avoid indirect
+ * call overhead that causes branch mispredictions and frontend stalls on
+ * large listpacks (e.g., 500-field hash HSET updates). */
 unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s,
                       uint32_t slen, unsigned int skip)
 {
-    struct lpFindArg arg = {
-        .s = s,
-        .slen = slen
-    };
-    return lpFindCbInternal(lp, p, &arg, lpFindCmp, skip);
+    int skipcnt = 0;
+    unsigned char vencoding = 0;
+    unsigned char *value;
+    int64_t ll, vll = 0;
+    uint64_t entry_size = 123456789; /* initialized to avoid warning. */
+    uint32_t lp_bytes = lpBytes(lp);
+
+    if (!p)
+        p = lpFirst(lp);
+
+    while (p) {
+        if (skipcnt == 0) {
+            value = lpGetWithSize(p, &ll, NULL, &entry_size);
+            if (value) {
+                /* check the value doesn't reach outside the listpack before accessing it */
+                assert(p >= lp + LP_HDR_SIZE && p + entry_size < lp + lp_bytes);
+                if ((uint32_t)ll == slen && memcmp(value, s, slen) == 0) {
+                    return p;
+                }
+            } else {
+                /* Find out if the searched field can be encoded. Note that
+                 * we do it only the first time, once done vencoding is set
+                 * to non-zero and vll is set to the integer value. */
+                if (vencoding == 0) {
+                    /* If the entry can be encoded as integer we set it to
+                     * 1, else set it to UCHAR_MAX, so that we don't retry
+                     * again the next time. */
+                    if (slen >= 32 || slen == 0 || !lpStringToInt64((const char*)s, slen, &vll)) {
+                        vencoding = UCHAR_MAX;
+                    } else {
+                        vencoding = 1;
+                    }
+                }
+
+                /* Compare current entry with specified entry, do it only
+                 * if vencoding != UCHAR_MAX because if there is no encoding
+                 * possible for the field it can't be a valid integer. */
+                if (vencoding != UCHAR_MAX && ll == vll) {
+                    return p;
+                }
+            }
+
+            /* Reset skip count */
+            skipcnt = skip;
+            p += entry_size;
+        } else {
+            /* Skip entry */
+            skipcnt--;
+
+            /* Move to next entry, avoid use `lpNext` due to `lpAssertValidEntry` in
+            * `lpNext` will call `lpBytes`, will cause performance degradation */
+            p = lpSkip(p);
+        }
+
+        /* The next call to lpGetWithSize could read at most 8 bytes past `p`
+         * We use the slower validation call only when necessary. */
+        if (p + 8 >= lp + lp_bytes)
+            lpAssertValidEntry(lp, lp_bytes, p);
+        else
+            assert(p >= lp + LP_HDR_SIZE && p < lp + lp_bytes);
+        if (p[0] == LP_EOF) break;
+    }
+
+    return NULL;
 }
 
 /* Insert, delete or replace the specified string element 'elestr' of length
