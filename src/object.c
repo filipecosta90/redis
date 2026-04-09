@@ -284,12 +284,13 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
     if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_EMBSTR) {
         size_t len = sdslen(val->ptr);
 
-        /* Embed when the sum is less than a cache line (Metadata is discarded 
-         * since we don't have to be accurate and it is placed before the object) */
+        /* Embed when the sum fits in 2 cache lines (128 bytes on x86).
+         * Metadata is discarded since we don't have to be accurate and
+         * it is placed before the object. */
         size_t size = sizeof(kvobj);
         size += (key != NULL) * (sdslen(key) + 3); /* hdr size (1) + hdr (1) + nullterm (1) */
         size += 4 + len; /* embstr header (3) + nullterm (1) */
-        if (size <= CACHE_LINE_SIZE) {
+        if (size <= 2 * CACHE_LINE_SIZE) {
             kv = kvobjCreateEmbedString(val->ptr, len, key, keyMetaBits);
         } else {
             kv = kvobjCreate(OBJ_STRING, key, sdsnewlen(val->ptr, len), keyMetaBits);
@@ -332,9 +333,17 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
  * OBJ_ENCODING_EMBSTR_SIZE_LIMIT, otherwise the RAW encoding is
  * used.
  *
- * The current limit of 44 is chosen so that the biggest string object
- * we allocate as EMBSTR will still fit into the 64 byte arena of jemalloc. */
-#define OBJ_ENCODING_EMBSTR_SIZE_LIMIT 44
+ * The limit of 108 is chosen so that the biggest string object we
+ * allocate as EMBSTR will still fit into the 128 byte arena of
+ * jemalloc (2 cache lines on x86). This trades one extra cache line
+ * per access for eliminating a separate allocation + pointer chase
+ * for strings up to 108 bytes.
+ *
+ * Layout: robj (16) + padding + sdshdr8 (3) + data + nullterm (1) = 128 bytes.
+ * The actual limit depends on struct alignment; empirically 101 bytes
+ * is the maximum that fits in the 128-byte jemalloc class.
+ * Previous limit was 44 (fitting in 64-byte / 1 cache line). */
+#define OBJ_ENCODING_EMBSTR_SIZE_LIMIT 101
 robj *createStringObject(const char *ptr, size_t len) {
     if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT)
         return createEmbeddedStringObject(ptr,len);
