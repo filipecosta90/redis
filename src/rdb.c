@@ -1831,6 +1831,7 @@ werr:
 typedef struct rdbEncoderThreadCtx {
     int                  thread_id;     /* 0..total-1 */
     int                  total_threads;
+    int                  dbid;          /* which db this round handles */
     int                  req;
     rdbSaveInfo         *rsi;
     sds                  buf;           /* per-thread output buffer */
@@ -1843,7 +1844,7 @@ static void *rdbEncoderThreadMain(void *arg) {
     rdbEncoderThreadCtx *ctx = arg;
 
     /* Build the entire per-thread RDB segment into an sds buffer in
-     * shared (process-wide) heap memory. The drainer picks up the
+     * shared (process-wide) heap memory. The main thread picks up the
      * pointer from ctx->buf after pthread_join — no pipes or syscalls
      * are needed to hand the bytes off. */
     rio rdb;
@@ -1858,8 +1859,11 @@ static void *rdbEncoderThreadMain(void *arg) {
     if (server.rdb_checksum)
         rdb.update_cksum = rioGenericUpdateChecksum;
 
-    /* Standalone (db 0), single dict per kvstore (slot_count_bits=0). */
-    redisDb *db = server.db + 0;
+    redisDb *db = server.db + ctx->dbid;
+    /* PoC limitation: we only iterate the FIRST dict of the kvstore.
+     * For non-cluster mode this is the only dict (slot_count_bits=0).
+     * For cluster mode the dispatch in rdbSaveToSlavesSockets falls
+     * back to the legacy path so we don't reach this code. */
     dict *d = kvstoreGetDict(db->keys, 0);
     if (d == NULL) goto thread_done;
 
@@ -1875,7 +1879,7 @@ static void *rdbEncoderThreadMain(void *arg) {
         kvobj *kv = dictGetKV(de);
         sds keystr = kvobjGetKey(kv);
 
-        /* Filter by hash mod N — each thread owns 1/N of the keyspace. */
+        /* Filter by hash mod N — each thread owns 1/N of this db's keys. */
         uint64_t h = dictGenHashFunction(keystr, sdslen(keystr));
         if ((h % (uint64_t)ctx->total_threads) != (uint64_t)ctx->thread_id)
             continue;
@@ -1883,7 +1887,7 @@ static void *rdbEncoderThreadMain(void *arg) {
         robj keyobj;
         initStaticStringObject(keyobj, keystr);
         long long expire = kvobjGetExpire(kv);
-        if (rdbSaveKeyValuePair(&rdb, &keyobj, kv, expire, 0) < 0) {
+        if (rdbSaveKeyValuePair(&rdb, &keyobj, kv, expire, ctx->dbid) < 0) {
             ctx->error = errno ? errno : EIO;
             break;
         }
@@ -1907,21 +1911,126 @@ thread_done:
     return NULL;
 }
 
-/* Parallel-encoder variant of rdbSaveRioWithEOFMark. Writes the EOF mark,
- * the RDB prologue (magic + AUX + functions + SELECTDB + RESIZEDB),
- * spawns num_streams encoder threads, joins them, copies their per-thread
- * buffers in order into rdb, then writes the trailer (EOF opcode +
- * checksum + EOF mark suffix).
+/* Run one round of N parallel encoder threads for a single db. The
+ * caller is expected to have already written the SELECTDB + RESIZEDB
+ * header for this db to `rdb`. On return, the per-thread buffers have
+ * been drained into `rdb` and the per-thread CRCs have been combined
+ * into the running stream CRC.
+ *
+ * Returns C_OK on success, C_ERR on failure (with errno set).
+ *
+ * `expected_per_thread` is a pre-allocation hint for the per-thread
+ * sds buffer to avoid repeated sdsMakeRoomFor reallocations during
+ * encoding. */
+static int rdbSaveDbParallel(int req, rio *rdb, rdbSaveInfo *rsi,
+                             int dbid, int num_streams,
+                             size_t expected_per_thread,
+                             long *out_keys, size_t *out_bytes) {
+    pthread_t *threads = NULL;
+    rdbEncoderThreadCtx *ctxs = NULL;
+    int spawned = 0;
+    int rv = C_OK;
+
+    /* Snapshot the running CRC. The per-thread CRCs will be combined
+     * into this so the final stream CRC matches the single-threaded
+     * path. */
+    uint64_t round_crc = rdb->cksum;
+    void (*saved_update_cksum)(rio *, const void *, size_t) = rdb->update_cksum;
+    /* Disable update_cksum on the main rdb during the per-thread buffer
+     * drain — the per-thread CRCs already cover those bytes. */
+    rdb->update_cksum = NULL;
+
+    threads = zmalloc(sizeof(*threads) * num_streams);
+    ctxs    = zcalloc(sizeof(*ctxs) * num_streams);
+    if (!threads || !ctxs) { rv = C_ERR; goto cleanup; }
+
+    for (int i = 0; i < num_streams; i++) {
+        ctxs[i].thread_id     = i;
+        ctxs[i].total_threads = num_streams;
+        ctxs[i].dbid          = dbid;
+        ctxs[i].req           = req;
+        ctxs[i].rsi           = rsi;
+        ctxs[i].crc           = 0;
+        ctxs[i].buf           = sdsempty();
+        if (ctxs[i].buf) {
+            ctxs[i].buf = sdsMakeRoomFor(ctxs[i].buf, expected_per_thread);
+        }
+        if (!ctxs[i].buf) { rv = C_ERR; goto cleanup; }
+        if (pthread_create(&threads[i], NULL, rdbEncoderThreadMain, &ctxs[i]) != 0) {
+            serverLog(LL_WARNING, "rdbSaveDbParallel: pthread_create failed");
+            rv = C_ERR; goto cleanup;
+        }
+        spawned++;
+    }
+
+    /* Wait for all encoder threads. Each thread now has its full
+     * per-thread RDB segment in ctx->buf and its CRC in ctx->crc. */
+    long total_keys = 0;
+    size_t total_bytes = 0;
+    for (int i = 0; i < spawned; i++) {
+        pthread_join(threads[i], NULL);
+        if (ctxs[i].error) {
+            errno = ctxs[i].error;
+            serverLog(LL_WARNING,
+                      "rdbSaveDbParallel: encoder thread %d failed: %s",
+                      i, strerror(ctxs[i].error));
+            rv = C_ERR; goto cleanup;
+        }
+        total_keys += ctxs[i].keys_written;
+        total_bytes += sdslen(ctxs[i].buf);
+    }
+
+    /* Drain phase: copy each thread's buffer in order to the main rdb. */
+    for (int i = 0; i < spawned; i++) {
+        size_t n = sdslen(ctxs[i].buf);
+        if (n == 0) continue;
+        if (rdbWriteRaw(rdb, ctxs[i].buf, n) == -1) { rv = C_ERR; goto cleanup; }
+    }
+
+    /* Combine the per-thread CRCs into the round CRC, in order. */
+    uint64_t combined_crc = round_crc;
+    for (int i = 0; i < spawned; i++) {
+        size_t n = sdslen(ctxs[i].buf);
+        if (n == 0) continue;
+        combined_crc = crc64_combine(combined_crc, ctxs[i].crc, n,
+                                     RDB_CRC64_REVERSED_POLY, 64);
+    }
+    rdb->cksum = combined_crc;
+
+    if (out_keys)  *out_keys  = total_keys;
+    if (out_bytes) *out_bytes = total_bytes;
+
+cleanup:
+    /* Reap any remaining threads (best effort on error path). */
+    if (rv == C_ERR && threads) {
+        for (int i = 0; i < spawned; i++) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+    if (ctxs) {
+        for (int i = 0; i < num_streams; i++) {
+            if (ctxs[i].buf) sdsfree(ctxs[i].buf);
+        }
+    }
+    zfree(threads);
+    zfree(ctxs);
+
+    rdb->update_cksum = saved_update_cksum;
+    return rv;
+}
+
+/* Parallel-encoder variant of rdbSaveRioWithEOFMark. Writes the EOF
+ * marker prefix, the RDB prologue (magic + AUX + functions), iterates
+ * the (non-empty) databases and runs one round of N parallel encoder
+ * threads per db, then writes the trailer (EOF opcode + checksum + EOF
+ * mark suffix).
  *
  * Returns C_OK on success, C_ERR on failure. */
 static int rdbSaveRioParallelWithEOFMark(int req, rio *rdb, int *error,
                                          rdbSaveInfo *rsi, int num_streams) {
     char eofmark[RDB_EOF_MARK_SIZE];
     char magic[10];
-    pthread_t *threads = NULL;
-    rdbEncoderThreadCtx *ctxs = NULL;
-    int spawned = 0;
-    long long t_start, t_after_prologue, t_after_join, t_after_drain;
+    long long t_start, t_after_prologue, t_after_dbs;
 
     if (num_streams < 1 || num_streams > 16) {
         if (error) *error = EINVAL;
@@ -1947,114 +2056,49 @@ static int rdbSaveRioParallelWithEOFMark(int req, rio *rdb, int *error,
     if (rdbSaveModulesAux(rdb, REDISMODULE_AUX_BEFORE_RDB) == -1) goto werr;
     if (rdbSaveFunctions(rdb) == -1) goto werr;
 
-    /* SELECTDB + RESIZEDB header for db 0 (PoC: single db only). */
-    redisDb *db = server.db + 0;
-    if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) goto werr;
-    if (rdbSaveLen(rdb, 0) == -1) goto werr;
-    if (rdbSaveType(rdb, RDB_OPCODE_RESIZEDB) == -1) goto werr;
-    if (rdbSaveLen(rdb, kvstoreSize(db->keys)) == -1) goto werr;
-    if (rdbSaveLen(rdb, kvstoreSize(db->expires)) == -1) goto werr;
-
-    /* Snapshot the prologue CRC. The per-thread CRCs will be combined
-     * into this so the final stream CRC is identical to what the
-     * single-threaded path would produce. */
-    uint64_t prologue_crc = rdb->cksum;
-    /* Disable update_cksum on the main rdb during the per-thread
-     * buffer drain — the per-thread CRCs already cover those bytes. */
-    void (*saved_update_cksum)(rio *, const void *, size_t) = rdb->update_cksum;
-    rdb->update_cksum = NULL;
-
     t_after_prologue = ustime();
-    serverLog(LL_NOTICE,
-              "rdbSaveRioParallel: prologue %.3f ms, spawning %d encoder "
-              "threads for %llu keys",
-              (double)(t_after_prologue - t_start) / 1000.0,
-              num_streams, (unsigned long long)kvstoreSize(db->keys));
 
-    /* Allocate per-thread state. */
-    threads = zmalloc(sizeof(*threads) * num_streams);
-    ctxs    = zcalloc(sizeof(*ctxs) * num_streams);
-    if (!threads || !ctxs) goto werr;
-
-    /* Pre-size each thread's sds buffer to avoid repeated sdsMakeRoomFor
-     * reallocations during encoding. Estimate per-thread bytes from the
-     * total keyspace divided by N, and a rough average bytes-per-key
-     * upper bound. The buffer grows naturally if the estimate is off. */
-    size_t expected_per_thread =
-        (kvstoreSize(db->keys) / (size_t)num_streams) *
-        RDB_PARALLEL_BYTES_PER_KEY_HINT;
-    if (expected_per_thread < (1 << 16)) expected_per_thread = (1 << 16);
-    /* Cap the pre-allocation so we don't reserve hundreds of MB on small
-     * unrelated benchmarks. The cap is generous enough that the typical
-     * 20M-key 1KiB benchmark hits it but a 100k-key benchmark doesn't. */
-    size_t expected_cap = (size_t)256 * 1024 * 1024;  /* 256 MiB / thread */
-    if (expected_per_thread > expected_cap) expected_per_thread = expected_cap;
-
-    for (int i = 0; i < num_streams; i++) {
-        ctxs[i].thread_id     = i;
-        ctxs[i].total_threads = num_streams;
-        ctxs[i].req           = req;
-        ctxs[i].rsi           = rsi;
-        ctxs[i].crc           = 0;
-        ctxs[i].buf           = sdsempty();
-        if (ctxs[i].buf) {
-            ctxs[i].buf = sdsMakeRoomFor(ctxs[i].buf, expected_per_thread);
-        }
-        if (!ctxs[i].buf) goto werr;
-        if (pthread_create(&threads[i], NULL, rdbEncoderThreadMain, &ctxs[i]) != 0) {
-            serverLog(LL_WARNING, "rdbSaveRioParallel: pthread_create failed");
-            goto werr;
-        }
-        spawned++;
-    }
-
-    /* Wait for all encoder threads. Each thread now has its full
-     * per-thread RDB segment in ctx->buf and its CRC in ctx->crc. */
+    /* Iterate non-empty databases. For each one, write the SELECTDB +
+     * RESIZEDB header in the main thread, then run one parallel round
+     * to encode the keys. Across rounds the total CPU work is the same
+     * as if the encoder were doing rdbSaveDb sequentially, but within
+     * each non-empty db it runs in parallel. */
     long total_keys = 0;
     size_t total_bytes = 0;
-    for (int i = 0; i < spawned; i++) {
-        pthread_join(threads[i], NULL);
-        if (ctxs[i].error) {
-            errno = ctxs[i].error;
-            serverLog(LL_WARNING,
-                      "rdbSaveRioParallel: encoder thread %d failed: %s",
-                      i, strerror(ctxs[i].error));
+    int dbs_with_data = 0;
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        redisDb *db = server.db + dbid;
+        unsigned long long db_size = kvstoreSize(db->keys);
+        if (db_size == 0) continue;
+        dbs_with_data++;
+
+        /* SELECTDB + RESIZEDB header. Goes through the main rdb rio
+         * with update_cksum still enabled. */
+        if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) goto werr;
+        if (rdbSaveLen(rdb, dbid) == -1) goto werr;
+        if (rdbSaveType(rdb, RDB_OPCODE_RESIZEDB) == -1) goto werr;
+        if (rdbSaveLen(rdb, db_size) == -1) goto werr;
+        if (rdbSaveLen(rdb, kvstoreSize(db->expires)) == -1) goto werr;
+
+        /* Pre-allocate per-thread sds capacity to avoid sdsMakeRoomFor
+         * reallocations during encoding. */
+        size_t expected_per_thread =
+            (db_size / (size_t)num_streams) * RDB_PARALLEL_BYTES_PER_KEY_HINT;
+        if (expected_per_thread < (1 << 16)) expected_per_thread = (1 << 16);
+        size_t expected_cap = (size_t)256 * 1024 * 1024;  /* 256 MiB / thread */
+        if (expected_per_thread > expected_cap) expected_per_thread = expected_cap;
+
+        long round_keys = 0;
+        size_t round_bytes = 0;
+        if (rdbSaveDbParallel(req, rdb, rsi, dbid, num_streams,
+                              expected_per_thread,
+                              &round_keys, &round_bytes) != C_OK) {
             goto werr;
         }
-        total_keys += ctxs[i].keys_written;
-        total_bytes += sdslen(ctxs[i].buf);
+        total_keys  += round_keys;
+        total_bytes += round_bytes;
     }
-    t_after_join = ustime();
-
-    /* Drain phase: copy each thread's buffer in order to the main rdb.
-     * No CRC update here (update_cksum was set to NULL above) — the
-     * per-thread CRCs already cover these bytes. */
-    for (int i = 0; i < spawned; i++) {
-        size_t n = sdslen(ctxs[i].buf);
-        if (n == 0) continue;
-        if (rdbWriteRaw(rdb, ctxs[i].buf, n) == -1) goto werr;
-    }
-
-    /* Combine the per-thread CRCs into the prologue CRC, in order. */
-    uint64_t combined_crc = prologue_crc;
-    for (int i = 0; i < spawned; i++) {
-        size_t n = sdslen(ctxs[i].buf);
-        if (n == 0) continue;
-        combined_crc = crc64_combine(combined_crc, ctxs[i].crc, n,
-                                     RDB_CRC64_REVERSED_POLY, 64);
-    }
-    rdb->cksum = combined_crc;
-
-    /* Free the per-thread buffers as soon as they're drained. */
-    for (int i = 0; i < spawned; i++) {
-        sdsfree(ctxs[i].buf);
-        ctxs[i].buf = NULL;
-    }
-
-    t_after_drain = ustime();
-
-    /* Re-enable update_cksum for the trailer bytes. */
-    rdb->update_cksum = saved_update_cksum;
+    t_after_dbs = ustime();
 
     if (rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
     if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) goto werr;
@@ -2065,6 +2109,7 @@ static int rdbSaveRioParallelWithEOFMark(int req, rio *rdb, int *error,
     /* Write the checksum bytes WITHOUT updating the running cksum (it's
      * already finalised — the 8 cksum bytes themselves are not part of
      * the protected payload). */
+    void (*saved_update_cksum)(rio *, const void *, size_t) = rdb->update_cksum;
     rdb->update_cksum = NULL;
     if (rioWrite(rdb, &cksum, 8) == 0) goto werr;
     rdb->update_cksum = saved_update_cksum;
@@ -2073,33 +2118,19 @@ static int rdbSaveRioParallelWithEOFMark(int req, rio *rdb, int *error,
     if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
 
     serverLog(LL_NOTICE,
-              "rdbSaveRioParallel: %d streams, %ld keys, %zu bytes, "
-              "encode+join %.3fs, drain+combine %.3fs, total %.3fs",
-              num_streams, total_keys, total_bytes,
-              (double)(t_after_join - t_after_prologue) / 1e6,
-              (double)(t_after_drain - t_after_join) / 1e6,
-              (double)(t_after_drain - t_start) / 1e6);
+              "rdbSaveRioParallel: %d streams, %d non-empty dbs, %ld keys, "
+              "%zu bytes, prologue %.3f ms, encode+drain+combine %.3fs, "
+              "total %.3fs",
+              num_streams, dbs_with_data, total_keys, total_bytes,
+              (double)(t_after_prologue - t_start) / 1000.0,
+              (double)(t_after_dbs - t_after_prologue) / 1e6,
+              (double)(t_after_dbs - t_start) / 1e6);
 
-    zfree(threads);
-    zfree(ctxs);
     stopSaving(1);
     return C_OK;
 
 werr:
     if (error && *error == 0) *error = errno ? errno : EIO;
-    /* Best-effort cleanup: join any running threads, free buffers. */
-    if (threads) {
-        for (int i = 0; i < spawned; i++) {
-            pthread_join(threads[i], NULL);
-        }
-    }
-    if (ctxs) {
-        for (int i = 0; i < num_streams; i++) {
-            if (ctxs[i].buf) sdsfree(ctxs[i].buf);
-        }
-    }
-    zfree(threads);
-    zfree(ctxs);
     stopSaving(0);
     return C_ERR;
 }
