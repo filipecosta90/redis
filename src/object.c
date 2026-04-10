@@ -285,11 +285,12 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
         size_t len = sdslen(val->ptr);
 
         /* Embed when the sum fits in 2 cache lines (128 bytes on x86).
-         * Metadata is discarded since we don't have to be accurate and
-         * it is placed before the object. */
+         * Include metadata bytes (e.g., expire) since they are allocated
+         * as part of the same block, prepended to the kvobj. */
         size_t size = sizeof(kvobj);
         size += (key != NULL) * (sdslen(key) + 3); /* hdr size (1) + hdr (1) + nullterm (1) */
         size += 4 + len; /* embstr header (3) + nullterm (1) */
+        size += getNumMeta(keyMetaBits) * sizeof(uint64_t); /* expire/module metadata */
         if (size <= 2 * CACHE_LINE_SIZE) {
             kv = kvobjCreateEmbedString(val->ptr, len, key, keyMetaBits);
         } else {
