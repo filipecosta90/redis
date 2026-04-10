@@ -2315,6 +2315,10 @@ struct redisServer {
                                          * delay (start sooner if they all connect). */
     int repl_rdb_channel;           /* Config used to determine if the replica should
                                      * use rdb channel replication for full syncs. */
+    int repl_parallel_fullsync_streams; /* Number of encoder threads in the rdb fork
+                                         * child during diskless replication.
+                                         * 1 = single-threaded (legacy). 2-16 = parallel.
+                                         * Master-only PoC; replica wire format is unchanged. */
     int repl_debug_pause;           /* Debug config to force the main process to pause. */
     size_t repl_buffer_mem;         /* The memory of replication buffer. */
     list *repl_buffer_blocks;       /* Replication buffers blocks list

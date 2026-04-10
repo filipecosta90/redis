@@ -26,6 +26,7 @@
 
 #include <math.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -1776,6 +1777,290 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
 
 werr:
     if (error) *error = errno;
+    return C_ERR;
+}
+
+/* ====================================================================
+ * Multi-threaded parallel RDB encoder for diskless replication (PoC).
+ * ====================================================================
+ *
+ * Phase 0 PoC for "multi-threaded full sync". The current single-threaded
+ * fork-child encoder is the dominant cost of a full sync — perf shows
+ * ~98% of fork-child cycles in rdbSaveDb (47% in lzf_compress alone) and
+ * the TCP send path is essentially idle (~1.5%).
+ *
+ * Design:
+ *   - N encoder pthreads in the fork child, each iterates the (single,
+ *     non-cluster) keys dict via an UNSAFE iterator and emits only the
+ *     keys whose hash mod N matches its thread id.
+ *   - Each encoder writes its (key,value) tuples to its own pipe via a
+ *     dedicated rio. The pipe gives natural backpressure (no user-space
+ *     locks) and isolates per-thread output.
+ *   - The fork-child main thread is the "drainer": it round-robins reads
+ *     from the N pipes in 64 KiB chunks and forwards them into the
+ *     existing rdb rio (which feeds the existing parent pipe / replica
+ *     socket). The drainer holds the only update_cksum on the final
+ *     stream, so the CRC stays valid.
+ *
+ * Wire format is unchanged. Replica side is unchanged. Keys arrive on
+ * the replica in a different (interleaved) order, but the RDB loader
+ * does not require any order so the resulting keyspace is identical.
+ *
+ * Out of scope for the PoC: cluster mode, multiple dbs, SLAVE_REQ_RDB_*
+ * filtered RDBs. The gating in rdbSaveToSlavesSockets falls back to the
+ * single-thread path for any unsupported case. */
+
+#define RDB_PARALLEL_DRAIN_BUF (64 * 1024)
+
+typedef struct rdbEncoderThreadCtx {
+    int                  thread_id;     /* 0..total-1 */
+    int                  total_threads;
+    int                  req;
+    rdbSaveInfo         *rsi;
+    int                  pipe_read_fd;
+    int                  pipe_write_fd;
+    long                 keys_written;
+    int                  error;         /* errno on failure, 0 on success */
+} rdbEncoderThreadCtx;
+
+static void *rdbEncoderThreadMain(void *arg) {
+    rdbEncoderThreadCtx *ctx = arg;
+
+    /* Build the entire per-thread RDB segment into an sds buffer first
+     * (no streaming to the pipe during encode). This keeps the encoder
+     * thread completely independent of the drainer until it's done, and
+     * makes the byte stream trivially inspectable. After encode is done
+     * we flush the whole buffer to the pipe in one go. */
+    rio rdb;
+    sds buf = sdsempty();
+    rioInitWithBuffer(&rdb, buf);
+
+    /* PoC: standalone (db 0), single dict per kvstore (slot_count_bits=0). */
+    redisDb *db = server.db + 0;
+    dict *d = kvstoreGetDict(db->keys, 0);
+    if (d == NULL) goto thread_done;
+
+    /* UNSAFE iterator: in the fork child the dict is a CoW snapshot and
+     * never mutates, so the safe-iterator counter (which would race
+     * across threads) is unnecessary. The fingerprint check on reset is
+     * still valid. */
+    dictIterator iter;
+    dictInitIterator(&iter, d);
+
+    dictEntry *de;
+    while ((de = dictNext(&iter)) != NULL) {
+        kvobj *kv = dictGetKV(de);
+        sds keystr = kvobjGetKey(kv);
+
+        /* Filter by hash mod N — each thread owns 1/N of the keyspace. */
+        uint64_t h = dictGenHashFunction(keystr, sdslen(keystr));
+        if ((h % (uint64_t)ctx->total_threads) != (uint64_t)ctx->thread_id)
+            continue;
+
+        robj keyobj;
+        initStaticStringObject(keyobj, keystr);
+        long long expire = kvobjGetExpire(kv);
+        if (rdbSaveKeyValuePair(&rdb, &keyobj, kv, expire, 0) < 0) {
+            ctx->error = errno ? errno : EIO;
+            break;
+        }
+        ctx->keys_written++;
+
+        /* NOTE: do NOT call dismissObject() here. Unlike the single-
+         * threaded path, we cannot safely madvise(MADV_DONTNEED) on a
+         * value's pages while other encoder threads may still be reading
+         * a different value that happens to share the same 4 KiB page
+         * (jemalloc co-locates same-size allocations). The DONTNEED hint
+         * would zero out the still-needed bytes for the racing thread,
+         * producing corrupt LZF blobs on the wire. */
+    }
+    dictResetIterator(&iter);
+
+thread_done:
+    /* The buffer rio may have grown the underlying sds via sdsMakeRoomFor;
+     * read the (possibly relocated) pointer back from the rio. */
+    buf = rdb.io.buffer.ptr;
+
+    /* Flush the whole buffer to the pipe in one big write loop. */
+    size_t total = sdslen(buf);
+    size_t off = 0;
+    while (off < total) {
+        ssize_t n = write(ctx->pipe_write_fd, buf + off, total - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ctx->error = errno;
+            break;
+        }
+        off += n;
+    }
+    sdsfree(buf);
+    close(ctx->pipe_write_fd);
+    return NULL;
+}
+
+/* Parallel-encoder variant of rdbSaveRioWithEOFMark. Writes the EOF mark,
+ * the RDB prologue (magic + AUX + functions + SELECTDB + RESIZEDB),
+ * spawns num_streams encoder threads, drains them round-robin into rdb,
+ * then writes the trailer (EOF opcode + checksum + EOF mark suffix).
+ *
+ * Returns C_OK on success, C_ERR on failure. */
+static int rdbSaveRioParallelWithEOFMark(int req, rio *rdb, int *error,
+                                         rdbSaveInfo *rsi, int num_streams) {
+    char eofmark[RDB_EOF_MARK_SIZE];
+    char magic[10];
+    pthread_t *threads = NULL;
+    rdbEncoderThreadCtx *ctxs = NULL;
+    int spawned = 0;
+    int *eof = NULL;
+
+    if (num_streams < 1 || num_streams > 16) {
+        if (error) *error = EINVAL;
+        return C_ERR;
+    }
+
+    startSaving(RDBFLAGS_REPLICATION);
+    if (error) *error = 0;
+
+    /* EOF prefix (matches rdbSaveRioWithEOFMark). */
+    getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
+    if (rioWrite(rdb, "$EOF:", 5) == 0) goto werr;
+    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
+    if (rioWrite(rdb, "\r\n", 2) == 0) goto werr;
+
+    /* RDB magic + prologue (matches rdbSaveRio prologue, single-threaded
+     * because each piece is small and ordering matters). */
+    if (server.rdb_checksum) rdb->update_cksum = rioGenericUpdateChecksum;
+    snprintf(magic, sizeof(magic), "REDIS%04d", RDB_VERSION);
+    if (rdbWriteRaw(rdb, magic, 9) == -1) goto werr;
+    if (rdbSaveInfoAuxFields(rdb, RDBFLAGS_REPLICATION, rsi) == -1) goto werr;
+    if (rdbSaveModulesAux(rdb, REDISMODULE_AUX_BEFORE_RDB) == -1) goto werr;
+    if (rdbSaveFunctions(rdb) == -1) goto werr;
+
+    /* SELECTDB + RESIZEDB header for db 0 (PoC: single db only). */
+    redisDb *db = server.db + 0;
+    if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) goto werr;
+    if (rdbSaveLen(rdb, 0) == -1) goto werr;
+    if (rdbSaveType(rdb, RDB_OPCODE_RESIZEDB) == -1) goto werr;
+    if (rdbSaveLen(rdb, kvstoreSize(db->keys)) == -1) goto werr;
+    if (rdbSaveLen(rdb, kvstoreSize(db->expires)) == -1) goto werr;
+
+    serverLog(LL_NOTICE,
+              "rdbSaveRioParallel: spawning %d encoder threads for %llu keys",
+              num_streams, (unsigned long long)kvstoreSize(db->keys));
+
+    /* Allocate per-thread state and pipes. */
+    threads = zmalloc(sizeof(*threads) * num_streams);
+    ctxs    = zcalloc(sizeof(*ctxs) * num_streams);
+    eof     = zcalloc(sizeof(*eof) * num_streams);
+    if (!threads || !ctxs || !eof) goto werr;
+
+    for (int i = 0; i < num_streams; i++) {
+        int fds[2];
+        if (pipe(fds) == -1) {
+            serverLog(LL_WARNING, "rdbSaveRioParallel: pipe() failed: %s",
+                      strerror(errno));
+            goto werr;
+        }
+        ctxs[i].thread_id     = i;
+        ctxs[i].total_threads = num_streams;
+        ctxs[i].req           = req;
+        ctxs[i].rsi           = rsi;
+        ctxs[i].pipe_read_fd  = fds[0];
+        ctxs[i].pipe_write_fd = fds[1];
+        if (pthread_create(&threads[i], NULL, rdbEncoderThreadMain, &ctxs[i]) != 0) {
+            serverLog(LL_WARNING, "rdbSaveRioParallel: pthread_create failed");
+            close(fds[0]); close(fds[1]);
+            goto werr;
+        }
+        spawned++;
+    }
+
+    /* Drain loop: drain each thread's pipe COMPLETELY before moving to
+     * the next. This is critical for correctness — the RDB stream needs
+     * each thread's bytes to be CONTIGUOUS in the final output (a
+     * half-encoded key from thread N cannot be followed by chunks from
+     * thread N+1, or the loader will parse the interleaved bytes as a
+     * continuation of the previous key and produce corrupt LZF blobs).
+     *
+     * Each encoder thread accumulates its full RDB segment into an sds
+     * buffer in memory (no streaming during encode) and only writes to
+     * the pipe in one big burst at the end. So the drainer reading
+     * thread N's pipe sequentially produces a clean, ordered stream of
+     * complete tuples for thread N. */
+    char drain_buf[RDB_PARALLEL_DRAIN_BUF];
+    for (int i = 0; i < num_streams; i++) {
+        for (;;) {
+            ssize_t n = read(ctxs[i].pipe_read_fd, drain_buf, sizeof(drain_buf));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                serverLog(LL_WARNING,
+                          "rdbSaveRioParallel: read pipe %d failed: %s",
+                          i, strerror(errno));
+                goto werr;
+            }
+            if (n == 0) break;  /* EOF */
+            if (rdbWriteRaw(rdb, drain_buf, (size_t)n) == -1) goto werr;
+        }
+        eof[i] = 1;
+        close(ctxs[i].pipe_read_fd);
+        ctxs[i].pipe_read_fd = -1;
+    }
+
+    /* Reap encoder threads and check for per-thread errors. */
+    long total_keys = 0;
+    for (int i = 0; i < spawned; i++) {
+        pthread_join(threads[i], NULL);
+        if (ctxs[i].error) {
+            errno = ctxs[i].error;
+            serverLog(LL_WARNING,
+                      "rdbSaveRioParallel: encoder thread %d failed: %s",
+                      i, strerror(ctxs[i].error));
+            goto werr;
+        }
+        total_keys += ctxs[i].keys_written;
+    }
+
+    if (rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
+    if (rdbSaveType(rdb, RDB_OPCODE_EOF) == -1) goto werr;
+
+    /* CRC64 of the entire stream so far. */
+    uint64_t cksum = rdb->cksum;
+    memrev64ifbe(&cksum);
+    if (rioWrite(rdb, &cksum, 8) == 0) goto werr;
+
+    /* EOF suffix (matches rdbSaveRioWithEOFMark). */
+    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
+
+    serverLog(LL_NOTICE,
+              "rdbSaveRioParallel: drained %d streams, %ld keys total",
+              num_streams, total_keys);
+
+    zfree(threads);
+    zfree(ctxs);
+    zfree(eof);
+    stopSaving(1);
+    return C_OK;
+
+werr:
+    if (error && *error == 0) *error = errno ? errno : EIO;
+    /* Best-effort cleanup: kill the writers via abort flag (close their
+     * read ends so they get SIGPIPE on next write), join everything. */
+    if (ctxs) {
+        for (int i = 0; i < num_streams; i++) {
+            if (!eof || !eof[i]) {
+                if (ctxs[i].pipe_read_fd >= 0) close(ctxs[i].pipe_read_fd);
+            }
+        }
+    }
+    if (threads) {
+        for (int i = 0; i < spawned; i++) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+    zfree(threads);
+    zfree(ctxs);
+    zfree(eof);
+    stopSaving(0);
     return C_ERR;
 }
 
@@ -4430,9 +4715,27 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         if (req & SLAVE_REQ_RDB_NO_CHECKSUM)
             server.rdb_checksum = 0;
 
+        /* Use the multi-threaded encoder iff:
+         *   - parallel-fullsync-streams > 1 (config opt-in)
+         *   - not a slots snapshot
+         *   - not a filter that excludes data or functions (the parallel
+         *     path emits a normal full RDB only)
+         *   - not cluster mode (PoC limitation: SLOT_INFO interleaving
+         *     across threads is not implemented yet)
+         *   - the request is not for a single-db filtered RDB (PoC: db 0)
+         */
+        int use_parallel = (server.repl_parallel_fullsync_streams > 1)
+                           && !(req & SLAVE_REQ_SLOTS_SNAPSHOT)
+                           && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA)
+                           && !(req & SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS)
+                           && !server.cluster_enabled;
+
         if (req & SLAVE_REQ_SLOTS_SNAPSHOT) {
             /* Slots snapshot is required */
             retval = slotSnapshotSaveRio(req, &rdb, NULL);
+        } else if (use_parallel) {
+            retval = rdbSaveRioParallelWithEOFMark(req, &rdb, NULL, rsi,
+                                                   server.repl_parallel_fullsync_streams);
         } else {
             retval = rdbSaveRioWithEOFMark(req,&rdb,NULL,rsi);
         }
