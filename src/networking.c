@@ -174,6 +174,8 @@ client *createClient(connection *conn) {
     c->current_pending_cmd = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
+    c->redact_args = NULL;
+    c->redact_args_count = 0;
     c->deferred_objects = NULL;
     c->deferred_objects_num = 0;
     c->io_deferred_objects = NULL;
@@ -1764,6 +1766,15 @@ void freeClientIODeferredObjects(client *c, int free_array) {
 }
 
 void freeClientOriginalArgv(client *c) {
+    /* Drop the deferred-redact index list, if any. The slowlog/monitor
+     * consumers have already materialized any redactions they needed via
+     * buildRedactedArgvView() during command post-processing. */
+    if (c->redact_args) {
+        zfree(c->redact_args);
+        c->redact_args = NULL;
+        c->redact_args_count = 0;
+    }
+
     /* We didn't rewrite this client */
     if (!c->original_argv) return;
 
@@ -4874,7 +4885,10 @@ void securityWarningCommand(client *c) {
 }
 
 /* Keep track of the original command arguments so that we can generate
- * an accurate slowlog entry after the command has been executed. */
+ * an accurate slowlog entry after the command has been executed. Called
+ * from the command-vector rewrite paths (rewriteClientCommandArgument /
+ * rewriteClientCommandVector / replaceClientCommandVector) before the
+ * client argv is mutated. */
 static void retainOriginalCommandVector(client *c) {
     /* We already rewrote this command, so don't rewrite it again */
     if (c->original_argv) return;
@@ -4884,19 +4898,85 @@ static void retainOriginalCommandVector(client *c) {
         c->original_argv[j] = c->argv[j];
         incrRefCount(c->argv[j]);
     }
+    /* If any redactions were deferred (via redactClientCommandArgument
+     * before this rewrite), bake them into the just-built original_argv now
+     * and drop the deferred list. From here on the rewrite/original-argv
+     * path owns the redaction state. */
+    if (c->redact_args_count > 0) {
+        for (int j = 0; j < c->redact_args_count; j++) {
+            int idx = c->redact_args[j];
+            if (idx < c->original_argc &&
+                c->original_argv[idx] != shared.redacted)
+            {
+                decrRefCount(c->original_argv[idx]);
+                c->original_argv[idx] = shared.redacted;
+            }
+        }
+        zfree(c->redact_args);
+        c->redact_args = NULL;
+        c->redact_args_count = 0;
+    }
 }
 
-/* Redact a given argument to prevent it from being shown
- * in the slowlog. This information is stored in the
- * original_argv array. */
+/* Redact a given argument to prevent it from being shown in the slowlog or
+ * MONITOR feed. The common case (no rewrite has happened on this client)
+ * just remembers the index in a small redact_args list — the slowlog and
+ * monitor consumers will materialize a redacted argv view on demand if they
+ * actually fire. This avoids the eager c->argc * sizeof(robj*) argv copy
+ * (plus its incrRefCount loop) that the previous implementation paid on
+ * every AUTH / HELLO AUTH / CLUSTER LINKS / CLIENT KILL USER / CONFIG SET
+ * masterauth / etc. — i.e. on every connection that authenticates.
+ *
+ * If a command vector rewrite has already happened (c->original_argv is
+ * populated), we fall back to redacting in place inside original_argv,
+ * preserving the existing semantics for the rare rewrite+redact case. */
 void redactClientCommandArgument(client *c, int argc) {
-    retainOriginalCommandVector(c);
-    if (c->original_argv[argc] == shared.redacted) {
-        /* This argument has already been redacted */
+    if (c->original_argv) {
+        if (argc >= c->original_argc) return;
+        if (c->original_argv[argc] == shared.redacted) return;
+        decrRefCount(c->original_argv[argc]);
+        c->original_argv[argc] = shared.redacted;
         return;
     }
-    decrRefCount(c->original_argv[argc]);
-    c->original_argv[argc] = shared.redacted;
+    if (argc >= c->argc) return;
+    /* Dedupe — typical count is 1-3, so a linear scan is fine. */
+    for (int j = 0; j < c->redact_args_count; j++) {
+        if (c->redact_args[j] == argc) return;
+    }
+    c->redact_args = zrealloc(c->redact_args,
+        sizeof(int) * (c->redact_args_count + 1));
+    c->redact_args[c->redact_args_count++] = argc;
+}
+
+/* Build an argv view that applies any deferred redactions. The returned
+ * pointer may alias c->argv, c->original_argv, or be a freshly-allocated
+ * temporary array of pointers — call freeRedactedArgvView() to release the
+ * temporary (the helper is a no-op for the alias cases). The view is shallow:
+ * the robj* slots are NOT incrRefCount'd, since the consumer (slowlog entry
+ * builder, MONITOR feed) reads them synchronously and either dup-strings or
+ * formats their contents before returning. */
+robj **buildRedactedArgvView(client *c, int *out_argc) {
+    if (c->original_argv) {
+        *out_argc = c->original_argc;
+        return c->original_argv;
+    }
+    if (c->redact_args_count == 0) {
+        *out_argc = c->argc;
+        return c->argv;
+    }
+    int argc = c->argc;
+    robj **view = zmalloc(sizeof(robj*) * argc);
+    for (int j = 0; j < argc; j++) view[j] = c->argv[j];
+    for (int j = 0; j < c->redact_args_count; j++) {
+        int idx = c->redact_args[j];
+        if (idx < argc) view[idx] = shared.redacted;
+    }
+    *out_argc = argc;
+    return view;
+}
+
+void freeRedactedArgvView(client *c, robj **view) {
+    if (view != c->argv && view != c->original_argv) zfree(view);
 }
 
 /* Rewrite the command vector of the client. All the new objects ref count

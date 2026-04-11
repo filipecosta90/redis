@@ -1454,6 +1454,10 @@ typedef struct client {
     int argv_len;           /* Size of argv array (may be more than argc) */
     int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
+    int *redact_args;       /* Argument indices to redact in slowlog/monitor when only
+                               redaction (and no rewrite) has happened. Lazy alternative
+                               to original_argv that avoids the eager argv copy. */
+    int redact_args_count;  /* Number of indices stored in redact_args. */
     size_t all_argv_len_sum;    /* Sum of lengths of objects in all pendingCommand argv lists */
     pendingCommandList pending_cmds;  /* List of parsed pending commands */
     pendingCommand *current_pending_cmd;
@@ -3206,6 +3210,8 @@ void rewriteClientCommandVector(client *c, int argc, ...);
 void rewriteClientCommandArgument(client *c, int i, robj *newval);
 void replaceClientCommandVector(client *c, int argc, robj **argv);
 void redactClientCommandArgument(client *c, int argc);
+robj **buildRedactedArgvView(client *c, int *out_argc);
+void freeRedactedArgvView(client *c, robj **view);
 size_t getClientOutputBufferMemoryUsage(client *c);
 size_t getNormalClientPendingReplyBytes(client *c);
 size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage);

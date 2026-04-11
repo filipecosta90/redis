@@ -3720,11 +3720,16 @@ void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t dur
     if (cmd->flags & CMD_SKIP_SLOWLOG)
         return;
 
-    /* If command argument vector was rewritten, use the original
-     * arguments. */
-    robj **argv = c->original_argv ? c->original_argv : c->argv;
-    int argc = c->original_argv ? c->original_argc : c->argc;
-    if (slowlogPushEntryIfNeeded(c,argv,argc,duration)) {
+    /* If the command vector was rewritten OR any args were marked as
+     * redacted, the helper builds an argv view that applies both — using
+     * c->original_argv directly when it exists (rewrite path) or a small
+     * temporary view that substitutes shared.redacted for the deferred
+     * redact indices (lazy redaction path). */
+    int argc;
+    robj **argv = buildRedactedArgvView(c, &argc);
+    int pushed = slowlogPushEntryIfNeeded(c, argv, argc, duration);
+    freeRedactedArgvView(c, argv);
+    if (pushed) {
         server.stat_slowlog_count++;
         server.stat_slowlog_time_us_sum += duration;
         if (duration > server.stat_slowlog_time_us_max)
@@ -4020,9 +4025,10 @@ void call(client *c, int flags) {
     if (update_command_stats && !reprocessing_command &&
         !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
     {
-        robj **argv = c->original_argv ? c->original_argv : c->argv;
-        int argc = c->original_argv ? c->original_argc : c->argc;
+        int argc;
+        robj **argv = buildRedactedArgvView(c, &argc);
         replicationFeedMonitors(c,server.monitors,c->db->id,argv,argc);
+        freeRedactedArgvView(c, argv);
     }
 
     /* Populate the per-command and per-slot statistics that we show in INFO commandstats and CLUSTER SLOT-STATS,
