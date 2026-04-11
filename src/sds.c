@@ -908,8 +908,14 @@ sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *c
             if (newtokens == NULL) goto cleanup;
             tokens = newtokens;
         }
-        /* search the separator */
-        if ((seplen == 1 && *(s+j) == sep[0]) || (memcmp(s+j,sep,seplen) == 0)) {
+        /* Search the separator. The ternary form (vs the historical
+         * `(seplen == 1 && ...) || (memcmp(...))`) hoists the loop-
+         * invariant `seplen == 1` test to a branch the compiler can
+         * unswitch — for single-char separators (the common case for
+         * config parsing and ACL loading) this lets GCC turn the loop
+         * body into a tight 128-bit SIMD memchr-style scan instead of
+         * a per-iteration branch over a memcmp call. */
+        if (seplen == 1 ? *(s+j) == sep[0] : memcmp(s+j,sep,seplen) == 0) {
             tokens[elements] = sdsnewlen(s+start,j-start);
             if (tokens[elements] == NULL) goto cleanup;
             elements++;
