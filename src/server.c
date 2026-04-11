@@ -6288,7 +6288,14 @@ static sds sdscatHistograms(sds info, int dbnum, keysizesHist histogram, const c
  * by the INFO command itself as we need to report the same information
  * on memory corruption problems. */
 sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
+    /* INFO ALL is typically 4–8 KiB on a freshly started server and grows
+     * with the number of connected clients, dbs, and modules. Pre-size the
+     * SDS buffer so the section builders don't trigger ~10–15 sdsMakeRoomFor
+     * reallocations as the response grows from default sds capacity. The
+     * buffer naturally grows past 8 KiB if needed; this is just an upfront
+     * hint. */
     sds info = sdsempty();
+    info = sdsMakeRoomFor(info, 8192);
     time_t uptime = server.unixtime-server.stat_starttime;
     int j;
     int sections = 0;
