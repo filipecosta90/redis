@@ -274,6 +274,38 @@ typedef struct watchedKey {
     unsigned expired:1; /* Flag that we're watching an already expired key. */
 } watchedKey;
 
+/* ----- Per-client (db, key) hashtable for O(1) WATCH duplicate detection ----- */
+
+/* Hash a watchedKey by (db pointer, key sds) so distinct dbs land in distinct
+ * buckets even if they hold identically-named keys. */
+static uint64_t watchedKeyClientDictHash(const void *key) {
+    const watchedKey *wk = key;
+    uint64_t h = dictGenHashFunction(wk->key->ptr, sdslen(wk->key->ptr));
+    return h ^ (uint64_t)(uintptr_t)wk->db;
+}
+
+/* Two watchedKey entries match iff they belong to the same db and the
+ * key strings are equal. */
+static int watchedKeyClientDictCompare(dictCmpCache *cache, const void *k1, const void *k2) {
+    UNUSED(cache);
+    const watchedKey *a = k1;
+    const watchedKey *b = k2;
+    return a->db == b->db && equalStringObjects(a->key, b->key);
+}
+
+/* The dict only stores pointers — the watchedKey memory is owned by the
+ * client->watched_keys list and is freed in unwatchAllKeys(). No dup/free
+ * callbacks are needed here. */
+static dictType watchedKeysClientLookupDictType = {
+    watchedKeyClientDictHash,       /* hashFunction */
+    NULL,                           /* keyDup */
+    NULL,                           /* valDup */
+    watchedKeyClientDictCompare,    /* keyCompare */
+    NULL,                           /* keyDestructor */
+    NULL,                           /* valDestructor */
+    NULL,                           /* resizeAllowed */
+};
+
 /* Attach a watchedKey to the list of clients watching that key. */
 static inline void watchedKeyLinkToClients(list *clients, watchedKey *wk) {
     wk->node.value = clients; /* Point the value back to the list */
@@ -294,19 +326,25 @@ static inline listNode *watchedKeyGetClientNode(watchedKey *wk) {
 /* Watch for the specified key */
 void watchForKey(client *c, robj *key) {
     list *clients = NULL;
-    listIter li;
-    listNode *ln;
     watchedKey *wk;
 
     if (listLength(c->watched_keys) == 0) server.watching_clients++;
 
-    /* Check if we are already watching for this key */
-    listRewind(c->watched_keys,&li);
-    while((ln = listNext(&li))) {
-        wk = listNodeValue(ln);
-        if (wk->db == c->db && equalStringObjects(key,wk->key))
-            return; /* Key already watched */
-    }
+    /* Lazy-allocate the per-client (db, key) lookup dict on first use. The
+     * dict mirrors c->watched_keys for O(1) duplicate detection during
+     * WATCH instead of the historical O(N) linear scan over the list. */
+    if (c->watched_keys_lookup == NULL)
+        c->watched_keys_lookup = dictCreate(&watchedKeysClientLookupDictType);
+
+    /* Check if we are already watching for this key (O(1) hashtable lookup).
+     * The probe key is a stack-allocated watchedKey shell — only ->db and
+     * ->key are read by the dictType callbacks. */
+    watchedKey probe;
+    probe.db  = c->db;
+    probe.key = key;
+    if (dictFind(c->watched_keys_lookup, &probe) != NULL)
+        return; /* Key already watched */
+
     /* This key is not already watched in this DB. Let's add it */
     clients = dictFetchValue(c->db->watched_keys,key);
     if (!clients) {
@@ -323,6 +361,9 @@ void watchForKey(client *c, robj *key) {
     incrRefCount(key);
     listAddNodeTail(c->watched_keys, wk);
     watchedKeyLinkToClients(clients, wk);
+    /* Mirror into the lookup dict so the next watchForKey on the same
+     * (db, key) hits in O(1). */
+    dictAdd(c->watched_keys_lookup, wk, NULL);
 }
 
 /* Unwatch all the keys watched by this client. To clean the EXEC dirty
@@ -345,7 +386,10 @@ void unwatchAllKeys(client *c) {
         /* Kill the entry at all if this was the only client */
         if (listLength(clients) == 0)
             dictDelete(wk->db->watched_keys, wk->key);
-        /* Remove this watched key from the client->watched list */
+        /* Remove this watched key from the client->watched list and from
+         * the per-client lookup dict (if it was allocated). */
+        if (c->watched_keys_lookup)
+            dictDelete(c->watched_keys_lookup, wk);
         listDelNode(c->watched_keys,ln);
         decrRefCount(wk->key);
         zfree(wk);

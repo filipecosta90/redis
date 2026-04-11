@@ -219,6 +219,7 @@ client *createClient(connection *conn) {
     initClientBlockingState(c);
     c->woff = 0;
     c->watched_keys = listCreate();
+    c->watched_keys_lookup = NULL;  /* lazy-allocated on first watchForKey() */
     c->pubsub_channels = dictCreate(&objectKeyPointerValueDictType);
     c->pubsub_patterns = dictCreate(&objectKeyPointerValueDictType);
     c->pubsubshard_channels = dictCreate(&objectKeyPointerValueDictType);
@@ -2136,6 +2137,7 @@ void freeClient(client *c) {
     /* UNWATCH all the keys */
     unwatchAllKeys(c);
     listRelease(c->watched_keys);
+    if (c->watched_keys_lookup) dictRelease(c->watched_keys_lookup);
 
     /* Unsubscribe from all the pubsub channels */
     pubsubUnsubscribeAllChannels(c,0);

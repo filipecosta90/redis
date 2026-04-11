@@ -1533,6 +1533,10 @@ typedef struct client {
     blockingState bstate;     /* blocking state */
     long long woff;         /* Last write global replication offset. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
+    dict *watched_keys_lookup;  /* Hashtable mirror of watched_keys for O(1) duplicate detection
+                                 * during WATCH. Lazily allocated when the client first watches a
+                                 * key. Keys are watchedKey* pointers; the dictType hashes/compares
+                                 * by (db, key sds) so distinct dbs hash to distinct buckets. */
     dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
     dict *pubsub_patterns;  /* patterns a client is interested in (PSUBSCRIBE) */
     dict *pubsubshard_channels;  /* shard level channels a client is interested in (SSUBSCRIBE) */
