@@ -23,6 +23,10 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <stddef.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "dict.h"
 #include "zmalloc.h"
@@ -43,6 +47,14 @@
  *    of elements and the buckets <= 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio). */
 static dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
 static unsigned int dict_force_resize_ratio = 4;
+
+/* When non-zero, dictRehash() will MADV_DONTNEED pages of the old hash table
+ * back to the OS as the rehash advances, spreading the cost of the final big
+ * `zfree(d->ht_table[0])` over the (already-incremental) rehash steps. This
+ * dramatically reduces the max-latency spike at rehash completion for very
+ * large tables. Set to 0 when Transparent Huge Pages are enabled (a per-page
+ * MADV_DONTNEED is ineffective on 2 MiB hugepages and just costs a syscall). */
+static int dict_release_rehashed_pages = 0;
 
 /* -------------------------- types ----------------------------------------- */
 struct dictEntry {
@@ -393,6 +405,75 @@ static int dictCheckRehashingCompleted(dict *d) {
     return 1;
 }
 
+/* Release pages of the old hash table that have become fully migrated during
+ * the just-completed batch of bucket rehashes back to the OS via
+ * MADV_DONTNEED. Spreads the cost of the final big `zfree(d->ht_table[0])`
+ * over the rehash steps so that the kernel hands back physical pages
+ * incrementally rather than walking the whole allocation in one shot at
+ * `dictCheckRehashingCompleted()`. The `start_idx` parameter is the value of
+ * `d->rehashidx` at the top of `dictRehash()` (before this batch ran).
+ *
+ * No state is persisted on the dict struct: the page-aligned region newly
+ * fully-migrated during this batch is computed purely from `start_idx` and
+ * the current `d->rehashidx`. The hot path is the early-out — most batches
+ * don't cross a page boundary so we want this to be cheap. The check uses
+ * a precomputed `log2(buckets_per_page)` so the per-call cost is just two
+ * shifts plus a compare. */
+static void dictReleaseRehashedOldTablePages(dict *d, long start_idx) {
+#if defined(__linux__)
+    if (!dict_release_rehashed_pages) return;
+
+    /* `buckets_per_page_shift` is set to a positive value once on first call.
+     * `0` means "disabled" (page size queried but unusable for this layout). */
+    static int buckets_per_page_shift = -1;
+    static size_t page_size = 0;
+    if (buckets_per_page_shift < 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) { buckets_per_page_shift = 0; return; }
+        page_size = (size_t)ps;
+        size_t bpp = page_size / sizeof(dictEntry *);
+        if (bpp < 2) { buckets_per_page_shift = 0; return; }
+        int sh = 0;
+        while ((1UL << sh) < bpp) sh++;
+        buckets_per_page_shift = sh;
+    }
+    if (buckets_per_page_shift == 0) return;
+    if (start_idx < 0 || d->rehashidx < 0) return;
+
+    unsigned long start_page =
+        (unsigned long)start_idx >> buckets_per_page_shift;
+    unsigned long end_page =
+        (unsigned long)d->rehashidx >> buckets_per_page_shift;
+    /* Hot path early-out: this batch didn't cross a page boundary, so no
+     * new pages are fully migrated. ~99% of `_dictRehashStep` calls hit
+     * this branch (n=1 batches advance rehashidx by 1, vs ~512 buckets
+     * per 4 KiB page). */
+    if (end_page == start_page) return;
+
+    if (d->ht_table[0] == NULL) return;
+
+    /* Defensive: clamp to the old table's bucket count, in case the rehash
+     * loop advanced rehashidx past the last valid bucket (which shouldn't
+     * happen because dictCheckRehashingCompleted() runs after us, but be
+     * conservative — we never want to madvise outside the allocation). */
+    unsigned long old_table_buckets = DICTHT_SIZE(d->ht_size_exp[0]);
+    unsigned long max_end_page =
+        old_table_buckets >> buckets_per_page_shift;
+    if (end_page > max_end_page) end_page = max_end_page;
+    if (end_page <= start_page) return;
+
+    char *base = (char *)d->ht_table[0];
+    char *region_start = base + start_page * page_size;
+    size_t region_len = (end_page - start_page) * page_size;
+    /* MADV_DONTNEED is best-effort and idempotent — failures are harmless
+     * (the pages just stay resident). */
+    (void)madvise(region_start, region_len, MADV_DONTNEED);
+#else
+    (void)d;
+    (void)start_idx;
+#endif
+}
+
 /* Performs N steps of incremental rehashing. Returns 1 if there are still
  * keys to move from the old to the new hash table, otherwise 0 is returned.
  *
@@ -407,15 +488,17 @@ int dictRehash(dict *d, int n) {
     unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
     unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
     if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
-    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing. 
+    /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing.
      * - If expanding, the threshold is dict_force_resize_ratio which is 4.
      * - If shrinking, the threshold is 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio) which is 1/32. */
-    if (dict_can_resize == DICT_RESIZE_AVOID && 
+    if (dict_can_resize == DICT_RESIZE_AVOID &&
         ((s1 > s0 && s1 < dict_force_resize_ratio * s0) ||
          (s1 < s0 && s0 < HASHTABLE_MIN_FILL * dict_force_resize_ratio * s1)))
     {
         return 0;
     }
+
+    long start_idx = d->rehashidx;
 
     while(n-- && d->ht_used[0] != 0) {
         /* Note that rehashidx can't overflow as we are sure there are more
@@ -423,12 +506,22 @@ int dictRehash(dict *d, int n) {
         assert(DICTHT_SIZE(d->ht_size_exp[0]) > (unsigned long)d->rehashidx);
         while(d->ht_table[0][d->rehashidx] == NULL) {
             d->rehashidx++;
-            if (--empty_visits == 0) return 1;
+            if (--empty_visits == 0) {
+                /* Release pages of the old table that became fully scanned
+                 * during this batch (even an empty-bucket scan releases the
+                 * underlying physical pages — they only contain NULL slots
+                 * that we never read again). */
+                dictReleaseRehashedOldTablePages(d, start_idx);
+                return 1;
+            }
         }
         /* Move all the keys in this bucket from the old to the new hash HT */
         rehashEntriesInBucketAtIndex(d, d->rehashidx);
         d->rehashidx++;
     }
+
+    /* Release fully-migrated pages of the old hash table back to the OS. */
+    dictReleaseRehashedOldTablePages(d, start_idx);
 
     return !dictCheckRehashingCompleted(d);
 }
@@ -1787,6 +1880,14 @@ void dictEmpty(dict *d, void(callback)(dict*)) {
 
 void dictSetResizeEnabled(dictResizeEnable enable) {
     dict_can_resize = enable;
+}
+
+/* Enable or disable the incremental page-release optimization in dictRehash().
+ * Server startup wires this to `!server.thp_enabled` — Transparent Huge Pages
+ * make per-page MADV_DONTNEED ineffective on the 2 MiB hugepage backing the
+ * old hash table, so we don't pay the syscall overhead in that case. */
+void dictSetReleaseRehashedPages(int enabled) {
+    dict_release_rehashed_pages = enabled ? 1 : 0;
 }
 
 /* Compiler inlines this for internal calls within dict.c (verified with -O3). */

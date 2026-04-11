@@ -271,6 +271,7 @@ uint64_t dictGenHashFunction(const void *key, size_t len);
 uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len);
 void dictEmpty(dict *d, void(callback)(dict*));
 void dictSetResizeEnabled(dictResizeEnable enable);
+void dictSetReleaseRehashedPages(int enabled);
 int dictRehash(dict *d, int n);
 int dictRehashMicroseconds(dict *d, uint64_t us);
 void dictSetHashFunctionSeed(uint8_t *seed);

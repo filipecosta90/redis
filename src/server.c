@@ -8074,6 +8074,11 @@ int main(int argc, char **argv) {
     /* Do system checks */
 #ifdef __linux__
     linuxMemoryWarnings();
+    /* Wire dict's incremental rehash page-release optimization to the THP
+     * detection result. With THP enabled, per-page MADV_DONTNEED is
+     * ineffective on the 2 MiB hugepage backing the old hash table, so
+     * disable the optimization to avoid the syscall overhead. */
+    dictSetReleaseRehashedPages(!server.thp_enabled);
     sds err_msg = NULL;
     if (checkXenClocksource(&err_msg) < 0) {
         serverLog(LL_WARNING, "WARNING %s", err_msg);
