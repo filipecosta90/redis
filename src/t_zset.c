@@ -118,9 +118,12 @@ static inline void zslSetNodeInfo(zskiplistNode *node, uint8_t levels, uint16_t 
  * Ordering is by score first, then lexicographically by element.
  * NULL is treated as +infinity (comes after any real node). */
 int zslCompareWithNode(double score, sds ele, const zskiplistNode *n) {
-    if (/*score < */ n == NULL) return -1; /* NULL is +infinity, comes after any real node */
-    if (score < n->score) return -1;
-    if (score > n->score) return 1;
+    if (n == NULL) return -1; /* NULL is +infinity, comes after any real node */
+    /* Branchless score comparison: (a > b) - (a < b) compiles to
+     * UCOMISD + SETcc on x86 — no branch prediction needed.
+     * Only falls through to sdscmp when scores are exactly equal. */
+    int cmp = (score > n->score) - (score < n->score);
+    if (cmp != 0) return cmp;
     /* Scores are equal, compare elements lexicographically */
     return sdscmp(ele, zslGetNodeElement(n));
 }
