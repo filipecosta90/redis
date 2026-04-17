@@ -1894,8 +1894,8 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     }
 
     vec keys;
-    void *keys_stack[256];
-    vecInit(&keys, keys_stack, 256);
+    void *keys_stack[64];
+    vecInit(&keys, keys_stack, 64);
     /* Hash on dict only has pointers to dict entries; other paths allocate
      * temporary sds that must be released. */
     if (o && (!ht || o->type == OBJ_ZSET))
