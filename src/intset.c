@@ -108,11 +108,15 @@ size_t intsetAllocSize(intset *is) {
     return sizeof(intset)+size;
 }
 
-/* Resize the intset */
+/* Resize the intset. Skip the realloc when the current jemalloc
+ * allocation already has enough usable room — avoids crossing
+ * size-class boundaries on every +1 element growth. */
 static intset *intsetResize(intset *is, uint32_t len) {
     uint64_t size = (uint64_t)len*intrev32ifbe(is->encoding);
     assert(size <= SIZE_MAX - sizeof(intset));
-    is = zrealloc(is,sizeof(intset)+size);
+    size_t needed = sizeof(intset)+size;
+    if (needed > zmalloc_usable_size(is))
+        is = zrealloc(is,needed);
     return is;
 }
 
