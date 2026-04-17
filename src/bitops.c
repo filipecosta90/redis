@@ -270,7 +270,11 @@ long long redisPopCountAarch64(void *s, long count) {
 
 #ifdef HAVE_AVX512
 /* AVX512 optimized version of redisPopcount using VPOPCNTDQ instruction.
- * This function requires AVX512F and AVX512VPOPCNTDQ support. */
+ * This function requires AVX512F and AVX512VPOPCNTDQ support.
+ *
+ * Uses 4 independent vector accumulators and processes 256 bytes per
+ * iteration to maximize ILP and defer the expensive horizontal reduction
+ * to after the main loop — matching the strategy used by the NEON path. */
 ATTRIBUTE_TARGET_AVX512_POPCOUNT
 long long redisPopCountAvx512(void *s, long count) {
     long long bits = 0;
@@ -282,19 +286,39 @@ long long redisPopCountAvx512(void *s, long count) {
         count--;
     }
 
-    /* Process 64 bytes at a time using AVX512 */
+    /* 4 independent i64 vector accumulators — no overflow risk, max ILP */
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    __m512i acc2 = _mm512_setzero_si512();
+    __m512i acc3 = _mm512_setzero_si512();
+
+    /* Process 256 bytes at a time (4 × 64B loads) */
+    while (count >= 256) {
+        __m512i d0 = _mm512_loadu_si512((__m512i*)(p +   0));
+        __m512i d1 = _mm512_loadu_si512((__m512i*)(p +  64));
+        __m512i d2 = _mm512_loadu_si512((__m512i*)(p + 128));
+        __m512i d3 = _mm512_loadu_si512((__m512i*)(p + 192));
+
+        acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(d0));
+        acc1 = _mm512_add_epi64(acc1, _mm512_popcnt_epi64(d1));
+        acc2 = _mm512_add_epi64(acc2, _mm512_popcnt_epi64(d2));
+        acc3 = _mm512_add_epi64(acc3, _mm512_popcnt_epi64(d3));
+
+        p += 256;
+        count -= 256;
+    }
+
+    /* Single horizontal reduction after the loop */
+    __m512i sum = _mm512_add_epi64(_mm512_add_epi64(acc0, acc1),
+                                    _mm512_add_epi64(acc2, acc3));
+    bits += _mm512_reduce_add_epi64(sum);
+
+    /* Handle remaining 64-byte blocks */
     while (count >= 64) {
         __m512i data = _mm512_loadu_si512((__m512i*)p);
-        __m512i popcnt = _mm512_popcnt_epi64(data);
-
-        /* Sum all 8 64-bit popcount results */
-        bits += _mm512_reduce_add_epi64(popcnt);
-
+        bits += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(data));
         p += 64;
         count -= 64;
-
-        /* Prefetch next cache line */
-        redis_prefetch_read(p + 2048);
     }
 
     /* Handle remaining bytes with scalar popcount */
