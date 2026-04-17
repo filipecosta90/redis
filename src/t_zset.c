@@ -280,6 +280,9 @@ static void zslInsertNode(zskiplist *zsl, zskiplistNode *node) {
         while (zslCompareWithNode(score, ele, x->level[i].forward) > 0) {
             rank[i] += zslGetNodeSpanAtLevel(x, i);
             x = x->level[i].forward;
+            /* Prefetch next node to hide L3 latency during pointer-chasing */
+            if (x->level[i].forward)
+                redis_prefetch_read(x->level[i].forward);
         }
         update[i] = x;
     }
@@ -378,6 +381,9 @@ static void zslDelete(zskiplist *zsl, zskiplistNode *node) {
     for (i = zsl->level-1; i >= 0; i--) {
         while (zslCompareWithNode(score, ele, x->level[i].forward) > 0) {
             x = x->level[i].forward;
+            /* Prefetch next node to hide L3 latency during pointer-chasing */
+            if (x->level[i].forward)
+                redis_prefetch_read(x->level[i].forward);
         }
         update[i] = x;
     }
@@ -415,6 +421,9 @@ static void zslUpdateScore(zskiplist *zsl, zskiplistNode *node, double newscore)
     for (i = zsl->level-1; i >= 0; i--) {
         while (zslCompareWithNode(curscore, ele, x->level[i].forward) > 0) {
             x = x->level[i].forward;
+            /* Prefetch next node to hide L3 latency during pointer-chasing */
+            if (x->level[i].forward)
+                redis_prefetch_read(x->level[i].forward);
         }
         update[i] = x;
     }
@@ -652,6 +661,9 @@ unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
         while (zslCompareWithNode(score, ele, x->level[i].forward) >= 0) {
             rank += zslGetNodeSpanAtLevel(x, i);
             x = x->level[i].forward;
+            /* Prefetch next node to hide L3 latency during pointer-chasing */
+            if (x->level[i].forward)
+                redis_prefetch_read(x->level[i].forward);
         }
 
         if (x != zsl->header && zslCompareWithNode(score, ele, x) == 0) {
@@ -678,6 +690,8 @@ unsigned long zslGetRankByNode(zskiplist *zsl, zskiplistNode *x) {
         level = zslGetNodeInfo(x)->levels - 1;
         distance_to_end += zslGetNodeSpanAtLevel(x, level);
         x = x->level[level].forward;
+        /* Prefetch next node to hide L3 latency during pointer-chasing */
+        if (x) redis_prefetch_read(x);
     }
     
     /* Rank = total nodes - nodes after this one */
