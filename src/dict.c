@@ -1585,6 +1585,12 @@ unsigned long dictScanDefrag(dict *d,
         v++;
         v = rev(v);
 
+        /* Prefetch the first entry of the bucket the next call will scan.
+         * HW prefetchers miss this scattered access pattern. */
+        if (v) {
+            dictEntry *next_de = d->ht_table[htidx0][v & m0];
+            if (next_de) __builtin_prefetch(next_de);
+        }
     } else {
         htidx0 = 0;
         htidx1 = 1;
@@ -1610,6 +1616,13 @@ unsigned long dictScanDefrag(dict *d,
             v = rev(v);
             v++;
             v = rev(v);
+
+            /* Prefetch the next bucket while we loop; same rationale as
+             * the non-rehashing path above. */
+            if (v & (m0 ^ m1)) {
+                dictEntry *next_de = d->ht_table[htidx1][v & m1];
+                if (next_de) __builtin_prefetch(next_de);
+            }
 
             /* Continue while bits covered by mask difference is non-zero */
         } while (v & (m0 ^ m1));
