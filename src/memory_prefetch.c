@@ -66,6 +66,7 @@ typedef struct KeyPrefetchInfo {
     uint64_t key_hash;        /* Hash value of the key being prefetched */
     dictEntry *current_entry; /* Pointer to the current entry being processed */
     kvobj *current_kv;        /* Pointer to the kv object being prefetched */
+    dictEntry *found_entry;   /* The found entry after lookup, or NULL if not found */
 } KeyPrefetchInfo;
 
 /* PrefetchCommandsBatch structure holds the state of the current batch of client commands being processed. */
@@ -161,6 +162,7 @@ static void initBatchInfo(dict **dicts, GetValueDataFunc func) {
     /* Initialize the prefetch info */
     for (size_t i = 0; i < batch->key_count; i++) {
         KeyPrefetchInfo *info = &batch->prefetch_info[i];
+        info->found_entry = NULL;
         if (!batch->current_dicts[i] || dictSize(batch->current_dicts[i]) == 0) {
             info->state = PREFETCH_DONE;
             continue;
@@ -241,15 +243,19 @@ static void prefetchValueData(KeyPrefetchInfo *info) {
     kvobj *kv = info->current_kv;
     sds key = kvobjGetKey(kv);
 
-    /* 1. If this is the last element, we assume a hit and don't compare the keys
-     * 2. This kv object is the target of the lookup. */
-    if ((!dictGetNext(info->current_entry) && !dictIsRehashing(batch->current_dicts[i])) ||
-        dictCompareKeys(batch->current_dicts[i], batch->keys[i], key))
-    {
+    /* Check if this kv object is the target of the lookup.
+     * Note: We always compare keys to ensure correctness when the key might not exist.
+     * The original optimization of assuming a hit for the last element is not safe
+     * when we need to return accurate found/not-found results. */
+    if (dictCompareKeys(batch->current_dicts[i], batch->keys[i], key)) {
+        info->found_entry = info->current_entry;
         if (batch->get_value_data_func) {
             void *value_data = batch->get_value_data_func(kv);
             if (value_data) prefetchAndMoveToNextKey(value_data);
         }
+        markKeyAsdone(info);
+    } else if (!dictGetNext(info->current_entry) && !dictIsRehashing(batch->current_dicts[i])) {
+        /* Last element and not rehashing - key not found */
         markKeyAsdone(info);
     } else {
         /* Not found in the current entry, move to the next entry */
@@ -296,6 +302,86 @@ static void dictPrefetch(dict **dicts, GetValueDataFunc get_val_data_func) {
 static void *getObjectValuePtr(const void *value) {
     kvobj *kv = (kvobj *)value;
     return (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_RAW) ? kv->ptr : NULL;
+}
+
+/*
+ * Prefetch and find multiple keys in a dictionary.
+ *
+ * This function performs interleaved prefetching while finding keys,
+ * returning the dictEntry for each key (or NULL if not found).
+ *
+ * d       - The dictionary to search
+ * keys    - Array of keys (sds) to find
+ * count   - Number of keys
+ * results - Output array of dictEntry* (caller must allocate, NULL if not found)
+ * get_val_data_func - Optional callback to prefetch value data
+ */
+void dictPrefetchFind(dict *d, void **keys, size_t count, dictEntry **results,
+                      GetValueDataFunc get_val_data_func) {
+    if (count == 0) return;
+
+    /* Use stack allocation for small counts, heap for large */
+    KeyPrefetchInfo stack_info[16];
+    dict *stack_dicts[16];
+    KeyPrefetchInfo *info_arr = count <= 16 ? stack_info : zmalloc(count * sizeof(KeyPrefetchInfo));
+    dict **dicts = count <= 16 ? stack_dicts : zmalloc(count * sizeof(dict *));
+
+    /* Initialize all dicts to point to the same dictionary */
+    for (size_t i = 0; i < count; i++) {
+        dicts[i] = d;
+    }
+
+    /* Save and setup batch state */
+    size_t saved_key_count = batch ? batch->key_count : 0;
+    size_t saved_cur_idx = batch ? batch->cur_idx : 0;
+    void **saved_keys = batch ? batch->keys : NULL;
+    KeyPrefetchInfo *saved_info = batch ? batch->prefetch_info : NULL;
+
+    /* Create temporary batch if needed */
+    PrefetchCommandsBatch temp_batch;
+    PrefetchCommandsBatch *saved_batch = batch;
+    if (!batch) {
+        memset(&temp_batch, 0, sizeof(temp_batch));
+        batch = &temp_batch;
+    }
+
+    batch->key_count = count;
+    batch->cur_idx = 0;
+    batch->keys = keys;
+    batch->prefetch_info = info_arr;
+
+    /* Initialize and run the prefetch state machine */
+    initBatchInfo(dicts, get_val_data_func);
+    KeyPrefetchInfo *info;
+    while ((info = getNextPrefetchInfo())) {
+        switch (info->state) {
+        case PREFETCH_BUCKET: prefetchBucket(info); break;
+        case PREFETCH_ENTRY: prefetchEntry(info); break;
+        case PREFETCH_KVOBJ: prefetchKVOject(info); break;
+        case PREFETCH_VALDATA: prefetchValueData(info); break;
+        default: serverPanic("Unknown prefetch state %d", info->state);
+        }
+    }
+
+    /* Copy results */
+    for (size_t i = 0; i < count; i++) {
+        results[i] = info_arr[i].found_entry;
+    }
+
+    /* Restore batch state */
+    if (saved_batch) {
+        batch->key_count = saved_key_count;
+        batch->cur_idx = saved_cur_idx;
+        batch->keys = saved_keys;
+        batch->prefetch_info = saved_info;
+    }
+    batch = saved_batch;
+
+    /* Free heap allocations if used */
+    if (count > 16) {
+        zfree(info_arr);
+        zfree(dicts);
+    }
 }
 
 void resetCommandsBatch(void) {

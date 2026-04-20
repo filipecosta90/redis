@@ -689,20 +689,36 @@ void getrangeCommand(client *c) {
 }
 
 void mgetCommand(client *c) {
-    int j;
+    int keycount = c->argc - 1;
 
-    addReplyArrayLen(c,c->argc-1);
-    for (j = 1; j < c->argc; j++) {
-        kvobj *o = lookupKeyRead(c->db, c->argv[j]);
+    addReplyArrayLen(c, keycount);
+
+    /* Use stack for small counts, heap for large */
+    kvobj **results;
+    kvobj *stack_results[16];
+    if (keycount <= 16) {
+        results = stack_results;
+    } else {
+        results = zmalloc(keycount * sizeof(kvobj *));
+    }
+
+    /* Vectorized lookup with prefetching */
+    lookupKeyReadVect(c->db, c->argv + 1, keycount, results, LOOKUP_NONE);
+
+    /* Reply with results */
+    for (int j = 0; j < keycount; j++) {
+        kvobj *o = results[j];
         if (o == NULL) {
             addReplyNull(c);
+        } else if (o->type != OBJ_STRING) {
+            addReplyNull(c);
         } else {
-            if (o->type != OBJ_STRING) {
-                addReplyNull(c);
-            } else {
-                addReplyBulk(c,o);
-            }
+            addReplyBulk(c, o);
         }
+    }
+
+    if (keycount > 16) {
+        zfree(results);
     }
 }
 

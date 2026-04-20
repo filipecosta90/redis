@@ -3972,6 +3972,7 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
 int checkAlreadyExpired(long long when);
 int parseExtendedExpireArgumentsOrReply(client *c, int *flags);
 kvobj *lookupKeyRead(redisDb *db, robj *key);
+void lookupKeyReadVect(redisDb *db, robj **keys, int count, kvobj **results, int flags);
 kvobj *lookupKeyWrite(redisDb *db, robj *key);
 kvobj *lookupKeyWriteWithLink(redisDb *db, robj *key, dictEntryLink *link);
 kvobj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
