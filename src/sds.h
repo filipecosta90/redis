@@ -65,7 +65,7 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 #define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))
 #define SDS_TYPE_5_LEN(s) (((unsigned char)(s[-1])) >> SDS_TYPE_BITS)
 
-static inline unsigned char sdsType(sds s) {
+static inline __attribute__((always_inline)) unsigned char sdsType(sds s) {
     unsigned char flags = s[-1];
     return flags & SDS_TYPE_MASK;
 }
@@ -96,10 +96,15 @@ static inline void sdsSetAuxBit(sds s, int bit, int value) {
 }
 
 static inline size_t sdslen(const sds s) {
-    switch (sdsType(s)) {
-        case SDS_TYPE_5: return SDS_TYPE_5_LEN(s);
-        case SDS_TYPE_8:
-            return SDS_HDR(8,s)->len;
+    /* SDS_TYPE_8 covers keys (< 256 B) and small values — the common case.
+     * Hoisting it out of the jump table lets the predicted-not-taken branch
+     * avoid the switch dispatch and load the length in two ops. */
+    unsigned char flags = s[-1];
+    unsigned char type = flags & SDS_TYPE_MASK;
+    if (__builtin_expect(type == SDS_TYPE_8, 1))
+        return SDS_HDR(8,s)->len;
+    switch (type) {
+        case SDS_TYPE_5: return flags >> SDS_TYPE_BITS;
         case SDS_TYPE_16:
             return SDS_HDR(16,s)->len;
         case SDS_TYPE_32:
