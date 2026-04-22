@@ -3109,8 +3109,11 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
         /* The pending command should have been reset */
         serverAssertWithInfo(c,NULL,pcmd->argc == 0);
 
-        /* Multi bulk length cannot be read without a \r\n */
-        newline = strchr(c->querybuf+c->qb_pos,'\r');
+        /* Multi bulk length cannot be read without a \r\n.
+         * Use memchr with the known bound rather than strchr — querybuf is
+         * SDS (may contain embedded NULs) and memchr avoids walking past the
+         * unread tail when the \r sits deep in the buffer. */
+        newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len-c->qb_pos);
         if (newline == NULL) {
             if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                 pcmd->read_error = CLIENT_READ_TOO_BIG_MBULK_COUNT_STRING;
@@ -3189,7 +3192,10 @@ static int processMultibulkBuffer(client *c, pendingCommand *pcmd) {
     while(c->multibulklen) {
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
-            newline = memchr(c->querybuf+c->qb_pos,'\r',sdslen(c->querybuf) - c->qb_pos);
+            /* querybuf_len is kept in sync with c->querybuf across all
+             * reallocations in this function, so avoid the per-arg sdslen
+             * call which otherwise fires once per bulk on every command. */
+            newline = memchr(c->querybuf+c->qb_pos,'\r',querybuf_len - c->qb_pos);
             if (newline == NULL) {
                 if (querybuf_len-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
                     pcmd->read_error = CLIENT_READ_TOO_BIG_BUCK_COUNT_STRING;
