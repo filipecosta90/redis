@@ -94,7 +94,8 @@ static inline keyCmpFunc dictGetCmpFunc(dict *d) {
     return dictDefaultCompare;
 }
 
-static const void *dictStoredKey2Key(dict *d, const void *key __stored_key) {
+static inline __attribute__((always_inline))
+const void *dictStoredKey2Key(dict *d, const void *key __stored_key) {
     return (d->type->keyFromStoredKey) ? d->type->keyFromStoredKey(key) : key;
 }
 

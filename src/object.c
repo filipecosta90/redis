@@ -242,14 +242,6 @@ robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
     return o;
 }
 
-sds kvobjGetKey(const kvobj *kv) {
-    unsigned char *data = (void *)(kv + 1);
-    debugServerAssert(kv->iskvobj);
-    uint8_t hdr_size = *(uint8_t *)data;
-    data += 1 + hdr_size;
-    return (sds)data;
-}
-
 long long kvobjGetExpire(const kvobj *kv) {
     if (kv->metabits & KEY_META_MASK_EXPIRE) {
         return (long long) (*kvobjMetaRef((kvobj *)kv, KEY_META_ID_EXPIRE));
