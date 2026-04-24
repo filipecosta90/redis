@@ -53,6 +53,17 @@ endif
 WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes
 OPT=$(OPTIMIZATION)
 
+# Align function entry points and hot-loop bodies to 32 bytes. This matches
+# Zen 4/5 Op Cache line size: a hot loop that fits inside one OC line stays
+# in the micro-op cache across fetches instead of spilling to decode, which
+# reduces Frontend_Bound.Fetch_Latency on dense reply paths (notably MGET /
+# HGETALL / LRANGE on AMD Zen). Intel/ARM also benefit from stricter I-fetch
+# alignment, though less dramatically. No ABI impact; affects only code
+# layout in the emitted binary.
+ifeq ($(uname_M),x86_64)
+	OPT+=-falign-functions=32 -falign-loops=32
+endif
+
 SKIP_VEC_SETS?=no
 # Detect if the compiler supports C11 _Atomic.
 # NUMBER_SIGN_CHAR is a workaround to support both GNU Make 4.3 and older versions.
