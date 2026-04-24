@@ -284,14 +284,21 @@ static void hashDictWithExpireOnRelease(dict *d) {
 
 #define HASH_LP_NO_TTL 0
 
-struct listpackEx *listpackExCreate(void) {
+/* The listpackEx* / hashTypeSetEx* code below supports OBJ_ENCODING_LISTPACK_EX
+ * (hashes with per-field expiry, HFE). Plain OBJ_ENCODING_LISTPACK hashes never
+ * reach any of these functions. Marking them __attribute__((cold)) so the
+ * linker places them in .text.cold, keeping the hot listpack scan loop
+ * contiguous in L1I for LISTPACK-only workloads. */
+#define HFE_COLD __attribute__((cold))
+
+HFE_COLD struct listpackEx *listpackExCreate(void) {
     listpackEx *lpt = zcalloc(sizeof(*lpt));
     lpt->meta.trash = 1;
     lpt->lp = NULL;
     return lpt;
 }
 
-static void listpackExFree(listpackEx *lpt) {
+HFE_COLD static void listpackExFree(listpackEx *lpt) {
     lpFree(lpt->lp);
     zfree(lpt);
 }
@@ -308,7 +315,7 @@ struct lpFingArgs {
 /* Callback for lpFindCb(). Used to find number of expired fields as part of
  * active expiry or when trying to find the position for the new field according
  * to its expiry time.*/
-static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
+HFE_COLD static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
                             void *user, unsigned char *s, long long slen)
 {
     (void) lp;
@@ -337,7 +344,7 @@ static int cbFindInListpack(const unsigned char *lp, unsigned char *p,
 }
 
 /* Returns number of expired fields. */
-static uint64_t listpackExExpireDryRun(const robj *o) {
+HFE_COLD static uint64_t listpackExExpireDryRun(const robj *o) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK_EX);
 
     listpackEx *lpt = o->ptr;
@@ -352,7 +359,7 @@ static uint64_t listpackExExpireDryRun(const robj *o) {
 }
 
 /* Returns the expiration time of the item with the nearest expiration. */
-static uint64_t listpackExGetMinExpire(robj *o) {
+HFE_COLD static uint64_t listpackExGetMinExpire(robj *o) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK_EX);
 
     long long expireAt;
@@ -374,7 +381,7 @@ static uint64_t listpackExGetMinExpire(robj *o) {
 }
 
 /* Walk over fields and delete the expired ones. */
-void listpackExExpire(redisDb *db, kvobj *kv, ExpireInfo *info) {
+HFE_COLD void listpackExExpire(redisDb *db, kvobj *kv, ExpireInfo *info) {
     OnFieldExpireCtx *ctx = info->ctx;
     serverAssert(kv->encoding == OBJ_ENCODING_LISTPACK_EX);
     uint64_t expired = 0, min = EB_EXPIRE_TIME_INVALID;
@@ -435,7 +442,7 @@ void listpackExExpire(redisDb *db, kvobj *kv, ExpireInfo *info) {
     info->nextExpireTime = min;
 }
 
-static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
+HFE_COLD static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
     listpackEx *lpt = o->ptr;
 
     /* Shortcut, just append at the end if this is a non-volatile field. */
@@ -461,7 +468,7 @@ static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
 }
 
 /* Add new field ordered by expire time. */
-void listpackExAddNew(robj *o, char *field, size_t flen,
+HFE_COLD void listpackExAddNew(robj *o, char *field, size_t flen,
                       char *value, size_t vlen, uint64_t expireAt) {
     listpackEntry ent[3] = {
         {.sval = (unsigned char*) field, .slen = flen},
@@ -475,7 +482,7 @@ void listpackExAddNew(robj *o, char *field, size_t flen,
 /* If expiry time is changed, this function will place field into the correct
  * position. First, it deletes the field and re-inserts to the listpack ordered
  * by expiry time. */
-static void listpackExUpdateExpiry(robj *o, sds field,
+HFE_COLD static void listpackExUpdateExpiry(robj *o, sds field,
                                    unsigned char *fptr,
                                    unsigned char *vptr,
                                    uint64_t expire_at) {
