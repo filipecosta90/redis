@@ -2362,6 +2362,35 @@ typedef struct {
 typedef union _iterset iterset;
 typedef union _iterzset iterzset;
 
+/* === Bulk-insert fast path for sorted-input zset construction. ===
+ * Forward declarations consumed by zdiffAlgorithm1/2 + zunionInterDiffGenericCommand;
+ * implementations live further down (near the ZRANGESTORE result handler). */
+
+typedef enum {
+    ZSET_BULK_FORWARD = 0,    /* (score, ele) emitted non-decreasing — append at tail */
+    ZSET_BULK_REVERSE = 1,    /* (score, ele) emitted non-increasing — prepend at head */
+} zsetBulkDirection;
+
+typedef struct {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL]; /* per-level predecessor (FORWARD only) */
+    unsigned long  rank[ZSKIPLIST_MAXLEVEL];   /* rank of each predecessor (FORWARD only) */
+    int initialized;
+    int disarmed;
+    zsetBulkDirection direction;
+} zsetBulkInsertCache;
+
+static inline void zsetBulkInsertCacheInit(zsetBulkInsertCache *c, zsetBulkDirection dir) {
+    c->initialized = 0;
+    c->disarmed = 0;
+    c->direction = dir;
+}
+
+static int zsetTryBulkInsert(robj *zobj, zsetBulkInsertCache *cache,
+                             double score, sds ele);
+static void zslBulkAppendPrebuilt(zskiplist *zsl, zsetBulkInsertCache *cache,
+                                  zskiplistNode *node);
+static int zslNodePtrCmpForBulk(const void *a, const void *b);
+
 void zuiInitIterator(zsetopsrc *op) {
     if (op->subject == NULL)
         return;
@@ -2703,7 +2732,8 @@ static size_t zsetDictGetMaxElementLength(dict *d, size_t *totallen) {
     return maxelelen;
 }
 
-static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiffAlgorithm1(zsetopsrc *src, long setnum, robj *dstobj, size_t *maxelelen, size_t *totelelen) {
+    zset *dstzset = dstobj->ptr;
     /* DIFF Algorithm 1:
      *
      * We perform the diff by iterating all the elements of the first set,
@@ -2727,6 +2757,12 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
      * duplicated elements ASAP. */
     qsort(src+1,setnum-1,sizeof(zsetopsrc),zuiCompareByRevCardinality);
 
+    /* src[0] is iterated in (score, ele) sorted order; we keep elements
+     * verbatim (no aggregation), so monotonic non-decreasing emit is
+     * guaranteed. Bulk-tail-append into the (skiplist-encoded) destination. */
+    zsetBulkInsertCache bcache;
+    zsetBulkInsertCacheInit(&bcache, ZSET_BULK_FORWARD);
+
     memset(&zval, 0, sizeof(zval));
     zuiInitIterator(&src[0]);
     while (zuiNext(&src[0],&zval)) {
@@ -2748,18 +2784,21 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
 
         if (!exists) {
             tmp = zuiNewSdsFromValue(&zval);
-            znode = zslInsert(dstzset->zsl,zval.score,tmp);
-            dictAdd(dstzset->dict, znode, NULL);
+            if (!zsetTryBulkInsert(dstobj, &bcache, zval.score, tmp)) {
+                znode = zslInsert(dstzset->zsl,zval.score,tmp);
+                dictAdd(dstzset->dict, znode, NULL);
+            }
             if (sdslen(tmp) > *maxelelen) *maxelelen = sdslen(tmp);
             (*totelelen) += sdslen(tmp);
-            sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+            sdsfree(tmp); /* zslInsert / helper copied it, we can free our copy */
         }
     }
     zuiClearIterator(&src[0]);
 }
 
 
-static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiffAlgorithm2(zsetopsrc *src, long setnum, robj *dstobj, size_t *maxelelen, size_t *totelelen) {
+    zset *dstzset = dstobj->ptr;
     /* DIFF Algorithm 2:
      *
      * Add all the elements of the first set to the auxiliary set.
@@ -2781,6 +2820,13 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     zskiplistNode *znode;
     sds tmp;
 
+    /* j=0 phase iterates src[0] in sorted order (no aggregation) — bulk-tail-
+     * append into the destination skiplist. The remove phases (j>0) don't use
+     * the cache; once we delete from the destination, monotonic state is no
+     * longer meaningful and the cache stays unused. */
+    zsetBulkInsertCache bcache;
+    zsetBulkInsertCacheInit(&bcache, ZSET_BULK_FORWARD);
+
     for (j = 0; j < setnum; j++) {
         if (zuiLength(&src[j]) == 0) continue;
 
@@ -2789,10 +2835,12 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         while (zuiNext(&src[j],&zval)) {
             if (j == 0) {
                 tmp = zuiNewSdsFromValue(&zval);
-                znode = zslInsert(dstzset->zsl,zval.score,tmp);
-                dictAdd(dstzset->dict, znode, NULL);
+                if (!zsetTryBulkInsert(dstobj, &bcache, zval.score, tmp)) {
+                    znode = zslInsert(dstzset->zsl,zval.score,tmp);
+                    dictAdd(dstzset->dict, znode, NULL);
+                }
                 cardinality++;
-                sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+                sdsfree(tmp); /* zslInsert / helper copied it, we can free our copy */
             } else {
                 dictPauseAutoResize(dstzset->dict);
                 tmp = zuiSdsFromValue(&zval);
@@ -2856,14 +2904,14 @@ static int zsetChooseDiffAlgorithm(zsetopsrc *src, long setnum) {
     return (algo_one_work <= algo_two_work) ? 1 : 2;
 }
 
-static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiff(zsetopsrc *src, long setnum, robj *dstobj, size_t *maxelelen, size_t *totelelen) {
     /* Skip everything if the smallest input is empty. */
     if (zuiLength(&src[0]) > 0) {
         int diff_algo = zsetChooseDiffAlgorithm(src, setnum);
         if (diff_algo == 1) {
-            zdiffAlgorithm1(src, setnum, dstzset, maxelelen, totelelen);
+            zdiffAlgorithm1(src, setnum, dstobj, maxelelen, totelelen);
         } else if (diff_algo == 2) {
-            zdiffAlgorithm2(src, setnum, dstzset, maxelelen, totelelen);
+            zdiffAlgorithm2(src, setnum, dstobj, maxelelen, totelelen);
         } else if (diff_algo != 0) {
             serverPanic("Unknown algorithm");
         }
@@ -3025,6 +3073,14 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     if (op == SET_OP_INTER) {
         /* Skip everything if the smallest input is empty. */
         if (zuiLength(&src[0]) > 0) {
+            /* Bulk-insert fast path: src[0] is iterated in sorted order; if the
+             * aggregated score sequence stays monotonic the cache stitches each
+             * survivor at the tail without the per-insert walk. The cache
+             * auto-disarms on the first non-monotonic emit and the loop falls
+             * back to zslInsert+dictAdd transparently. */
+            zsetBulkInsertCache bcache;
+            zsetBulkInsertCacheInit(&bcache, ZSET_BULK_FORWARD);
+
             /* Precondition: as src[0] is non-empty and the inputs are ordered
              * by size, all src[i > 0] are non-empty too. */
             zuiInitIterator(&src[0]);
@@ -3060,11 +3116,13 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     }
                 } else if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
-                    znode = zslInsert(dstzset->zsl,score,tmp);
-                    dictAdd(dstzset->dict, znode, NULL);
+                    if (!zsetTryBulkInsert(dstobj, &bcache, score, tmp)) {
+                        znode = zslInsert(dstzset->zsl,score,tmp);
+                        dictAdd(dstzset->dict, znode, NULL);
+                    }
                     totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
-                    sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+                    sdsfree(tmp); /* zslInsert / helper copied it, we can free our copy */
                 }
             }
             zuiClearIterator(&src[0]);
@@ -3121,16 +3179,34 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiClearIterator(&src[i]);
         }
 
-        /* Step 2: Done filling dict with nodes and updating scores. Now insert skiplist */
-        dictInitIterator(&di, dstzset->dict);
+        /* Step 2: Sort-then-bulk-build the skiplist. All nodes are in the
+         * dict but the skiplist is empty; rather than inserting each node
+         * via zslInsertNode (which walks from the head every time, O(log N)
+         * per insert with cold pointer chases), we copy the node pointers
+         * to a tight array, sort by (score, ele), then bulk-link each one
+         * onto the tail using the same per-level cache the bulk fast path
+         * uses. Sort+linear-link is much friendlier to the cache than
+         * N independent pointer-chased walks. */
+        unsigned long zsize = dictSize(dstzset->dict);
+        if (zsize > 0) {
+            zskiplistNode **arr = zmalloc(sizeof(*arr) * zsize);
+            unsigned long k = 0;
 
-        while((de = dictNext(&di)) != NULL) {
-            zskiplistNode *znode = dictGetKey(de);
-            zslInsertNode(dstzset->zsl, znode);
+            dictInitIterator(&di, dstzset->dict);
+            while ((de = dictNext(&di)) != NULL) arr[k++] = dictGetKey(de);
+            dictResetIterator(&di);
+
+            qsort(arr, zsize, sizeof(*arr), zslNodePtrCmpForBulk);
+
+            zsetBulkInsertCache bcache;
+            zsetBulkInsertCacheInit(&bcache, ZSET_BULK_FORWARD);
+            for (unsigned long i2 = 0; i2 < zsize; i2++) {
+                zslBulkAppendPrebuilt(dstzset->zsl, &bcache, arr[i2]);
+            }
+            zfree(arr);
         }
-        dictResetIterator(&di);
     } else if (op == SET_OP_DIFF) {
-        zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
+        zdiff(src, setnum, dstobj, &maxelelen, &totelelen);
     } else {
         serverPanic("Unknown operator");
     }
@@ -3247,6 +3323,11 @@ typedef void (*zrangeResultEmitLongLongFunction)(
 void zrangeGenericCommand (zrange_result_handler *handler, int argc_start, int store,
                            zrange_type rangetype, zrange_direction direction);
 
+/* The bulk-insert fast path's typedef + forward declarations live further
+ * up the file (consumed by zdiffAlgorithm1/2 + zunionInterDiffGenericCommand
+ * before this point); implementations follow the ZRANGESTORE result handler
+ * declarations below. */
+
 /* Interface struct for ZRANGE/ZRANGESTORE generic implementation.
  * There is one implementation of this interface that sends a RESP reply to clients.
  * and one implementation that stores the range result into a zset object. */
@@ -3262,11 +3343,10 @@ struct zrange_result_handler {
     zrangeResultFinalizeFunction         finalizeResultEmission;
     zrangeResultEmitCBufferFunction      emitResultFromCBuffer;
     zrangeResultEmitLongLongFunction     emitResultFromLongLong;
-    /* STORE fast path state. See zrangeStoreTryAppend(). */
-    zskiplistNode                       *bulk_update[ZSKIPLIST_MAXLEVEL];
-    unsigned long                        bulk_rank[ZSKIPLIST_MAXLEVEL];
-    int                                  bulk_initialized;
-    int                                  bulk_disarmed;
+    /* STORE-mode bulk-insert fast path. Direction is set by zrangeGenericCommand
+     * via handler->bulk_reverse before result emission begins. */
+    int                                  bulk_reverse;
+    zsetBulkInsertCache                  bulk_cache;
 };
 
 /* Result handler methods for responding the ZRANGE to clients.
@@ -3336,47 +3416,56 @@ static void zrangeResultFinalizeClient(zrange_result_handler *handler,
 static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
 {
     handler->dstobj = zsetTypeCreate(length >= 0 ? length : 0, 0);
+    zsetBulkInsertCacheInit(&handler->bulk_cache,
+        handler->bulk_reverse ? ZSET_BULK_REVERSE : ZSET_BULK_FORWARD);
 }
 
-/* STORE-mode tail-append fast path for forward ZRANGESTORE.
+/* === Bulk-insert fast path for sorted-input zset construction. ===
  *
- * When the destination is skiplist-encoded and incoming (score, ele) is >=
- * the current tail, append the new node directly using per-level tail
- * pointers cached on 'handler'. On first use with a non-empty skiplist
- * (destination was listpack and converted mid-store, e.g. ZRANGESTORE
- * BYSCORE/BYLEX), the cache seeds from the existing tail chain. Span
- * bookkeeping mirrors zslInsertNode() verbatim: level-0 spans are implicit,
- * level>=1 predecessor span = (new_rank - prev_rank) + 1, new-tail span = 0;
- * bulk_rank[i] = hops-from-header to bulk_update[i] so the formula stays
- * invariant across calls.
+ * Caller emits (score, ele) tuples in sorted order — non-decreasing for
+ * ZSET_BULK_FORWARD, non-increasing for ZSET_BULK_REVERSE — and gets each
+ * pair stitched into the destination in O(1) amortized work per insert,
+ * versus the O(log N) walk-from-head that zsetAdd() / zslInsert() would do.
  *
- * Returns 1 if handled, 0 to fall back to zsetAdd() (not skiplist, not
- * monotonic, or unexpected duplicate). */
-static int zrangeStoreTryAppend(zrange_result_handler *handler, double score, sds ele) {
-    if (handler->bulk_disarmed) return 0;
-    if (handler->dstobj->encoding != OBJ_ENCODING_SKIPLIST) return 0;
-    zset *zs = handler->dstobj->ptr;
-    zskiplist *zsl = zs->zsl;
+ * The destination may be listpack- or skiplist-encoded; the helper dispatches
+ * on encoding and keeps the listpack→skiplist transition transparent: when an
+ * append would push the listpack past the encoding threshold, the helper
+ * returns 0 for that emit so the caller falls back to zsetAdd() (which does
+ * the conversion). The very next call sees skiplist encoding and re-arms the
+ * cache from the existing tail chain.
+ *
+ * Returns 1 if handled, 0 to fall back to zsetAdd(). On 0 the cache may be
+ * disarmed (permanent monotonic-violation / dup) or simply unable to handle
+ * this one emit (encoding-grow); the disarmed flag distinguishes. */
+
+/* --- Skiplist tail-append (FORWARD) ---------------------------------------
+ *
+ * Span bookkeeping mirrors zslInsertNode() verbatim: level-0 spans are
+ * implicit, level>=1 predecessor span = (new_rank - prev_rank) + 1,
+ * new-tail span = 0; cache->rank[i] = hops-from-header to cache->update[i]
+ * so the formula stays invariant across calls. On first use with a non-empty
+ * skiplist (destination was listpack and converted mid-store, e.g.
+ * ZRANGESTORE BYSCORE/BYLEX), the cache seeds from the existing tail chain. */
+static int zslTryAppendTail(zskiplist *zsl, dict *zdict,
+                            zsetBulkInsertCache *cache,
+                            double score, sds ele) {
     if (zsl->tail != NULL && zslCompareWithNode(score, ele, zsl->tail) < 0) {
-        handler->bulk_disarmed = 1;
+        cache->disarmed = 1;
         return 0;
     }
     dictEntryLink bucket;
-    if (dictFindLink(zs->dict, ele, &bucket) != NULL) {
-        handler->bulk_disarmed = 1;  /* unexpected duplicate */
+    if (dictFindLink(zdict, ele, &bucket) != NULL) {
+        cache->disarmed = 1;  /* unexpected duplicate */
         return 0;
     }
 
-    if (!handler->bulk_initialized) {
+    if (!cache->initialized) {
         if (zsl->length == 0) {
             for (int i = 0; i < ZSKIPLIST_MAXLEVEL; i++) {
-                handler->bulk_update[i] = zsl->header;
-                handler->bulk_rank[i] = 0;
+                cache->update[i] = zsl->header;
+                cache->rank[i] = 0;
             }
         } else {
-            /* Walk the existing tail chain so update[]/rank[] match what
-             * zslInsertNode() would have computed; otherwise the first
-             * stitch would overwrite header.forward on a non-empty chain. */
             zskiplistNode *x = zsl->header;
             unsigned long r = 0;
             for (int i = zsl->level - 1; i >= 0; i--) {
@@ -3384,15 +3473,15 @@ static int zrangeStoreTryAppend(zrange_result_handler *handler, double score, sd
                     r += zslGetNodeSpanAtLevel(x, i);
                     x = x->level[i].forward;
                 }
-                handler->bulk_update[i] = x;
-                handler->bulk_rank[i] = r;
+                cache->update[i] = x;
+                cache->rank[i] = r;
             }
             for (int i = zsl->level; i < ZSKIPLIST_MAXLEVEL; i++) {
-                handler->bulk_update[i] = zsl->header;
-                handler->bulk_rank[i] = 0;
+                cache->update[i] = zsl->header;
+                cache->rank[i] = 0;
             }
         }
-        handler->bulk_initialized = 1;
+        cache->initialized = 1;
     }
 
     int level = zslRandomLevel();
@@ -3401,40 +3490,248 @@ static int zrangeStoreTryAppend(zrange_result_handler *handler, double score, sd
 
     if (level > zsl->level) {
         for (int i = zsl->level; i < level; i++) {
-            handler->bulk_update[i] = zsl->header;
-            handler->bulk_rank[i] = 0;
+            cache->update[i] = zsl->header;
+            cache->rank[i] = 0;
             zslSetNodeSpanAtLevel(zsl->header, i, zsl->length);
         }
         zsl->level = level;
         zslGetNodeInfo(zsl->header)->levels = level;
     }
 
-    zskiplistNode *prev_level0 = handler->bulk_update[0];
+    zskiplistNode *prev_level0 = cache->update[0];
     for (int i = 0; i < level; i++) {
         node->level[i].forward = NULL;
-        handler->bulk_update[i]->level[i].forward = node;
+        cache->update[i]->level[i].forward = node;
         zslSetNodeSpanAtLevel(node, i, 0);
-        zslSetNodeSpanAtLevel(handler->bulk_update[i], i,
-                              (insert_rank - handler->bulk_rank[i]) + 1);
-        handler->bulk_update[i] = node;
-        handler->bulk_rank[i] = insert_rank + 1;
+        zslSetNodeSpanAtLevel(cache->update[i], i,
+                              (insert_rank - cache->rank[i]) + 1);
+        cache->update[i] = node;
+        cache->rank[i] = insert_rank + 1;
     }
     for (int i = level; i < zsl->level; i++) {
-        zslIncrNodeSpanAtLevel(handler->bulk_update[i], i, 1);
+        zslIncrNodeSpanAtLevel(cache->update[i], i, 1);
     }
     node->backward = (prev_level0 == zsl->header) ? NULL : prev_level0;
     zsl->tail = node;
     zsl->length++;
 
-    dictSetKeyAtLink(zs->dict, node, &bucket, 1);
+    dictSetKeyAtLink(zdict, node, &bucket, 1);
     return 1;
+}
+
+/* --- Skiplist head-prepend (REVERSE) --------------------------------------
+ *
+ * Each prepend inserts the new node at rank 0. Predecessor at every level is
+ * always zsl->header, so no cache walk or per-level update[] tracking is
+ * needed — the cache fields stay unused for REVERSE.
+ *
+ * Span formulas (derived from zslInsertNode with rank[i]=0, rank[0]=0):
+ *   new.level[i].forward (i < new_level)  := old header.level[i].forward
+ *   new.span[i]                            := old header.span[i]
+ *   header.level[i].forward                := new
+ *   header.span[i]                         := 1
+ *   For untouched levels (new_level..zsl->level-1): header.span[i] += 1
+ *   Level extension (new_level > zsl->level): header.span[i]=zsl->length
+ *     for new top levels BEFORE the main loop, mirroring zslInsertNode. */
+static int zslTryPrependHead(zskiplist *zsl, dict *zdict,
+                             zsetBulkInsertCache *cache,
+                             double score, sds ele) {
+    /* Monotonic-non-increasing invariant: incoming tuple <= current head. */
+    zskiplistNode *cur_head = zsl->header->level[0].forward;
+    if (cur_head != NULL && zslCompareWithNode(score, ele, cur_head) > 0) {
+        cache->disarmed = 1;
+        return 0;
+    }
+    dictEntryLink bucket;
+    if (dictFindLink(zdict, ele, &bucket) != NULL) {
+        cache->disarmed = 1;
+        return 0;
+    }
+    (void)cache;  /* REVERSE direction does not amortize update[]/rank[]. */
+
+    int level = zslRandomLevel();
+    zskiplistNode *node = zslCreateNode(zsl, level, score, ele);
+
+    if (level > zsl->level) {
+        for (int i = zsl->level; i < level; i++) {
+            zslSetNodeSpanAtLevel(zsl->header, i, zsl->length);
+        }
+        zsl->level = level;
+        zslGetNodeInfo(zsl->header)->levels = level;
+    }
+
+    /* Stitch new node at rank 0 (predecessor = header at every level). */
+    for (int i = 0; i < level; i++) {
+        node->level[i].forward = zsl->header->level[i].forward;
+        zslSetNodeSpanAtLevel(node, i, zslGetNodeSpanAtLevel(zsl->header, i));
+        zsl->header->level[i].forward = node;
+        zslSetNodeSpanAtLevel(zsl->header, i, 1);
+    }
+    /* Untouched levels: header.span += 1. */
+    for (int i = level; i < zsl->level; i++) {
+        zslIncrNodeSpanAtLevel(zsl->header, i, 1);
+    }
+
+    node->backward = NULL;
+    if (node->level[0].forward != NULL) {
+        node->level[0].forward->backward = node;
+    } else {
+        zsl->tail = node;  /* list was empty */
+    }
+    zsl->length++;
+
+    dictSetKeyAtLink(zdict, node, &bucket, 1);
+    return 1;
+}
+
+/* --- Listpack append/prepend ----------------------------------------------
+ *
+ * For monotonic input on a listpack-encoded destination, skip zzlInsert()'s
+ * walk-from-head: append at the end (FORWARD) or insert before the first
+ * entry (REVERSE). Both reduce per-emit work from O(N) walk to O(1) plus
+ * the listpack realloc-for-grow that lpBatchAppend / lpBatchInsert already
+ * handle. We mirror zsetAdd's encoding-grow check; when the listpack would
+ * exceed its limits, the helper returns 0 so the caller falls back to
+ * zsetAdd() (which performs the conversion to skiplist). The next emit
+ * sees the new skiplist encoding and re-arms the cache. */
+static int zzlTryBulkInsert(robj *zobj, zsetBulkInsertCache *cache,
+                            double score, sds ele) {
+    unsigned char *zl = zobj->ptr;
+
+    /* Monotonic-invariant check against the boundary entry (last for FORWARD,
+     * first for REVERSE). Boundary may be absent for an empty listpack. */
+    if (cache->direction == ZSET_BULK_FORWARD) {
+        unsigned char *last_eptr = lpSeek(zl, -2); /* element entry; score follows */
+        if (last_eptr != NULL) {
+            unsigned char *last_sptr = lpNext(zl, last_eptr);
+            double last_score = zzlGetScore(last_sptr);
+            if (score < last_score) { cache->disarmed = 1; return 0; }
+            if (score == last_score &&
+                zzlCompareElements(last_eptr, (unsigned char*)ele, sdslen(ele)) > 0)
+            {
+                cache->disarmed = 1;
+                return 0;
+            }
+        }
+    } else {
+        unsigned char *first_eptr = lpSeek(zl, 0);
+        if (first_eptr != NULL) {
+            unsigned char *first_sptr = lpNext(zl, first_eptr);
+            double first_score = zzlGetScore(first_sptr);
+            if (score > first_score) { cache->disarmed = 1; return 0; }
+            if (score == first_score &&
+                zzlCompareElements(first_eptr, (unsigned char*)ele, sdslen(ele)) < 0)
+            {
+                cache->disarmed = 1;
+                return 0;
+            }
+        }
+    }
+
+    /* Encoding-grow check (mirror zsetAdd). On overflow, defer to zsetAdd
+     * which performs the listpack→skiplist conversion. The next emit will
+     * see skiplist encoding and the skiplist path will arm itself from the
+     * existing tail/head chain (cache->initialized is still 0 for FORWARD;
+     * REVERSE doesn't need a cache). */
+    if (zzlLength(zl) + 1 > server.zset_max_listpack_entries ||
+        sdslen(ele) > server.zset_max_listpack_value ||
+        !lpSafeToAdd(zl, sdslen(ele)))
+    {
+        return 0;
+    }
+
+    /* Direct-append: skip zzlInsert's walk-from-head. */
+    if (cache->direction == ZSET_BULK_FORWARD) {
+        zobj->ptr = zzlInsertAt(zl, NULL, ele, score);
+    } else {
+        unsigned char *first = lpSeek(zl, 0);
+        zobj->ptr = zzlInsertAt(zl, first, ele, score);
+    }
+    return 1;
+}
+
+/* --- Prebuilt-node tail-append (FORWARD only) ------------------------------
+ *
+ * Variant used by ZUNIONSTORE step 2 (sort-then-bulk-build): all nodes have
+ * already been allocated and registered in the destination dict by step 1
+ * (`zslCreateNode` + `dictSetKeyAtLink`); step 2 just needs to stitch them
+ * into the skiplist in (score, ele) order. The caller sorts the array of
+ * node pointers and then drives this helper sequentially — each call
+ * performs the same per-level pointer/span bookkeeping as zslTryAppendTail
+ * but skips node creation and dict insertion. */
+static void zslBulkAppendPrebuilt(zskiplist *zsl, zsetBulkInsertCache *cache,
+                                  zskiplistNode *node) {
+    if (!cache->initialized) {
+        for (int i = 0; i < ZSKIPLIST_MAXLEVEL; i++) {
+            cache->update[i] = zsl->header;
+            cache->rank[i] = 0;
+        }
+        cache->initialized = 1;
+    }
+    int level = zslGetNodeInfo(node)->levels;
+    unsigned long insert_rank = zsl->length;
+
+    if (level > zsl->level) {
+        for (int i = zsl->level; i < level; i++) {
+            cache->update[i] = zsl->header;
+            cache->rank[i] = 0;
+            zslSetNodeSpanAtLevel(zsl->header, i, zsl->length);
+        }
+        zsl->level = level;
+        zslGetNodeInfo(zsl->header)->levels = level;
+    }
+
+    zskiplistNode *prev_level0 = cache->update[0];
+    for (int i = 0; i < level; i++) {
+        node->level[i].forward = NULL;
+        cache->update[i]->level[i].forward = node;
+        zslSetNodeSpanAtLevel(node, i, 0);
+        zslSetNodeSpanAtLevel(cache->update[i], i,
+                              (insert_rank - cache->rank[i]) + 1);
+        cache->update[i] = node;
+        cache->rank[i] = insert_rank + 1;
+    }
+    for (int i = level; i < zsl->level; i++) {
+        zslIncrNodeSpanAtLevel(cache->update[i], i, 1);
+    }
+    node->backward = (prev_level0 == zsl->header) ? NULL : prev_level0;
+    zsl->tail = node;
+    zsl->length++;
+}
+
+/* qsort comparator for ZUNIONSTORE step 2 — orders node pointers by
+ * (score, ele) for the sort-then-bulk-build path. */
+static int zslNodePtrCmpForBulk(const void *a, const void *b) {
+    const zskiplistNode *na = *(zskiplistNode * const *)a;
+    const zskiplistNode *nb = *(zskiplistNode * const *)b;
+    if (na->score < nb->score) return -1;
+    if (na->score > nb->score) return 1;
+    return sdscmp(zslGetNodeElement(na), zslGetNodeElement(nb));
+}
+
+/* --- Top-level dispatch ---------------------------------------------------- */
+static int zsetTryBulkInsert(robj *zobj, zsetBulkInsertCache *cache,
+                             double score, sds ele) {
+    if (cache->disarmed) return 0;
+
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        return zzlTryBulkInsert(zobj, cache, score, ele);
+    }
+
+    /* Skiplist destination. */
+    zset *zs = zobj->ptr;
+    if (cache->direction == ZSET_BULK_FORWARD) {
+        return zslTryAppendTail(zs->zsl, zs->dict, cache, score, ele);
+    } else {
+        return zslTryPrependHead(zs->zsl, zs->dict, cache, score, ele);
+    }
 }
 
 static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
     const void *value, size_t value_length_in_bytes, double score)
 {
     sds ele = sdsnewlen(value, value_length_in_bytes);
-    if (zrangeStoreTryAppend(handler, score, ele)) {
+    if (zsetTryBulkInsert(handler->dstobj, &handler->bulk_cache, score, ele)) {
         sdsfree(ele);
         return;
     }
@@ -3449,7 +3746,7 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
     long long value, double score)
 {
     sds ele = sdsfromlonglong(value);
-    if (zrangeStoreTryAppend(handler, score, ele)) {
+    if (zsetTryBulkInsert(handler->dstobj, &handler->bulk_cache, score, ele)) {
         sdsfree(ele);
         return;
     }
@@ -4136,6 +4433,12 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
 
     if (opt_withscores || store) {
         zrangeResultHandlerScoreEmissionEnable(handler);
+    }
+    /* Tell the STORE result handler whether output is REV — it picks the
+     * bulk-insert direction (head-prepend for REV, tail-append otherwise)
+     * inside zrangeResultBeginStore. */
+    if (store) {
+        handler->bulk_reverse = (direction == ZRANGE_DIRECTION_REVERSE);
     }
 
     /* Step 3: Lookup the key and get the range. */
