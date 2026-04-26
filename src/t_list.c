@@ -169,6 +169,60 @@ void listTypePush(robj *subject, robj *value, int where) {
     }
 }
 
+/* Bulk push of N values onto a listpack-encoded list. Replaces the
+ * per-element lpAppend / lpPrepend loop in pushGenericCommand with a
+ * single lpBatchAppend (RPUSH) or lpBatchInsert at head (LPUSH), which
+ * does one realloc + one memmove instead of N. The caller has already
+ * decided that the destination stays listpack-encoded — this fast path
+ * is only entered after listTypeTryConversionAppend() runs.
+ *
+ * For LPUSH the listpack must end up in (vN, vN-1, ..., v1) order
+ * (each push moves the previously-pushed element back), matching the
+ * single-element loop's `lpPrepend(v1) ; lpPrepend(v2) ; ...` semantics.
+ * The argv slice is reversed in-place into the entry buffer before insert.
+ *
+ * Stack-allocates the entry buffer for small batches; falls back to
+ * zmalloc above LIST_BULK_PUSH_STACK_ENTRIES so 107-element bulkloads
+ * (the typical pattern) hit a single small heap alloc rather than N
+ * listpack reallocs. */
+#define LIST_BULK_PUSH_STACK_ENTRIES 32
+static void listTypeListpackPushBulk(robj *subject, robj **argv, int start, int count, int where) {
+    listpackEntry stack_entries[LIST_BULK_PUSH_STACK_ENTRIES];
+    listpackEntry *entries = stack_entries;
+    if (count > LIST_BULK_PUSH_STACK_ENTRIES) {
+        entries = zmalloc(sizeof(*entries) * count);
+    }
+
+    /* Build entries[]. For LPUSH, fill in reverse so the resulting
+     * listpack matches the per-element-loop output. */
+    for (int i = 0; i < count; i++) {
+        int src = (where == LIST_HEAD) ? (start + (count - 1 - i)) : (start + i);
+        robj *value = argv[src];
+        if (value->encoding == OBJ_ENCODING_INT) {
+            entries[i].sval = NULL;
+            entries[i].lval = (long)value->ptr;
+        } else {
+            entries[i].sval = value->ptr;
+            entries[i].slen = sdslen(value->ptr);
+        }
+    }
+
+    if (where == LIST_HEAD) {
+        unsigned char *first = lpFirst(subject->ptr);
+        if (first == NULL) {
+            /* Empty listpack: append == prepend. */
+            subject->ptr = lpBatchAppend(subject->ptr, entries, count);
+        } else {
+            subject->ptr = lpBatchInsert(subject->ptr, first, LP_BEFORE,
+                                         entries, count, NULL);
+        }
+    } else {
+        subject->ptr = lpBatchAppend(subject->ptr, entries, count);
+    }
+
+    if (entries != stack_entries) zfree(entries);
+}
+
 void *listPopSaver(unsigned char *data, size_t sz) {
     return createStringObject((char*)data,sz);
 }
@@ -502,9 +556,16 @@ void pushGenericCommand(client *c, int where, int xx) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(lobj);
     listTypeTryConversionAppend(lobj,c->argv,2,c->argc-1,NULL,NULL);
-    for (j = 2; j < c->argc; j++) {
-        listTypePush(lobj,c->argv[j],where);
-        server.dirty++;
+    int nvalues = c->argc - 2;
+    if (nvalues > 1 && lobj->encoding == OBJ_ENCODING_LISTPACK) {
+        /* Listpack-only bulk fast path: single realloc + memmove. */
+        listTypeListpackPushBulk(lobj, c->argv, 2, nvalues, where);
+        server.dirty += nvalues;
+    } else {
+        for (j = 2; j < c->argc; j++) {
+            listTypePush(lobj,c->argv[j],where);
+            server.dirty++;
+        }
     }
 
     llen = listTypeLength(lobj);
