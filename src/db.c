@@ -1896,10 +1896,9 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     vec keys;
     void *keys_stack[256];
     vecInit(&keys, keys_stack, 256);
-    /* When COUNT exceeds the stack buffer, pre-size the heap buffer to avoid
-     * the grow-by-doubling path during scanCallback. */
-    if ((size_t)count > sizeof(keys_stack) / sizeof(keys_stack[0]))
-        vecReserve(&keys, count);
+    /* Cap pre-allocation so a huge user-supplied COUNT can't drive a DoS
+     * allocation. */
+    vecReserve(&keys, count < 4096 ? (size_t)count : 4096);
     /* Hash on dict only has pointers to dict entries; other paths allocate
      * temporary sds that must be released. */
     if (o && (!ht || o->type == OBJ_ZSET))
