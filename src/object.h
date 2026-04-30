@@ -119,7 +119,28 @@ typedef struct redisObject kvobj;
 kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits);
 kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits);
 kvobj *kvobjSetExpire(kvobj *kv, long long expire);
-sds kvobjGetKey(const kvobj *kv);
+
+/* Inlined: read the embedded sds key out of a kvobj.
+ *
+ * Hot path: called on every key-by-name dict lookup via dbDictType's
+ * keyFromStoredKey callback (kvGetKey in server.c). The previous
+ * out-of-line definition in object.c could not be inlined across the
+ * translation-unit boundary, leaving ~6% of total CPU spent on the
+ * function-call frame itself in MGET-heavy workloads. Promoting the
+ * body to a static inline lets every caller fold this to a single
+ * offset calculation + one byte read.
+ *
+ * Layout (matches the kvobj header comment above):
+ *   [serverObject] [u8 hdr_size] [hdr bytes] [sds key ...] ...
+ *   ^-- kv         ^-- (kv+1)                ^-- return value
+ */
+static inline sds kvobjGetKey(const kvobj *kv) {
+    unsigned char *data = (void *)(kv + 1);
+    uint8_t hdr_size = *(uint8_t *)data;
+    data += 1 + hdr_size;
+    return (sds)data;
+}
+
 long long kvobjGetExpire(const kvobj *val);
 uint64_t *kvobjMetaRef(kvobj *kv, int metaId);
 

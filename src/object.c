@@ -242,13 +242,8 @@ robj *createEmbeddedStringObject(const char *val_ptr, size_t val_len) {
     return o;
 }
 
-sds kvobjGetKey(const kvobj *kv) {
-    unsigned char *data = (void *)(kv + 1);
-    debugServerAssert(kv->iskvobj);
-    uint8_t hdr_size = *(uint8_t *)data;
-    data += 1 + hdr_size;
-    return (sds)data;
-}
+/* kvobjGetKey moved to a static inline in object.h so callers can fold
+ * it to a single offset calculation. */
 
 long long kvobjGetExpire(const kvobj *kv) {
     if (kv->metabits & KEY_META_MASK_EXPIRE) {
