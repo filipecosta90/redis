@@ -1230,6 +1230,165 @@ unsigned long bitopCommandAVX512(unsigned char **keys, unsigned char *res,
 }
 #endif /* HAVE_AVX512 */
 
+#ifdef HAVE_AARCH64_NEON
+/* Compute the given bitop operation using AArch64 NEON intrinsics.
+ * Mirrors bitopCommandAVX with 16-byte (uint8x16_t) vectors. Returns how
+ * many bytes were successfully processed; the tail (bytes past the last
+ * 16-byte boundary) is handled by the scalar loop in bitopCommand. */
+unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
+                               unsigned long op, unsigned long numkeys,
+                               unsigned long minlen)
+{
+    const unsigned long step = sizeof(uint8x16_t); /* 16 bytes */
+
+    unsigned long i;
+    unsigned long processed = 0;
+    unsigned char *res_start = res;
+    unsigned char *fst_key = keys[0];
+
+    if (minlen < step) {
+        return 0;
+    }
+
+    const uint8x16_t zero128 = vdupq_n_u8(0);
+
+    switch (op) {
+    case BITOP_AND:
+        while (minlen >= step) {
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = vandq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    /* Same convention as bitopCommandAVX: for DIFF / DIFF1 / ANDOR we first
+     * compute the OR of all source keys EXCEPT the first one into lres, and
+     * then mix in the first key in the post-loop fix-up below. OR shares
+     * the loop body with them but seeds lres from keys[0] up front. */
+    case BITOP_DIFF:
+    case BITOP_DIFF1:
+    case BITOP_ANDOR:
+    case BITOP_OR:
+        while (minlen >= step) {
+            uint8x16_t lres = (op == BITOP_OR) ?
+                vld1q_u8(keys[0] + processed) :
+                zero128;
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = vorrq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_XOR:
+        while (minlen >= step) {
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = veorq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_NOT:
+        while (minlen >= step) {
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+            lres = vmvnq_u8(lres);
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_ONE:
+        while (minlen >= step) {
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+            uint8x16_t common_bits = zero128;
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                uint8x16_t common = vandq_u8(lres, lkey);
+                common_bits = vorrq_u8(common_bits, common);
+
+                lres = veorq_u8(lres, lkey);
+            }
+            /* lres &= ~common_bits */
+            lres = vbicq_u8(lres, common_bits);
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    default:
+        break;
+    }
+
+    /* Post-loop fix-up: combine the first key into the result for the
+     * three operations whose definition references it explicitly. */
+    res = res_start;
+    switch (op) {
+    case BITOP_DIFF:
+        /* lres = fst_key & ~lres */
+        for (i = 0; i < processed; i += step) {
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vbicq_u8(fkey, lres);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    case BITOP_DIFF1:
+        /* lres = lres & ~fst_key */
+        for (i = 0; i < processed; i += step) {
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vbicq_u8(lres, fkey);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    case BITOP_ANDOR:
+        /* lres = fst_key & lres */
+        for (i = 0; i < processed; i += step) {
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vandq_u8(fkey, lres);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    default:
+        break;
+    }
+
+    return processed;
+}
+#endif /* HAVE_AARCH64_NEON */
+
 /* BITOP op_name target_key src_key1 src_key2 src_key3 ... src_keyN */
 REDIS_NO_SANITIZE("alignment")
 void bitopCommand(client *c) {
@@ -1337,6 +1496,17 @@ void bitopCommand(client *c) {
 #if defined(HAVE_AVX2)
         if (!useAVX && BITOP_USE_AVX2) {
             j = bitopCommandAVX(src, res, op, numkeys, minlen);
+
+            serverAssert(minlen >= j);
+            minlen -= j;
+
+            useAVX = 1;
+        }
+#endif
+
+#if defined(HAVE_AARCH64_NEON)
+        if (!useAVX) {
+            j = bitopCommandNEON(src, res, op, numkeys, minlen);
 
             serverAssert(minlen >= j);
             minlen -= j;
