@@ -1331,7 +1331,13 @@ void addReplyBulk(client *c, robj *obj) {
     addReplyBulkWithFlag(c, obj, 1);
 }
 
-/* Add a C buffer as bulk reply */
+/* Add a C buffer as bulk reply.
+ *
+ * `flatten` lets the compiler inline _addReplyLongLongBulk and the two
+ * _addReplyToBufferOrList calls so the redundant per-call branch chain
+ * (CLIENT flags, replica/push checks, list-length test, encoded-buffer
+ * branch) can be CSE'd across the three pieces of the same bulk reply. */
+__attribute__((flatten))
 void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     if (_prepareClientToWrite(c) != C_OK) return;
     _addReplyLongLongBulk(c, len);
