@@ -1338,7 +1338,11 @@ void addReplyBulk(client *c, robj *obj) {
  * 3 separate _addReplyToBufferOrList() calls (one per piece) and the per-call
  * branch chain each of those would re-run. Falls back to the original 3-call
  * path for the cases the fast path can't handle (reply-list non-empty,
- * encoded RESP3 buffer, replica/push/close-after-reply, or buffer overflow). */
+ * encoded RESP3 buffer, replica/push/close-after-reply, or buffer overflow).
+ *
+ * Note: callers that already produce a contiguous "$N\r\n<payload>\r\n"
+ * sequence (e.g. addReplyBulkSds with sufficient slack) could plug in here
+ * directly; explored as a follow-up. */
 void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     if (_prepareClientToWrite(c) != C_OK) return;
 
