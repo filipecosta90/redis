@@ -1331,9 +1331,52 @@ void addReplyBulk(client *c, robj *obj) {
     addReplyBulkWithFlag(c, obj, 1);
 }
 
-/* Add a C buffer as bulk reply */
+/* Add a C buffer as bulk reply.
+ *
+ * Fast path emits "$N\r\n<payload>\r\n" with a single contiguous write into
+ * the static client buffer when the common-case flags allow it, avoiding the
+ * 3 separate _addReplyToBufferOrList() calls (one per piece) and the per-call
+ * branch chain each of those would re-run. Falls back to the original 3-call
+ * path for the cases the fast path can't handle (reply-list non-empty,
+ * encoded RESP3 buffer, replica/push/close-after-reply, or buffer overflow). */
 void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     if (_prepareClientToWrite(c) != C_OK) return;
+
+    if (likely(listLength(c->reply) == 0) &&
+        likely(!c->buf_encoded) &&
+        likely(!(c->flags & (CLIENT_CLOSE_AFTER_REPLY | CLIENT_PUSHING))) &&
+        likely(!clientTypeIsSlave(c)))
+    {
+        const char *hdr;
+        size_t hdr_len;
+        char hdr_buf[24]; /* Enough for "$<INT64_MAX>\r\n". */
+        if (likely(len < OBJ_SHARED_BULKHDR_LEN)) {
+            hdr = shared.bulkhdr[len]->ptr;
+            hdr_len = OBJ_SHARED_HDR_STRLEN(len);
+        } else {
+            hdr_buf[0] = '$';
+            int n = ll2string(hdr_buf + 1, sizeof(hdr_buf) - 3, (long long)len);
+            hdr_buf[n + 1] = '\r';
+            hdr_buf[n + 2] = '\n';
+            hdr = hdr_buf;
+            hdr_len = (size_t)(n + 3);
+        }
+        const size_t total = hdr_len + len + 2;
+
+        if (likely(c->buf_usable_size - c->bufpos >= total)) {
+            char *dst = c->buf + c->bufpos;
+            memcpy(dst, hdr, hdr_len);
+            memcpy(dst + hdr_len, p, len);
+            dst[hdr_len + len    ] = '\r';
+            dst[hdr_len + len + 1] = '\n';
+            c->bufpos += total;
+            c->net_output_bytes_curr_cmd += total;
+            if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+            reqresSaveClientReplyOffset(c);
+            return;
+        }
+    }
+
     _addReplyLongLongBulk(c, len);
     _addReplyToBufferOrList(c, p, len);
     _addReplyToBufferOrList(c, "\r\n", 2);
