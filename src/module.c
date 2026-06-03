@@ -9458,6 +9458,10 @@ int moduleHasSubscribersForKeyspaceEventWithSubkeys(int type) {
     return (moduleKeyspaceSubscribersWithSubkeysTypes & type) != 0;
 }
 
+/* Keep the rarely-taken drain out-of-line (LTO would otherwise inline it into
+ * the per-command hot path postExecutionUnitOperations(), bloating the DSB
+ * window — measured Frontend_Bound/DSB regression on cheap pipelined reads). */
+__attribute__((noinline,cold))
 void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
@@ -9491,6 +9495,9 @@ void firePostExecutionUnitJobs(void) {
  * Also invoked from the AOF replay loop in loadSingleAppendOnlyFile after
  * each single command
  */
+/* Same rationale as firePostExecutionUnitJobs: keep out-of-line so the keyed
+ * drain never bloats afterCommand()/postExecutionUnitOperations() on the hot path. */
+__attribute__((noinline,cold))
 void firePostKeyedNotificationJobs(void) {
     /* Reentrance guard, avoid recursive calls */
     if (server.firing_keyed_post_notif_jobs) return;

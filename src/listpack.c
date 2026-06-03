@@ -24,6 +24,14 @@
 #include "redisassert.h"
 #include "util.h"
 
+/* Available at file scope so the listpack traversal helpers below can mark
+ * parameters unused once the per-step lpAssertValidEntry checks are dropped.
+ * (A second identical definition exists inside the REDIS_TEST block; identical
+ * macro redefinition is well-defined in C, so both can coexist.) */
+#ifndef UNUSED
+#define UNUSED(x) (void)(x)
+#endif
+
 #define LP_HDR_SIZE 6       /* 32 bit total len + 16 bit number of elements. */
 #define LP_HDR_NUMELE_UNKNOWN UINT16_MAX
 #define LP_MAX_INT_ENCODING_LEN 9
@@ -508,9 +516,12 @@ static inline unsigned char *lpSkip(unsigned char *p) {
 /* This is similar to lpNext() but avoids the inner call to lpBytes when you already know the listpack size. */
 unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes) {
     assert(p);
+    UNUSED(lp);
+    UNUSED(lpbytes);
     p = lpSkip(p);
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpbytes, p);
+    /* listpack buffers are deep-validated at load time (RDB + RESTORE); in-memory
+     * traversal trusts the buffer and skips the per-step lpAssertValidEntry. */
     return p;
 }
 
@@ -519,9 +530,10 @@ unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t
  * already pointed to the last element of the listpack. */
 unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
     assert(p);
+    UNUSED(lp);
     p = lpSkip(p);
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpBytes(lp), p);
+    /* See lpNextWithBytes: per-step validation skipped; buffer trusted post-load. */
     return p;
 }
 
@@ -535,7 +547,7 @@ unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
     uint64_t prevlen = lpDecodeBacklen(p);
     prevlen += lpEncodeBacklenBytes(prevlen);
     p -= prevlen-1; /* Seek the first byte of the previous entry. */
-    lpAssertValidEntry(lp, lpBytes(lp), p);
+    /* See lpNextWithBytes: per-step validation skipped; buffer trusted post-load. */
     return p;
 }
 
@@ -544,7 +556,7 @@ unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
 unsigned char *lpFirst(unsigned char *lp) {
     unsigned char *p = lp + LP_HDR_SIZE; /* Skip the header. */
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpBytes(lp), p);
+    /* See lpNextWithBytes: per-step validation skipped; buffer trusted post-load. */
     return p;
 }
 

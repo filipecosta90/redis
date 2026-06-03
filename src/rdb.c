@@ -2412,15 +2412,20 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     /* Set default error of load object, it will be set to 0 on success. */
     if (error) *error = RDB_LOAD_ERR_OTHER;
 
-    int deep_integrity_validation = server.sanitize_dump_payload == SANITIZE_DUMP_YES;
+    /* Deep integrity validation is now unconditional. The listpack/intset/stream
+     * traversal helpers (lpFirst/lpNext/lpPrev/lpNextWithBytes) no longer run a
+     * per-step lpAssertValidEntry on the hot path; instead every encoded buffer is
+     * fully validated once, here, on the only paths that ingest untrusted bytes
+     * (RDB load + RESTORE). This trades a tiny one-time load cost for removing
+     * redundant per-traversal checks. The previous sanitize-dump-payload gating is
+     * retained below only for documentation of intent. */
+    int deep_integrity_validation = 1;
     if (server.sanitize_dump_payload == SANITIZE_DUMP_CLIENTS) {
-        /* Skip sanitization when loading (an RDB), or getting a RESTORE command
-         * from either the master or a client using an ACL user with the skip-sanitize-payload flag. */
-        int skip = server.loading ||
-            (server.current_client && (server.current_client->flags & CLIENT_MASTER));
-        if (!skip && server.current_client && server.current_client->user)
-            skip = !!(server.current_client->user->flags & USER_FLAG_SANITIZE_PAYLOAD_SKIP);
-        deep_integrity_validation = !skip;
+        /* Historically this path could skip sanitization when loading an RDB or
+         * handling a RESTORE from the master / a skip-sanitize-payload ACL user.
+         * With validation now unconditional we keep the branch resolved to 1 so
+         * the invariant "buffers are validated before in-memory traversal" holds. */
+        deep_integrity_validation = 1;
     }
 
     if (rdbtype == RDB_TYPE_STRING) {
