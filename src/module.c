@@ -9418,6 +9418,11 @@ int moduleHasSubscribersForKeyspaceEventWithSubkeys(int type) {
     return (moduleKeyspaceSubscribersWithSubkeysTypes & type) != 0;
 }
 
+/* Rarely-taken drain (queue is empty on the common command path). Keep it
+ * out-of-line: LTO otherwise inlines the whole body into the per-command hot
+ * path postExecutionUnitOperations(), bloating the DSB/uop-cache window and
+ * taxing cheap pipelined reads. */
+__attribute__((noinline,cold))
 void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
