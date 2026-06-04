@@ -9490,6 +9490,7 @@ void firePostExecutionUnitJobs(void) {
  * Also invoked from the AOF replay loop in loadSingleAppendOnlyFile after
  * each single command
  */
+__attribute__((noinline,cold))
 void firePostKeyedNotificationJobs(void) {
     /* Reentrance guard, avoid recursive calls */
     if (server.firing_keyed_post_notif_jobs) return;
