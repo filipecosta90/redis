@@ -2062,17 +2062,6 @@ struct redisServer {
     int execution_nesting;      /* Execution nesting level.
                                  * e.g. call(), async module stuff (timers, events, etc.),
                                  * cron stuff (active expire, eviction) */
-    int firing_keyed_post_notif_jobs; /* Re-entrance guard while
-                                       * firePostKeyedNotificationJobs is draining. */
-    int has_pending_keyed_post_notif_jobs; /* Fast-path hint: non-zero when at
-                                       * least one keyed post-notification job
-                                       * is queued. Lets the hot command path
-                                       * skip the firePostKeyedNotificationJobs
-                                       * call entirely when nothing is pending. */
-    int in_keyspace_notification;     /* >0 while inside a moduleNotifyKeyspaceEvent
-                                       * dispatch. Defines the scope from which
-                                       * RM_AddPostNotificationJobForKey may be called;
-                                       * a counter so nested notifications nest cleanly. */
     rax *clients_index;         /* Active clients dictionary by client ID. */
     uint32_t paused_actions;   /* Bitmask of actions that are currently paused */
     list *postponed_clients;       /* List of postponed clients */
@@ -2587,6 +2576,18 @@ struct redisServer {
     /* Local environment */
     char *locale_collate;
     unsigned int dbg_assert_flags; /* Bitmask of debug assertions to run after each command */
+    /* Keyed post-notification jobs control flags. Kept at the struct TAIL on
+     * purpose: inserting them mid-struct shifts the offsets of all fields below,
+     * which ripples through LTO codegen and grows many hot per-command functions
+     * (DSB/uop-cache footprint regression). Placing them last leaves every other
+     * field offset unchanged. They are cold control flags with no locality need. */
+    int firing_keyed_post_notif_jobs; /* Re-entrance guard while
+                                       * firePostKeyedNotificationJobs is draining. */
+    int has_pending_keyed_post_notif_jobs; /* Fast-path hint: non-zero when at
+                                       * least one keyed post-notification job is queued. */
+    int in_keyspace_notification;     /* >0 while inside a moduleNotifyKeyspaceEvent
+                                       * dispatch; scope from which
+                                       * RM_AddPostNotificationJobForKey may be called. */
 };
 
 /* Debug assertion flags for server.dbg_assert_flags */
