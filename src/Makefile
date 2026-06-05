@@ -53,7 +53,7 @@ ifneq (,$(findstring FreeBSD,$(uname_S)))
 endif
 endif
 WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes
-OPT=$(OPTIMIZATION)
+OPT=$(OPTIMIZATION) -falign-functions=32
 
 SKIP_VEC_SETS?=no
 # Detect if the compiler supports C11 _Atomic.
