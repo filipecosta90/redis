@@ -3850,8 +3850,9 @@ void postExecutionUnitOperations(void) {
     if (server.execution_nesting)
         return;
 
-    if (server.has_pending_keyed_post_notif_jobs)
-        firePostKeyedNotificationJobs();
+    /* Keyed jobs are already drained in afterCommand() (before propagation),
+     * which runs on every call() boundary; this second check was redundant and
+     * added a branch to the per-command hot path. */
     firePostExecutionUnitJobs();
 
     /* If we are at the top-most call() and not inside a an active module
@@ -4254,7 +4255,7 @@ void rejectCommandFormat(client *c, const char *fmt, ...) {
 /* This is called after a command in call, we can do some maintenance job in it. */
 void afterCommand(client *c) {
     /* Fire keyed post-notification jobs first, before any propagation. */
-    if (server.has_pending_keyed_post_notif_jobs)
+    if (unlikely(server.has_pending_keyed_post_notif_jobs))
         firePostKeyedNotificationJobs();
 
     /* Should be done before trackingHandlePendingKeyInvalidations so that we
