@@ -3846,6 +3846,7 @@ static void propagatePendingCommands(void) {
  * currently with respect to replication and post jobs, but in the future there might
  * be other considerations. So we basically want the `postUnitOperations` to trigger
  * after the entire chain finished. */
+__attribute__((aligned(32)))
 void postExecutionUnitOperations(void) {
     if (server.execution_nesting)
         return;
@@ -4252,6 +4253,7 @@ void rejectCommandFormat(client *c, const char *fmt, ...) {
 }
 
 /* This is called after a command in call, we can do some maintenance job in it. */
+__attribute__((aligned(32)))
 void afterCommand(client *c) {
     /* Fire keyed post-notification jobs first, before any propagation. */
     if (server.has_pending_keyed_post_notif_jobs)
