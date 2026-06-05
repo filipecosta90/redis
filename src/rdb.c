@@ -2412,16 +2412,15 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     /* Set default error of load object, it will be set to 0 on success. */
     if (error) *error = RDB_LOAD_ERR_OTHER;
 
-    int deep_integrity_validation = server.sanitize_dump_payload == SANITIZE_DUMP_YES;
-    if (server.sanitize_dump_payload == SANITIZE_DUMP_CLIENTS) {
-        /* Skip sanitization when loading (an RDB), or getting a RESTORE command
-         * from either the master or a client using an ACL user with the skip-sanitize-payload flag. */
-        int skip = server.loading ||
-            (server.current_client && (server.current_client->flags & CLIENT_MASTER));
-        if (!skip && server.current_client && server.current_client->user)
-            skip = !!(server.current_client->user->flags & USER_FLAG_SANITIZE_PAYLOAD_SKIP);
-        deep_integrity_validation = !skip;
-    }
+    /* Listpack/intset/stream-listpack traversal helpers (lpFirst, lpNext, lpPrev,
+     * lpNextWithBytes) no longer re-validate per step on hot read paths. To preserve
+     * the integrity guarantee on payloads accepted from RDB load and RESTORE, deep
+     * validation is unconditional here regardless of the `sanitize-dump-payload`
+     * setting. The original skip-on-master / skip-on-flagged-user path is removed
+     * because the cost moved from per-traversal (every HGET/HGETALL/HSCAN call) to
+     * once-at-load, which is amortized over the lifetime of the object. */
+    int deep_integrity_validation = 1;
+    (void)server.sanitize_dump_payload;
 
     if (rdbtype == RDB_TYPE_STRING) {
         /* Read string value */

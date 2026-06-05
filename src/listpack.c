@@ -508,9 +508,10 @@ static inline unsigned char *lpSkip(unsigned char *p) {
 /* This is similar to lpNext() but avoids the inner call to lpBytes when you already know the listpack size. */
 unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes) {
     assert(p);
+    (void)lp;
+    (void)lpbytes;
     p = lpSkip(p);
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpbytes, p);
     return p;
 }
 
@@ -519,9 +520,9 @@ unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t
  * already pointed to the last element of the listpack. */
 unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
     assert(p);
+    (void)lp;
     p = lpSkip(p);
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpBytes(lp), p);
     return p;
 }
 
@@ -535,7 +536,6 @@ unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
     uint64_t prevlen = lpDecodeBacklen(p);
     prevlen += lpEncodeBacklenBytes(prevlen);
     p -= prevlen-1; /* Seek the first byte of the previous entry. */
-    lpAssertValidEntry(lp, lpBytes(lp), p);
     return p;
 }
 
@@ -544,7 +544,6 @@ unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
 unsigned char *lpFirst(unsigned char *lp) {
     unsigned char *p = lp + LP_HDR_SIZE; /* Skip the header. */
     if (p[0] == LP_EOF) return NULL;
-    lpAssertValidEntry(lp, lpBytes(lp), p);
     return p;
 }
 
