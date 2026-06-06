@@ -345,7 +345,7 @@ static int moduleKeyspaceSubscribersTypes = 0;
 static int moduleKeyspaceSubscribersWithSubkeysTypes = 0;
 
 /* The module post keyspace jobs list */
-static list *modulePostExecUnitJobs;
+list *modulePostExecUnitJobs;  /* extern: guarded at call site in postExecutionUnitOperations */
 
 /* Data structures related to the exported dictionary data structure. */
 typedef struct RedisModuleDict {
@@ -9418,6 +9418,7 @@ int moduleHasSubscribersForKeyspaceEventWithSubkeys(int type) {
     return (moduleKeyspaceSubscribersWithSubkeysTypes & type) != 0;
 }
 
+__attribute__((noinline,cold))
 void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent

@@ -3847,7 +3847,8 @@ void postExecutionUnitOperations(void) {
     if (server.execution_nesting)
         return;
 
-    firePostExecutionUnitJobs();
+    if (listLength(modulePostExecUnitJobs))
+        firePostExecutionUnitJobs();
 
     /* If we are at the top-most call() and not inside a an active module
      * context (e.g. within a module timer) we can propagate what we accumulated. */
