@@ -119,6 +119,12 @@ void kvsUpdateHistogram(keysizesHist kvstoreHist, uint32_t type, int64_t oldLen,
 }
 
 void updateKeysizesHist(redisDb *db, uint32_t type, int64_t oldLen, int64_t newLen) {
+    /* [issue #13659 reproduction — MEASUREMENT PATCH, DO NOT MERGE]
+     * Neutralize the INFO KEYSIZES histogram update on the write path to measure
+     * its throughput cost on MSET (10 keys → 10 updates/command). Mirrors the
+     * reporter's "delete the updateKeysizes* calls" root-cause confirmation,
+     * applied to the current histogram implementation. */
+    return;
     kvstoreMetadata *kvstoreMeta = kvstoreGetMetadata(db->keys);
     kvsUpdateHistogram(kvstoreMeta->keysizes_hist, type, oldLen, newLen);
 }
