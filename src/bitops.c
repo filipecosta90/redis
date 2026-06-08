@@ -1275,12 +1275,15 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
         return 0;
     }
 
-    /* Software prefetch only pays off once the streams spill out of cache; in
-     * the cache-resident regime the extra PRFM issue slots slow the tight loop
-     * (measurably so for the cheapest ops). Gate it on the total length, decided
-     * once up front, so small bitmaps keep the minimal loop body. 64 KiB is past
-     * L1 and approaching where the multi-stream working set pressures L2. */
-    const int do_prefetch = (minlen >= (64 * 1024));
+    /* Software prefetch only pays off when (a) the buffers are large enough to
+     * spill cache and (b) several source streams compete for the load/fill
+     * buffers — that multi-stream pressure is what outruns the hardware
+     * prefetcher on narrower-memory cores. In the cache-resident regime, or for
+     * the single-stream NOT, the extra PRFM issue slots just slow the tight loop
+     * (measurably so for the cheapest ops). Decide once up front so those cases
+     * keep the minimal loop body. 64 KiB is past L1 and approaching where the
+     * multi-stream working set pressures L2. */
+    const int do_prefetch = (minlen >= (64 * 1024)) && (numkeys > 1);
 
     const uint8x16_t zero128 = vdupq_n_u8(0);
 
