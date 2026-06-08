@@ -1275,12 +1275,19 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
         return 0;
     }
 
+    /* Software prefetch only pays off once the streams spill out of cache; in
+     * the cache-resident regime the extra PRFM issue slots slow the tight loop
+     * (measurably so for the cheapest ops). Gate it on the total length, decided
+     * once up front, so small bitmaps keep the minimal loop body. 64 KiB is past
+     * L1 and approaching where the multi-stream working set pressures L2. */
+    const int do_prefetch = (minlen >= (64 * 1024));
+
     const uint8x16_t zero128 = vdupq_n_u8(0);
 
     switch (op) {
     case BITOP_AND:
         while (minlen >= step) {
-            if ((processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
             uint8x16_t lres = vld1q_u8(keys[0] + processed);
 
             for (i = 1; i < numkeys; i++) {
@@ -1302,7 +1309,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
     case BITOP_ANDOR:
     case BITOP_OR:
         while (minlen >= step) {
-            if ((processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
             uint8x16_t lres = (op == BITOP_OR) ?
                 vld1q_u8(keys[0] + processed) :
                 zero128;
@@ -1319,7 +1326,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
         break;
     case BITOP_XOR:
         while (minlen >= step) {
-            if ((processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
             uint8x16_t lres = vld1q_u8(keys[0] + processed);
 
             for (i = 1; i < numkeys; i++) {
@@ -1334,7 +1341,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
         break;
     case BITOP_NOT:
         while (minlen >= step) {
-            if ((processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
             uint8x16_t lres = vld1q_u8(keys[0] + processed);
             lres = vmvnq_u8(lres);
             vst1q_u8(res, lres);
@@ -1345,7 +1352,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
         break;
     case BITOP_ONE:
         while (minlen >= step) {
-            if ((processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
             uint8x16_t lres = vld1q_u8(keys[0] + processed);
             uint8x16_t common_bits = zero128;
 
@@ -1375,7 +1382,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
     case BITOP_DIFF:
         /* lres = fst_key & ~lres */
         for (i = 0; i < processed; i += step) {
-            if ((i & 63UL) == 0) {
+            if (do_prefetch && (i & 63UL) == 0) {
                 __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
                 __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
             }
@@ -1392,7 +1399,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
     case BITOP_DIFF1:
         /* lres = lres & ~fst_key */
         for (i = 0; i < processed; i += step) {
-            if ((i & 63UL) == 0) {
+            if (do_prefetch && (i & 63UL) == 0) {
                 __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
                 __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
             }
@@ -1409,7 +1416,7 @@ static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
     case BITOP_ANDOR:
         /* lres = fst_key & lres */
         for (i = 0; i < processed; i += step) {
-            if ((i & 63UL) == 0) {
+            if (do_prefetch && (i & 63UL) == 0) {
                 __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
                 __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
             }
