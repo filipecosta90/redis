@@ -1232,10 +1232,16 @@ unsigned long bitopCommandAVX512(unsigned char **keys, unsigned char *res,
 
 #ifdef HAVE_AARCH64_NEON
 /* Compute the given bitop operation using AArch64 NEON intrinsics.
- * Mirrors bitopCommandAVX with 16-byte (uint8x16_t) vectors. Returns how
- * many bytes were successfully processed; the tail (bytes past the last
- * 16-byte boundary) is handled by the scalar loop in bitopCommand. */
-unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
+ * Mirrors bitopCommandAVX / bitopCommandAVX512 with 16-byte (uint8x16_t)
+ * vectors. Returns how many bytes were successfully processed; the tail
+ * (bytes past the last 16-byte boundary) is handled by the scalar loop in
+ * bitopCommand.
+ *
+ * KEEP IN SYNC WITH bitopCommandAVX / bitopCommandAVX512: the per-op
+ * algorithm (OR/ONE seeding, DIFF/DIFF1/ANDOR post-loop fix-ups) is identical;
+ * only the vector type and intrinsics differ. Any op added or bug fixed in one
+ * must be mirrored in the others. */
+static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
                                unsigned long op, unsigned long numkeys,
                                unsigned long minlen)
 {
@@ -1477,7 +1483,7 @@ void bitopCommand(client *c) {
         res = (unsigned char*) sdsnewlen(NULL,maxlen);
         unsigned char output, byte, disjunction, common_bits;
         unsigned long i;
-        int useAVX = 0;
+        int useSIMD = 0;
 
         /* Number of bytes processed from each source key */
         j = 0;
@@ -1489,29 +1495,34 @@ void bitopCommand(client *c) {
             serverAssert(minlen >= j);
             minlen -= j;
 
-            useAVX = 1;
+            useSIMD = 1;
         }
 #endif
 
 #if defined(HAVE_AVX2)
-        if (!useAVX && BITOP_USE_AVX2) {
+        if (!useSIMD && BITOP_USE_AVX2) {
             j = bitopCommandAVX(src, res, op, numkeys, minlen);
 
             serverAssert(minlen >= j);
             minlen -= j;
 
-            useAVX = 1;
+            useSIMD = 1;
         }
 #endif
 
 #if defined(HAVE_AARCH64_NEON)
-        if (!useAVX) {
+        /* NEON is mandatory baseline on every AArch64 CPU, so it is gated at
+         * compile time only (no __builtin_cpu_supports needed). Unlike the
+         * AVX-512 path it carries no size/key floor: 128-bit vectors have no
+         * frequency/spin-up penalty, so the only threshold is one vector width
+         * (minlen >= 16, checked inside bitopCommandNEON). */
+        if (!useSIMD) {
             j = bitopCommandNEON(src, res, op, numkeys, minlen);
 
             serverAssert(minlen >= j);
             minlen -= j;
 
-            useAVX = 1;
+            useSIMD = 1;
         }
 #endif
 
@@ -1521,7 +1532,7 @@ void bitopCommand(client *c) {
          * than the byte-by-byte loop below. On ARM we skip this since 
          * it would cause GCC to emit multiple-word load/store ops
          * not supported even on ARM >= v6. */
-        if (!useAVX && minlen >= sizeof(unsigned long)*4) {
+        if (!useSIMD && minlen >= sizeof(unsigned long)*4) {
 
             unsigned long **lp = (unsigned long**)src;
             unsigned long *lres = (unsigned long*) res;
