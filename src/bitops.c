@@ -1230,6 +1230,217 @@ unsigned long bitopCommandAVX512(unsigned char **keys, unsigned char *res,
 }
 #endif /* HAVE_AVX512 */
 
+#ifdef HAVE_AARCH64_NEON
+/* Compute the given bitop operation using AArch64 NEON intrinsics.
+ * Mirrors bitopCommandAVX / bitopCommandAVX512 with 16-byte (uint8x16_t)
+ * vectors. Returns how many bytes were successfully processed; the tail
+ * (bytes past the last 16-byte boundary) is handled by the scalar loop in
+ * bitopCommand.
+ *
+ * KEEP IN SYNC WITH bitopCommandAVX / bitopCommandAVX512: the per-op
+ * algorithm (OR/ONE seeding, DIFF/DIFF1/ANDOR post-loop fix-ups) is identical;
+ * only the vector type and intrinsics differ. Any op added or bug fixed in one
+ * must be mirrored in the others. */
+/* Software-prefetch distance (bytes) ahead of the vector currently being
+ * processed. The NEON loop streams numkeys source buffers plus the result in
+ * lock-step; on narrower-memory AArch64 cores (e.g. Neoverse-N1) those
+ * concurrent streams otherwise outrun the hardware prefetcher and starve the
+ * load/fill buffers, turning a large-bitmap BITOP into a memory-latency stall.
+ * Issuing a non-temporal prefetch one cache line group ahead of each stream
+ * hides that latency; PRFM is non-faulting so prefetching past the buffer end
+ * is safe. 512 B (8 cache lines) keeps several lines in flight per stream. */
+#define BITOP_NEON_PREFETCH_AHEAD 512
+
+static inline void bitopNEONPrefetch(unsigned char **keys, unsigned long numkeys,
+                                     unsigned char *res, unsigned long off)
+{
+    unsigned long i;
+    for (i = 0; i < numkeys; i++)
+        __builtin_prefetch(keys[i] + off + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
+    __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
+}
+
+static unsigned long bitopCommandNEON(unsigned char **keys, unsigned char *res,
+                               unsigned long op, unsigned long numkeys,
+                               unsigned long minlen)
+{
+    const unsigned long step = sizeof(uint8x16_t); /* 16 bytes */
+
+    unsigned long i;
+    unsigned long processed = 0;
+    unsigned char *res_start = res;
+    unsigned char *fst_key = keys[0];
+
+    if (minlen < step) {
+        return 0;
+    }
+
+    /* Software prefetch only pays off when (a) the buffers are large enough to
+     * spill cache and (b) several source streams compete for the load/fill
+     * buffers — that multi-stream pressure is what outruns the hardware
+     * prefetcher on narrower-memory cores. In the cache-resident regime, or for
+     * the single-stream NOT, the extra PRFM issue slots just slow the tight loop
+     * (measurably so for the cheapest ops). Decide once up front so those cases
+     * keep the minimal loop body. 64 KiB is past L1 and approaching where the
+     * multi-stream working set pressures L2. */
+    const int do_prefetch = (minlen >= (64 * 1024)) && (numkeys > 1);
+
+    const uint8x16_t zero128 = vdupq_n_u8(0);
+
+    switch (op) {
+    case BITOP_AND:
+        while (minlen >= step) {
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = vandq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    /* Same convention as bitopCommandAVX: for DIFF / DIFF1 / ANDOR we first
+     * compute the OR of all source keys EXCEPT the first one into lres, and
+     * then mix in the first key in the post-loop fix-up below. OR shares
+     * the loop body with them but seeds lres from keys[0] up front. */
+    case BITOP_DIFF:
+    case BITOP_DIFF1:
+    case BITOP_ANDOR:
+    case BITOP_OR:
+        while (minlen >= step) {
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            uint8x16_t lres = (op == BITOP_OR) ?
+                vld1q_u8(keys[0] + processed) :
+                zero128;
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = vorrq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_XOR:
+        while (minlen >= step) {
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                lres = veorq_u8(lres, lkey);
+            }
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_NOT:
+        while (minlen >= step) {
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+            lres = vmvnq_u8(lres);
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    case BITOP_ONE:
+        while (minlen >= step) {
+            if (do_prefetch && (processed & 63UL) == 0) bitopNEONPrefetch(keys, numkeys, res, processed);
+            uint8x16_t lres = vld1q_u8(keys[0] + processed);
+            uint8x16_t common_bits = zero128;
+
+            for (i = 1; i < numkeys; i++) {
+                uint8x16_t lkey = vld1q_u8(keys[i] + processed);
+                uint8x16_t common = vandq_u8(lres, lkey);
+                common_bits = vorrq_u8(common_bits, common);
+
+                lres = veorq_u8(lres, lkey);
+            }
+            /* lres &= ~common_bits */
+            lres = vbicq_u8(lres, common_bits);
+            vst1q_u8(res, lres);
+            res += step;
+            processed += step;
+            minlen -= step;
+        }
+        break;
+    default:
+        break;
+    }
+
+    /* Post-loop fix-up: combine the first key into the result for the
+     * three operations whose definition references it explicitly. */
+    res = res_start;
+    switch (op) {
+    case BITOP_DIFF:
+        /* lres = fst_key & ~lres */
+        for (i = 0; i < processed; i += step) {
+            if (do_prefetch && (i & 63UL) == 0) {
+                __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
+                __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
+            }
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vbicq_u8(fkey, lres);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    case BITOP_DIFF1:
+        /* lres = lres & ~fst_key */
+        for (i = 0; i < processed; i += step) {
+            if (do_prefetch && (i & 63UL) == 0) {
+                __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
+                __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
+            }
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vbicq_u8(lres, fkey);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    case BITOP_ANDOR:
+        /* lres = fst_key & lres */
+        for (i = 0; i < processed; i += step) {
+            if (do_prefetch && (i & 63UL) == 0) {
+                __builtin_prefetch(res + BITOP_NEON_PREFETCH_AHEAD, 1, 0);
+                __builtin_prefetch(fst_key + BITOP_NEON_PREFETCH_AHEAD, 0, 0);
+            }
+            uint8x16_t lres = vld1q_u8(res);
+            uint8x16_t fkey = vld1q_u8(fst_key);
+
+            lres = vandq_u8(fkey, lres);
+            vst1q_u8(res, lres);
+
+            res += step;
+            fst_key += step;
+        }
+        break;
+    default:
+        break;
+    }
+
+    return processed;
+}
+#endif /* HAVE_AARCH64_NEON */
+
 /* BITOP op_name target_key src_key1 src_key2 src_key3 ... src_keyN */
 REDIS_NO_SANITIZE("alignment")
 void bitopCommand(client *c) {
@@ -1318,7 +1529,7 @@ void bitopCommand(client *c) {
         res = (unsigned char*) sdsnewlen(NULL,maxlen);
         unsigned char output, byte, disjunction, common_bits;
         unsigned long i;
-        int useAVX = 0;
+        int useSIMD = 0;
 
         /* Number of bytes processed from each source key */
         j = 0;
@@ -1330,18 +1541,34 @@ void bitopCommand(client *c) {
             serverAssert(minlen >= j);
             minlen -= j;
 
-            useAVX = 1;
+            useSIMD = 1;
         }
 #endif
 
 #if defined(HAVE_AVX2)
-        if (!useAVX && BITOP_USE_AVX2) {
+        if (!useSIMD && BITOP_USE_AVX2) {
             j = bitopCommandAVX(src, res, op, numkeys, minlen);
 
             serverAssert(minlen >= j);
             minlen -= j;
 
-            useAVX = 1;
+            useSIMD = 1;
+        }
+#endif
+
+#if defined(HAVE_AARCH64_NEON)
+        /* NEON is mandatory baseline on every AArch64 CPU, so it is gated at
+         * compile time only (no __builtin_cpu_supports needed). Unlike the
+         * AVX-512 path it carries no size/key floor: 128-bit vectors have no
+         * frequency/spin-up penalty, so the only threshold is one vector width
+         * (minlen >= 16, checked inside bitopCommandNEON). */
+        if (!useSIMD) {
+            j = bitopCommandNEON(src, res, op, numkeys, minlen);
+
+            serverAssert(minlen >= j);
+            minlen -= j;
+
+            useSIMD = 1;
         }
 #endif
 
@@ -1351,7 +1578,7 @@ void bitopCommand(client *c) {
          * than the byte-by-byte loop below. On ARM we skip this since 
          * it would cause GCC to emit multiple-word load/store ops
          * not supported even on ARM >= v6. */
-        if (!useAVX && minlen >= sizeof(unsigned long)*4) {
+        if (!useSIMD && minlen >= sizeof(unsigned long)*4) {
 
             unsigned long **lp = (unsigned long**)src;
             unsigned long *lres = (unsigned long*) res;
