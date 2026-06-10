@@ -9418,7 +9418,7 @@ int moduleHasSubscribersForKeyspaceEventWithSubkeys(int type) {
     return (moduleKeyspaceSubscribersWithSubkeysTypes & type) != 0;
 }
 
-void firePostExecutionUnitJobs(void) {
+__attribute__((noinline,cold)) void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
      * recursive calls to firePostExecutionUnitJobs.
@@ -9441,6 +9441,7 @@ void firePostExecutionUnitJobs(void) {
         zfree(job);
     }
     exitExecutionUnit();
+    server.has_pending_post_unit_jobs = 0;
 }
 
 /* When running inside a key space notification callback, it is dangerous and highly discouraged to perform any write
@@ -9472,6 +9473,8 @@ int RM_AddPostNotificationJob(RedisModuleCtx *ctx, RedisModulePostNotificationJo
     job->dbid = ctx->client->db->id;
 
     listAddNodeTail(modulePostExecUnitJobs, job);
+    /* Arm the fast-path hint so the per-command epilogue knows a drain is due. */
+    server.has_pending_post_unit_jobs = 1;
     return REDISMODULE_OK;
 }
 

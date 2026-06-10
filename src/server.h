@@ -2578,6 +2578,13 @@ struct redisServer {
     /* Local environment */
     char *locale_collate;
     unsigned int dbg_assert_flags; /* Bitmask of debug assertions to run after each command */
+    int has_pending_post_unit_jobs; /* Fast-path hint: non-zero when at least one
+                                     * module post-notification job is queued. Lets the
+                                     * per-command epilogue skip firePostExecutionUnitJobs()
+                                     * (and its enter/exitExecutionUnit) entirely when the
+                                     * queue is empty (the common, no-module case).
+                                     * Placed at struct tail to avoid perturbing the cache
+                                     * layout of hot per-command fields. */
 };
 
 /* Debug assertion flags for server.dbg_assert_flags */
