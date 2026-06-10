@@ -394,11 +394,33 @@ static void zslDelete(zskiplist *zsl, zskiplistNode *node) {
  * Otherwise, unlinks the node, updates score, reinserts at correct position, and returns node.
  * Anyway, the node pointer stays the same (no dict update needed). */
 static void zslUpdateScore(zskiplist *zsl, zskiplistNode *node, double newscore) {
+    zskiplistNode *bw = node->backward;
+    zskiplistNode *fw = node->level[0].forward;
+
     /* Fast path: if the node, after the score update, would be still exactly
      * at the same position, we can just update the score without
      * actually removing and re-inserting the element in the skiplist. */
-    if ((node->backward == NULL || node->backward->score < newscore) &&
-        (node->level[0].forward == NULL || node->level[0].forward->score > newscore))
+    if ((bw == NULL || bw->score < newscore) &&
+        (fw == NULL || fw->score > newscore))
+    {
+        node->score = newscore;
+        return;
+    }
+
+    /* Equal-score widening: skiplist order is (score, ele) with the element
+     * acting as a stable lex tie-breaker, so when newscore equals an
+     * immediate neighbour's score we can still keep the in-place update as
+     * long as the (newscore, ele) pair preserves the relative ordering with
+     * that neighbour. The strict-inequality fast path above would otherwise
+     * push every ZADD-overwrite / ZINCRBY landing on a neighbour's score
+     * through O(log N) unlink+reinsert — common in leaderboards with
+     * saturated levels, counter-style ZINCRBY-by-1, score histograms, and
+     * deduped-event timestamps. */
+    sds ele = zslGetNodeElement(node);
+    if ((bw == NULL || bw->score < newscore ||
+         (bw->score == newscore && sdscmp(zslGetNodeElement(bw), ele) < 0)) &&
+        (fw == NULL || fw->score > newscore ||
+         (fw->score == newscore && sdscmp(zslGetNodeElement(fw), ele) > 0)))
     {
         node->score = newscore;
         return;
@@ -409,7 +431,6 @@ static void zslUpdateScore(zskiplist *zsl, zskiplistNode *node, double newscore)
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
     int i;
     double curscore = node->score;
-    sds ele = zslGetNodeElement(node);
 
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
