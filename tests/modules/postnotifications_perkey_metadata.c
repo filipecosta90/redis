@@ -251,7 +251,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     int notifyFlags = REDISMODULE_NOTIFY_GENERIC | REDISMODULE_NOTIFY_HASH |
                       REDISMODULE_NOTIFY_STRING | REDISMODULE_NOTIFY_EXPIRED |
-                      REDISMODULE_NOTIFY_EVICTED;
+                      REDISMODULE_NOTIFY_EVICTED | REDISMODULE_NOTIFY_SET;
     if (RedisModule_SubscribeToKeyspaceEvents(ctx, notifyFlags, NotifyCallback) != REDISMODULE_OK)
         return REDISMODULE_ERR;
 
