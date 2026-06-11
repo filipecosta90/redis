@@ -359,3 +359,32 @@ tags "modules external:skip" {
         }
     }
 }
+
+# Pointer-safety guard. The per-key job's RM_SetKeyMeta first-attach REALLOCATES
+# the key's kvobj. The job must therefore run only after the triggering command
+# has fully returned (the afterCommand / postExecutionUnitOperations drain) —
+# never from inside the command's own keyspace-notification dispatch, where the
+# command still holds a cached object pointer across its notify and would
+# dereference a freed kvobj. SMOVE is the sharp case: it caches `srcset`, fires
+# "srem", then derefs `srcset` again (setTypeSize / keyModified). This test pins
+# that the drain placement is safe; it crashes (heap-use-after-free under ASAN)
+# if the drain is ever moved into the notification dispatch.
+tags "modules external:skip" {
+    test "perkey-ptr-safety: SMOVE first metadata attach must not UAF the source set" {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            r pkmeta.reset
+            r sadd s a b
+            r sadd d z
+            # Reload from RDB so members survive but module metadata is dropped
+            # (not persisted, no KSN on RDB load) — makes the next write to 's'
+            # a FIRST metadata attach, i.e. the reallocating path.
+            r debug reload
+            r pkmeta.reset
+            assert_equal {} [r pkmeta.getmeta s]
+            r smove s d a
+            assert_equal {b} [lsort [r smembers s]]
+            assert_equal {a z} [lsort [r smembers d]]
+            assert_equal PONG [r ping]   ;# server alive: drain ran post-command
+        }
+    } {} {needs:debug}
+}
