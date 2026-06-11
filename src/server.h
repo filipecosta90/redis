@@ -2062,17 +2062,6 @@ struct redisServer {
     int execution_nesting;      /* Execution nesting level.
                                  * e.g. call(), async module stuff (timers, events, etc.),
                                  * cron stuff (active expire, eviction) */
-    uint8_t firing_keyed_post_notif_jobs; /* Re-entrance guard while
-                                       * firePostKeyedNotificationJobs is draining. */
-    uint8_t has_pending_keyed_post_notif_jobs; /* Fast-path hint: non-zero when at
-                                       * least one keyed post-notification job
-                                       * is queued. Lets the hot command path
-                                       * skip the firePostKeyedNotificationJobs
-                                       * call entirely when nothing is pending. */
-    uint8_t in_keyspace_notification;     /* >0 while inside a moduleNotifyKeyspaceEvent
-                                       * dispatch. Defines the scope from which
-                                       * RM_AddPostNotificationJobForKey may be called;
-                                       * a counter so nested notifications nest cleanly. */
     rax *clients_index;         /* Active clients dictionary by client ID. */
     uint32_t paused_actions;   /* Bitmask of actions that are currently paused */
     list *postponed_clients;       /* List of postponed clients */
@@ -2587,6 +2576,16 @@ struct redisServer {
     /* Local environment */
     char *locale_collate;
     unsigned int dbg_assert_flags; /* Bitmask of debug assertions to run after each command */
+    /* Module per-key post-notification state. Kept at the struct tail (cold)
+     * so it does not perturb the cache layout of hot per-command fields. */
+    uint8_t firing_keyed_post_notif_jobs; /* Re-entrance guard while
+                                       * firePostKeyedNotificationJobs is draining. */
+    uint8_t in_keyspace_notification;     /* >0 while inside a moduleNotifyKeyspaceEvent
+                                       * dispatch. Defines the scope from which
+                                       * RM_AddPostNotificationJobForKey may be called,
+                                       * and the point at which queued keyed jobs drain
+                                       * (at the outermost dispatch). A counter so nested
+                                       * notifications nest cleanly. */
 };
 
 /* Debug assertion flags for server.dbg_assert_flags */

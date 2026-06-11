@@ -9514,7 +9514,6 @@ __attribute__((noinline,cold)) void firePostKeyedNotificationJobs(void) {
     }
     exitExecutionUnit();
     server.firing_keyed_post_notif_jobs = 0;
-    server.has_pending_keyed_post_notif_jobs = 0;
 }
 
 /* When running inside a key space notification callback, it is dangerous and highly discouraged to perform any write
@@ -9617,8 +9616,6 @@ int RM_AddPostNotificationJobForKey(RedisModuleCtx *ctx, RedisModulePostNotifyJo
     job->free_pd = free_privdata;
     job->dbid = ctx->client->db->id;
     listAddNodeTail(modulePostKeyedNotificationJobs, job);
-    /* Arm the fast-path hint so the hot command path knows a drain is due. */
-    server.has_pending_keyed_post_notif_jobs = 1;
     return REDISMODULE_OK;
 }
 
@@ -9733,6 +9730,17 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid,
 
     server.in_keyspace_notification--;
     exitExecutionUnit();
+
+    /* Every keyed post-notification job is registered from inside this dispatch
+     * (RM_AddPostNotificationJobForKey requires in_keyspace_notification > 0),
+     * so this is the single chokepoint at which to drain them: after the
+     * sub-command's notification, before the next sub-command, at ZERO
+     * per-command hot-path cost (pure reads never reach this function). Drain
+     * only at the outermost dispatch so nested notifications still fire their
+     * jobs in submission order. The firing_keyed_post_notif_jobs re-entrance
+     * guard inside the drain makes a callback-triggered notification safe. */
+    if (server.in_keyspace_notification == 0)
+        firePostKeyedNotificationJobs();
 }
 
 /* Unsubscribe any notification subscribers this module has upon unloading */
