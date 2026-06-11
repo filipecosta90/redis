@@ -320,3 +320,42 @@ tags "modules external:skip" {
         }
     }
 }
+
+# Expiry / eviction: the keyed job must fire when a key disappears, which is the
+# real metadata-cleanup use case. The drain now runs at the keyspace-notification
+# tail, so for lazy expire that point is INSIDE the read command's key lookup —
+# these tests pin that path. The job sees an already-removed key, so it records
+# via pkmeta.empty_firecount / pkmeta.empty_firelog rather than attaching metadata.
+tags "modules external:skip" {
+    test "perkey-expire: lazy expire on read fires the per-key job (drain mid-read)" {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            # Disable active expire so the key is reaped by the READ, not by cron.
+            r debug set-active-expire 0
+            r set ek v px 10
+            r pkmeta.reset                        ;# clear the live-key SET firing(s)
+            after 20                              ;# key is now logically expired
+            # The GET triggers lazy expire + the "expired" KSN; the per-key job
+            # fires from inside the read's lookup and sees an empty key.
+            assert_equal {} [r get ek]
+            assert_equal 1 [r pkmeta.empty_firecount]
+            assert_equal {ek} [r pkmeta.empty_firelog]
+            r debug set-active-expire 1
+        }
+    }
+
+    test "perkey-expire: active expire (cron) fires the per-key job without a read" {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            r debug set-active-expire 1
+            r set ak v px 50
+            r pkmeta.reset
+            # Never touch ak — let the active-expire cycle reap it. The poll loop
+            # only issues pkmeta.empty_firecount, which does not access ak.
+            wait_for_condition 50 20 {
+                [r pkmeta.empty_firecount] == 1
+            } else {
+                fail "active expire did not fire the per-key job for ak"
+            }
+            assert_equal {ak} [r pkmeta.empty_firelog]
+        }
+    }
+}
