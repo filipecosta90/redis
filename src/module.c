@@ -363,6 +363,13 @@ static list *modulePostKeyedNotificationJobs;
 
 static int keyedPostNotifRMCallWarned = 0;
 
+/* Cold per-key post-notification state, kept out of struct redisServer so the
+ * struct stays byte-identical to unstable and the per-command epilogue carries
+ * only the single has_pending byte. Both are touched only on cold paths here:
+ * the drain re-entrance guard and the keyspace-notification dispatch depth. */
+static int firing_keyed_post_notif_jobs = 0;
+static int in_keyspace_notification = 0;
+
 /* Data structures related to the exported dictionary data structure. */
 typedef struct RedisModuleDict {
     rax *rax;                       /* The radix tree. */
@@ -6920,7 +6927,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     /* Enforce the per-key post-notification contract: a per-key callback
      * (registered via RM_AddPostNotificationJobForKey) MUST NOT issue
      * commands. */
-    if (server.firing_keyed_post_notif_jobs) {
+    if (firing_keyed_post_notif_jobs) {
         /* Calling a command from within a per-key post-notification callback is
          * a misuse of the API. */
         if (!keyedPostNotifRMCallWarned) {
@@ -9492,8 +9499,8 @@ void firePostExecutionUnitJobs(void) {
  */
 __attribute__((noinline,cold)) void firePostKeyedNotificationJobs(void) {
     /* Reentrance guard, avoid recursive calls */
-    if (server.firing_keyed_post_notif_jobs) return;
-    server.firing_keyed_post_notif_jobs = 1;
+    if (firing_keyed_post_notif_jobs) return;
+    firing_keyed_post_notif_jobs = 1;
     keyedPostNotifRMCallWarned = 0;
     enterExecutionUnit(0, 0);
     while (listLength(modulePostKeyedNotificationJobs) > 0) {
@@ -9513,7 +9520,7 @@ __attribute__((noinline,cold)) void firePostKeyedNotificationJobs(void) {
         zfree(job);
     }
     exitExecutionUnit();
-    server.firing_keyed_post_notif_jobs = 0;
+    firing_keyed_post_notif_jobs = 0;
     server.has_pending_keyed_post_notif_jobs = 0;
 }
 
@@ -9591,7 +9598,7 @@ int RM_AddPostNotificationJobForKey(RedisModuleCtx *ctx, RedisModulePostNotifyJo
 
     /* The API is only meaningful from inside a keyspace-notification handler:
      * that is the single-key context the per-key contract is scoped to. */
-    if (!server.in_keyspace_notification) {
+    if (!in_keyspace_notification) {
         serverLog(LL_WARNING,
             "API misuse detected in module %s: "
             "RedisModule_AddPostNotificationJobForKey called outside a "
@@ -9682,7 +9689,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid,
     enterExecutionUnit(0, 0);
 
     /* Mark that we are inside a keyspace-notification dispatch. */
-    server.in_keyspace_notification++;
+    in_keyspace_notification++;
 
     listIter li;
     listNode *ln;
@@ -9731,7 +9738,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid,
         }
     }
 
-    server.in_keyspace_notification--;
+    in_keyspace_notification--;
     exitExecutionUnit();
 }
 

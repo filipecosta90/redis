@@ -2972,9 +2972,7 @@ void initServer(void) {
     server.errors = raxNew();
     server.errors_enabled = 1;
     server.execution_nesting = 0;
-    server.firing_keyed_post_notif_jobs = 0;
     server.has_pending_keyed_post_notif_jobs = 0;
-    server.in_keyspace_notification = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
@@ -4253,8 +4251,14 @@ void rejectCommandFormat(client *c, const char *fmt, ...) {
 
 /* This is called after a command in call, we can do some maintenance job in it. */
 void afterCommand(client *c) {
-    /* Fire keyed post-notification jobs first, before any propagation. */
-    if (server.has_pending_keyed_post_notif_jobs)
+    /* Top-level keyed-job draining is owned by postExecutionUnitOperations()
+     * below: it runs at execution_nesting==0 and fires keyed jobs before
+     * propagation. Only the NESTED sub-command case (MULTI/EXEC, RM_Call) needs
+     * the per-sub-command keyed drain here, because postExecutionUnitOperations()
+     * early-returns while nested. Gating on execution_nesting folds this behind
+     * the nesting test the epilogue already performs, so a top-level pure read
+     * does not even load the has_pending byte here. */
+    if (server.execution_nesting && server.has_pending_keyed_post_notif_jobs)
         firePostKeyedNotificationJobs();
 
     /* Should be done before trackingHandlePendingKeyInvalidations so that we

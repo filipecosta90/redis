@@ -2062,17 +2062,16 @@ struct redisServer {
     int execution_nesting;      /* Execution nesting level.
                                  * e.g. call(), async module stuff (timers, events, etc.),
                                  * cron stuff (active expire, eviction) */
-    uint8_t firing_keyed_post_notif_jobs; /* Re-entrance guard while
-                                       * firePostKeyedNotificationJobs is draining. */
     uint8_t has_pending_keyed_post_notif_jobs; /* Fast-path hint: non-zero when at
-                                       * least one keyed post-notification job
-                                       * is queued. Lets the hot command path
-                                       * skip the firePostKeyedNotificationJobs
-                                       * call entirely when nothing is pending. */
-    uint8_t in_keyspace_notification;     /* >0 while inside a moduleNotifyKeyspaceEvent
-                                       * dispatch. Defines the scope from which
-                                       * RM_AddPostNotificationJobForKey may be called;
-                                       * a counter so nested notifications nest cleanly. */
+                                       * least one keyed post-notification job is
+                                       * queued. Lives in execution_nesting's 4-byte
+                                       * alignment hole, so clients_index (and every
+                                       * field below) keeps its exact offset and
+                                       * struct redisServer does not grow vs unstable.
+                                       * The cold re-entrance guard and KSN-dispatch
+                                       * counter are module.c file-scope statics, not
+                                       * here — keep this byte the only per-command
+                                       * state so the hot epilogue stays compact. */
     rax *clients_index;         /* Active clients dictionary by client ID. */
     uint32_t paused_actions;   /* Bitmask of actions that are currently paused */
     list *postponed_clients;       /* List of postponed clients */
