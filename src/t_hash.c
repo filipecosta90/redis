@@ -2144,6 +2144,93 @@ void hsetnxCommand(client *c) {
     server.dirty++;
 }
 
+/* Fast path for a multi-field HSET/HMSET into a plain listpack-encoded hash.
+ *
+ * The per-field hashTypeSet() loop is O(n^2) for a wide HSET: each field runs a
+ * full lpFind() over the listpack, which grows as earlier fields of the same
+ * command are appended. Here we DEFER every new-field append to a single
+ * lpBatchAppend() after the lookup loop, so each lpFind() only ever scans the
+ * pre-command entries (zero scanning for a fresh/empty hash -> O(n) build).
+ *
+ * In-command duplicate new fields are resolved last-wins via a small
+ * open-addressing set over the pending pairs. This is exact: lpStringToInt64()
+ * is strictly canonical, so two byte-distinct field names are always distinct
+ * listpack fields -> raw-byte equality == field equality.
+ *
+ * Only plain OBJ_ENCODING_LISTPACK is handled (LISTPACK_EX/HT fall back to the
+ * per-field loop). Returns 1 and sets *pcreated when handled. */
+#define HSET_LP_BATCH_MAX 512
+static int hashTypeSetListpackBatch(redisDb *db, kvobj *o, robj **argv,
+                                    int numfields, int *pcreated)
+{
+    unsigned char *zl = o->ptr;
+    listpackEntry pending[2 * HSET_LP_BATCH_MAX]; /* deferred new (field,value) */
+    uint64_t seen[2 * HSET_LP_BATCH_MAX];         /* hash of a pending field; 0 = empty */
+    uint16_t sidx[2 * HSET_LP_BATCH_MAX];         /* slot -> pending pair index */
+    int tabsize = 8;
+    while (tabsize < numfields * 2) tabsize <<= 1;
+    unsigned mask = tabsize - 1;
+    memset(seen, 0, tabsize * sizeof(uint64_t));
+    int np = 0, created = 0;
+
+    for (int j = 0; j < numfields; j++) {
+        sds field = argv[j*2]->ptr, value = argv[j*2+1]->ptr;
+
+        /* Existence check against the original entries only: appends are
+         * deferred, so the listpack does not grow during this loop. */
+        unsigned char *fptr = lpFirst(zl);
+        if (fptr) fptr = lpFind(zl, fptr, (unsigned char*)field, sdslen(field), 1);
+        if (fptr) {
+            unsigned char *vptr = lpNext(zl, fptr);
+            serverAssert(vptr != NULL);
+            zl = lpReplace(zl, &vptr, (unsigned char*)value, sdslen(value)); /* in place, count unchanged */
+            continue;
+        }
+
+        /* New field: dedup against earlier pending new fields (last value wins).
+         * Hashing only happens for misses, so all-update HSET pays nothing. */
+        uint64_t h = dictGenHashFunction(field, sdslen(field));
+        if (h == 0) h = 1;                       /* reserve 0 as the empty marker */
+        unsigned slot = h & mask;
+        int dup = 0;
+        while (seen[slot]) {
+            if (seen[slot] == h) {
+                int pi = sidx[slot];
+                if (pending[pi*2].slen == sdslen(field) &&
+                    memcmp(pending[pi*2].sval, field, sdslen(field)) == 0)
+                {
+                    pending[pi*2+1].sval = (unsigned char*)value;
+                    pending[pi*2+1].slen = sdslen(value);
+                    dup = 1;
+                    break;
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (dup) continue;
+
+        seen[slot] = h;
+        sidx[slot] = np;
+        pending[np*2].sval   = (unsigned char*)field;
+        pending[np*2].slen   = sdslen(field);
+        pending[np*2+1].sval = (unsigned char*)value;
+        pending[np*2+1].slen = sdslen(value);
+        np++;
+        created++;
+    }
+
+    if (np) zl = lpBatchAppend(zl, pending, (unsigned long)np * 2); /* one realloc; skip if none */
+    o->ptr = zl;
+
+    /* hashTypeTryConversion() only counts the NEW fields, so existing+new can
+     * cross hash-max-listpack-entries; convert once here (mirrors hashTypeSet). */
+    if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+        hashTypeConvert(db, o, OBJ_ENCODING_HT);
+
+    *pcreated = created;
+    return 1;
+}
+
 void hsetCommand(client *c) {
     int i, created = 0;
     size_t oldsize = 0;
@@ -2160,8 +2247,14 @@ void hsetCommand(client *c) {
         oldsize = kvobjAllocSize(kv);
     hashTypeTryConversion(c->db, kv, c->argv, 2, c->argc-1);
 
-    for (i = 2; i < c->argc; i += 2)
-        created += !hashTypeSet(c->db, kv, c->argv[i]->ptr, c->argv[i+1]->ptr, HASH_SET_COPY);
+    int numfields = (c->argc - 2) / 2;
+    if (!(kv->encoding == OBJ_ENCODING_LISTPACK && numfields > 1 &&
+          numfields <= HSET_LP_BATCH_MAX &&
+          hashTypeSetListpackBatch(c->db, kv, c->argv + 2, numfields, &created)))
+    {
+        for (i = 2; i < c->argc; i += 2)
+            created += !hashTypeSet(c->db, kv, c->argv[i]->ptr, c->argv[i+1]->ptr, HASH_SET_COPY);
+    }
 
     /* HMSET (deprecated) and HSET return value is different. */
     char *cmdname = c->argv[0]->ptr;
@@ -2179,7 +2272,6 @@ void hsetCommand(client *c) {
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
 
     /* Collect field pointers for subkey notification. Fields are at argv[2,4,6...]. */
-    int numfields = (c->argc - 2) / 2;
     fieldvec fvset;
     vec *vset = fieldvecInit(&fvset, numfields);
     for (i = 0; i < numfields; i++) {
