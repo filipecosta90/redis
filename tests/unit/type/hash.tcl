@@ -357,6 +357,23 @@ start_server {tags {"hash"}} {
         assert_equal w31 [r hget freshhmset g31]
     }
 
+    test {HSET fresh build with all-duplicate fields -> single field, last-wins} {
+        r del freshalldup
+        assert_equal 1 [r hset freshalldup f a f b f c]
+        assert_equal 1 [r hlen freshalldup]
+        assert_equal c [r hget freshalldup f]
+    }
+
+    test {HSET fresh build with an over-limit value converts to hashtable} {
+        r config set hash-max-listpack-value 64
+        r del freshbigval
+        set big [string repeat x 100]
+        assert_equal 2 [r hset freshbigval f1 v1 f2 $big]
+        assert_encoding hashtable freshbigval
+        assert_equal $big [r hget freshbigval f2]
+        r config set hash-max-listpack-value 64
+    }
+
     test {HSETNX target key missing - small hash} {
         r hsetnx smallhash __123123123__ foo
         r hget smallhash __123123123__

@@ -2166,14 +2166,18 @@ void hsetnxCommand(client *c) {
  * run for this command -- so every value fits hash-max-listpack-value, the total
  * is lpSafeToAdd(), and numfields <= hash-max-listpack-entries (else the object
  * would already be a hashtable and we would not be here). Hence no per-field
- * length check and no post-build conversion are needed. Returns fields created. */
-#define HSET_LP_BATCH_MAX 512
+ * length check and no post-build conversion are needed. Returns fields created.
+ *
+ * HSET_LP_BATCH_MAX bounds the stack working set (3 arrays of 2*MAX entries,
+ * ~8.5 KB at 128); a fresh HSET with more fields than this (only reachable with
+ * a raised hash-max-listpack-entries) simply takes the per-field path. */
+#define HSET_LP_BATCH_MAX 128
 static int hashTypeBuildFreshListpack(kvobj *o, robj **argv, int numfields) {
     serverAssert(o->encoding == OBJ_ENCODING_LISTPACK && lpLength(o->ptr) == 0 &&
                  numfields >= 2 && numfields <= HSET_LP_BATCH_MAX);
     listpackEntry pending[2 * HSET_LP_BATCH_MAX]; /* unique (field,value) pairs */
     uint64_t seen[2 * HSET_LP_BATCH_MAX];         /* hash of a pending field; 0 = empty slot */
-    uint16_t sidx[2 * HSET_LP_BATCH_MAX];         /* slot -> pending pair index */
+    uint16_t sidx[2 * HSET_LP_BATCH_MAX];         /* slot -> pending pair index (fits: MAX < 65536) */
     int tabsize = 8;
     while (tabsize < numfields * 2) tabsize <<= 1; /* load factor <= 0.5, power of two */
     unsigned mask = tabsize - 1;
@@ -2212,6 +2216,7 @@ static int hashTypeBuildFreshListpack(kvobj *o, robj **argv, int numfields) {
     }
 
     o->ptr = lpBatchAppend(o->ptr, pending, (unsigned long)np * 2); /* np>=1 (numfields>=2) */
+    serverAssert(o->ptr != NULL); /* sizes pre-validated by hashTypeTryConversion */
     return np;
 }
 
