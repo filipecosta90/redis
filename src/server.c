@@ -6024,18 +6024,52 @@ void bytesToHuman(char *s, size_t size, unsigned long long n) {
     }
 }
 
+/* Upper bound on configured percentiles resolved in a single histogram pass.
+ * Sized for any realistic latency-tracking-info-percentiles config (default 3);
+ * larger configs fall back to the per-percentile path. Bounds the four small
+ * stack arrays below (<=448 bytes total). */
+#define LATENCY_PERCENTILE_FASTPATH_MAX 16
+
 /* Fill percentile distribution of latencies. */
 sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram) {
+    const int len = server.latency_tracking_info_percentiles_len;
+    const double *pcfg = server.latency_tracking_info_percentiles;
     info = sdscatfmt(info,"latency_percentiles_usec_%s:",histogram_name);
-    for (int j = 0; j < server.latency_tracking_info_percentiles_len; j++) {
-        char fbuf[128];
-        size_t len = snprintf(fbuf, sizeof(fbuf), "%f", server.latency_tracking_info_percentiles[j]);
-        trimDoubleString(fbuf, len);
-        info = sdscatprintf(info,"p%s=%.3f", fbuf,
-            ((double)hdr_value_at_percentile(histogram,server.latency_tracking_info_percentiles[j]))/1000.0f);
-        if (j != server.latency_tracking_info_percentiles_len-1)
-            info = sdscatlen(info,",",1);
+
+    /* Computing each percentile with hdr_value_at_percentile() rescans the
+     * histogram counts from index 0 every time, so N percentiles cost N scans.
+     * hdr_value_at_percentiles() resolves them all in a single pass, but
+     * requires ascending input while the configured list may be in any order.
+     * Sort an index permutation (len is tiny, 3 by default), resolve in one
+     * pass, and scatter the results back into the configured order so the
+     * output is byte-identical to the per-percentile path. */
+    int64_t values[LATENCY_PERCENTILE_FASTPATH_MAX];
+    int use_fastpath = (len > 0 && len <= LATENCY_PERCENTILE_FASTPATH_MAX);
+    if (use_fastpath) {
+        int order[LATENCY_PERCENTILE_FASTPATH_MAX];
+        double sorted_p[LATENCY_PERCENTILE_FASTPATH_MAX];
+        int64_t sorted_v[LATENCY_PERCENTILE_FASTPATH_MAX];
+        for (int j = 0; j < len; j++) order[j] = j;
+        for (int a = 1; a < len; a++) { /* insertion sort indices by value */
+            int key = order[a];
+            int b = a - 1;
+            while (b >= 0 && pcfg[order[b]] > pcfg[key]) { order[b+1] = order[b]; b--; }
+            order[b+1] = key;
         }
+        for (int j = 0; j < len; j++) sorted_p[j] = pcfg[order[j]];
+        hdr_value_at_percentiles(histogram, sorted_p, sorted_v, len);
+        for (int j = 0; j < len; j++) values[order[j]] = sorted_v[j];
+    }
+
+    for (int j = 0; j < len; j++) {
+        char fbuf[128];
+        size_t flen = snprintf(fbuf, sizeof(fbuf), "%f", pcfg[j]);
+        trimDoubleString(fbuf, flen);
+        int64_t v = use_fastpath ? values[j] : hdr_value_at_percentile(histogram, pcfg[j]);
+        info = sdscatprintf(info,"p%s=%.3f", fbuf, ((double)v)/1000.0f);
+        if (j != len-1)
+            info = sdscatlen(info,",",1);
+    }
     info = sdscatprintf(info,"\r\n");
     return info;
 }
