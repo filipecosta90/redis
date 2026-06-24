@@ -6065,11 +6065,14 @@ sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, st
 
     for (int j = 0; j < len; j++) {
         int64_t v = use_fastpath ? values[j] : hdr_value_at_percentile(histogram, pcfg[j]);
-        /* v is an integer number of microseconds, so v/1000.0 has at most 3
-         * fractional digits. Emitting (v/1000).(v%1000, zero-padded to 3) with
-         * integer conversion is byte-identical to the old "%.3f" of
-         * (double)v/1000.0, while avoiding glibc's floating-point formatter
-         * (__printf_fp) — the dominant leaf in latencystats per CPU profiling. */
+        /* v is an integer histogram value (nanoseconds); the reported figure is
+         * v/1000 (microseconds). Because v is an integer, v/1000.0 has at most 3
+         * fractional decimal digits, so emitting (v/1000).(v%1000, zero-padded to
+         * 3) by integer conversion is byte-identical to the old "%.3f" of
+         * (double)v/1000.0 across the bounded latency-histogram range (values are
+         * clamped to <= 1e9, far below 2^53 where double vs integer rounding could
+         * diverge), while avoiding glibc's floating-point formatter (__printf_fp),
+         * the dominant latencystats leaf in CPU profiling. */
         long long ip = (long long)(v / 1000), fp = (long long)(v % 1000);
         if (plabels != NULL) {
             info = sdscatprintf(info,"p%s=%lld.%03lld", plabels[j], ip, fp);
