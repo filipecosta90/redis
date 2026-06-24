@@ -6065,13 +6065,19 @@ sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, st
 
     for (int j = 0; j < len; j++) {
         int64_t v = use_fastpath ? values[j] : hdr_value_at_percentile(histogram, pcfg[j]);
+        /* v is an integer number of microseconds, so v/1000.0 has at most 3
+         * fractional digits. Emitting (v/1000).(v%1000, zero-padded to 3) with
+         * integer conversion is byte-identical to the old "%.3f" of
+         * (double)v/1000.0, while avoiding glibc's floating-point formatter
+         * (__printf_fp) — the dominant leaf in latencystats per CPU profiling. */
+        long long ip = (long long)(v / 1000), fp = (long long)(v % 1000);
         if (plabels != NULL) {
-            info = sdscatprintf(info,"p%s=%.3f", plabels[j], ((double)v)/1000.0f);
+            info = sdscatprintf(info,"p%s=%lld.%03lld", plabels[j], ip, fp);
         } else {
             char fbuf[128];
             size_t flen = snprintf(fbuf, sizeof(fbuf), "%f", pcfg[j]);
             trimDoubleString(fbuf, flen);
-            info = sdscatprintf(info,"p%s=%.3f", fbuf, ((double)v)/1000.0f);
+            info = sdscatprintf(info,"p%s=%lld.%03lld", fbuf, ip, fp);
         }
         if (j != len-1)
             info = sdscatlen(info,",",1);
@@ -6203,12 +6209,20 @@ sds genRedisInfoStringCommandStats(sds info, dict *commands) {
                     c->slowlog_count, (double)c->slowlog_time_us_sum / 1000,
                     (double)c->slowlog_time_us_max / 1000);
             } else {
-                info = sdscatprintf(info,
-                    "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
-                    ",rejected_calls=%lld,failed_calls=%lld\r\n",
+                /* Hot path (no slowlog): avoid sdscatprintf's full printf-format
+                 * parse of this long format string for every command (hundreds on
+                 * a busy server). Pre-render the single float field, then use
+                 * sdscatfmt's lightweight scanner (%I = long long) for the integer
+                 * fields. Byte-identical: identical (float)-cast %.2f and integer
+                 * digits; only the formatter machinery changes. */
+                char upc[64];
+                snprintf(upc, sizeof(upc), "%.2f",
+                    (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+                info = sdscatfmt(info,
+                    "cmdstat_%s:calls=%I,usec=%I,usec_per_call=%s"
+                    ",rejected_calls=%I,failed_calls=%I\r\n",
                     getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe), c->calls, c->microseconds,
-                    (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
-                    c->rejected_calls, c->failed_calls);
+                    upc, c->rejected_calls, c->failed_calls);
             }
             if (tmpsafe != NULL) zfree(tmpsafe);
         }
