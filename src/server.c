@@ -6030,8 +6030,10 @@ void bytesToHuman(char *s, size_t size, unsigned long long n) {
  * stack arrays below (<=448 bytes total). */
 #define LATENCY_PERCENTILE_FASTPATH_MAX 16
 
-/* Fill percentile distribution of latencies. */
-sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram) {
+/* Fill percentile distribution of latencies. 'plabels' holds the pre-formatted
+ * percentile labels (e.g. "50","99","99.9"), which are identical for every
+ * histogram; pass NULL to format them per-call (the rare >FASTPATH_MAX fallback). */
+sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, struct hdr_histogram* histogram, const char **plabels) {
     const int len = server.latency_tracking_info_percentiles_len;
     const double *pcfg = server.latency_tracking_info_percentiles;
     info = sdscatfmt(info,"latency_percentiles_usec_%s:",histogram_name);
@@ -6062,11 +6064,15 @@ sds fillPercentileDistributionLatencies(sds info, const char* histogram_name, st
     }
 
     for (int j = 0; j < len; j++) {
-        char fbuf[128];
-        size_t flen = snprintf(fbuf, sizeof(fbuf), "%f", pcfg[j]);
-        trimDoubleString(fbuf, flen);
         int64_t v = use_fastpath ? values[j] : hdr_value_at_percentile(histogram, pcfg[j]);
-        info = sdscatprintf(info,"p%s=%.3f", fbuf, ((double)v)/1000.0f);
+        if (plabels != NULL) {
+            info = sdscatprintf(info,"p%s=%.3f", plabels[j], ((double)v)/1000.0f);
+        } else {
+            char fbuf[128];
+            size_t flen = snprintf(fbuf, sizeof(fbuf), "%f", pcfg[j]);
+            trimDoubleString(fbuf, flen);
+            info = sdscatprintf(info,"p%s=%.3f", fbuf, ((double)v)/1000.0f);
+        }
         if (j != len-1)
             info = sdscatlen(info,",",1);
     }
@@ -6231,7 +6237,9 @@ sds genRedisInfoStringACLStats(sds info) {
     return info;
 }
 
-sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
+/* Recursive worker for genRedisInfoStringLatencyStats(). 'plabels' carries the
+ * pre-formatted percentile labels (constant across all histograms), or NULL. */
+static sds genRedisInfoStringLatencyStatsImpl(sds info, dict *commands, const char **plabels) {
     struct redisCommand *c;
     dictEntry *de;
     dictIterator di;
@@ -6242,16 +6250,37 @@ sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
         if (c->latency_histogram) {
             info = fillPercentileDistributionLatencies(info,
                 getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe),
-                c->latency_histogram);
+                c->latency_histogram, plabels);
             if (tmpsafe != NULL) zfree(tmpsafe);
         }
         if (c->subcommands_dict) {
-            info = genRedisInfoStringLatencyStats(info, c->subcommands_dict);
+            info = genRedisInfoStringLatencyStatsImpl(info, c->subcommands_dict, plabels);
         }
     }
     dictResetIterator(&di);
 
     return info;
+}
+
+sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
+    /* The percentile LABELS (e.g. "50"/"99"/"99.9") are identical for every
+     * command histogram, so format them once here instead of re-running
+     * snprintf()+trimDoubleString() per histogram inside the per-command loop
+     * (which on a busy server iterates hundreds of histograms). */
+    const int len = server.latency_tracking_info_percentiles_len;
+    if (len > 0 && len <= LATENCY_PERCENTILE_FASTPATH_MAX) {
+        char lblbuf[LATENCY_PERCENTILE_FASTPATH_MAX][16]; /* percentiles are <=100.0 -> <=10 chars */
+        const char *plabels[LATENCY_PERCENTILE_FASTPATH_MAX];
+        for (int j = 0; j < len; j++) {
+            size_t l = snprintf(lblbuf[j], sizeof(lblbuf[j]), "%f",
+                                server.latency_tracking_info_percentiles[j]);
+            trimDoubleString(lblbuf[j], l);
+            plabels[j] = lblbuf[j];
+        }
+        return genRedisInfoStringLatencyStatsImpl(info, commands, plabels);
+    }
+    /* len==0, or an unusually large config: format labels per-call. */
+    return genRedisInfoStringLatencyStatsImpl(info, commands, NULL);
 }
 
 /* Takes a null terminated sections list, and adds them to the dict. */
