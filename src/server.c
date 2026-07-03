@@ -6300,6 +6300,94 @@ sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
     return genRedisInfoStringLatencyStatsImpl(info, commands, NULL);
 }
 
+/* Fused walk: when INFO everything (or any single call that asks for BOTH
+ * commandstats + latencystats) is served, walk `commands` once and append
+ * per-command commandstats lines to *cs_out and per-command latencystats
+ * lines to *ls_out. Either pointer may be NULL to disable that side.
+ * Recurses into subcommand dicts.
+ *
+ * The per-line formatting is byte-identical to the standalone helpers
+ * genRedisInfoStringCommandStats() / genRedisInfoStringLatencyStatsImpl() —
+ * only the enclosing dict iteration and the getSafeInfoString() call are
+ * shared across both sections. */
+static void genRedisInfoStringCommandAndLatencyStatsImpl(dict *commands,
+                                                         sds *cs_out,
+                                                         sds *ls_out,
+                                                         const char **plabels) {
+    struct redisCommand *c;
+    dictEntry *de;
+    dictIterator di;
+    dictInitSafeIterator(&di, commands);
+    while ((de = dictNext(&di)) != NULL) {
+        c = (struct redisCommand *) dictGetVal(de);
+        int need_cs = cs_out && (c->calls || c->failed_calls || c->rejected_calls);
+        int need_ls = ls_out && c->latency_histogram;
+
+        if (need_cs || need_ls) {
+            char *tmpsafe = NULL;
+            char *safename = getSafeInfoString(c->fullname, sdslen(c->fullname), &tmpsafe);
+
+            if (need_cs) {
+                if (c->slowlog_count > 0) {
+                    *cs_out = sdscatprintf(*cs_out,
+                        "cmdstat_%s:calls=%lld,usec=%lld,usec_per_call=%.2f"
+                        ",rejected_calls=%lld,failed_calls=%lld"
+                        ",slowlog_count=%lld,slowlog_time_ms_sum=%.2f,slowlog_time_ms_max=%.2f\r\n",
+                        safename, c->calls, c->microseconds,
+                        (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls),
+                        c->rejected_calls, c->failed_calls,
+                        c->slowlog_count, (double)c->slowlog_time_us_sum / 1000,
+                        (double)c->slowlog_time_us_max / 1000);
+                } else {
+                    char upc[64];
+                    snprintf(upc, sizeof(upc), "%.2f",
+                        (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+                    *cs_out = sdscatfmt(*cs_out,
+                        "cmdstat_%s:calls=%I,usec=%I,usec_per_call=%s"
+                        ",rejected_calls=%I,failed_calls=%I\r\n",
+                        safename, c->calls, c->microseconds,
+                        upc, c->rejected_calls, c->failed_calls);
+                }
+            }
+
+            if (need_ls) {
+                *ls_out = fillPercentileDistributionLatencies(*ls_out,
+                    safename, c->latency_histogram, plabels);
+            }
+
+            if (tmpsafe != NULL) zfree(tmpsafe);
+        }
+
+        if (c->subcommands_dict) {
+            genRedisInfoStringCommandAndLatencyStatsImpl(c->subcommands_dict,
+                                                        cs_out, ls_out, plabels);
+        }
+    }
+    dictResetIterator(&di);
+}
+
+/* Public entry that fuses commandstats + latencystats emission when both are
+ * needed. Populates *cs_out (if non-NULL) and *ls_out (if non-NULL) walking
+ * server.commands exactly once. Formats percentile labels once for the whole
+ * INFO call (same shape as genRedisInfoStringLatencyStats()). */
+void genRedisInfoStringCommandAndLatencyStats(sds *cs_out, sds *ls_out) {
+    const int len = server.latency_tracking_info_percentiles_len;
+    if (ls_out && len > 0 && len <= LATENCY_PERCENTILE_FASTPATH_MAX) {
+        char lblbuf[LATENCY_PERCENTILE_FASTPATH_MAX][16];
+        const char *plabels[LATENCY_PERCENTILE_FASTPATH_MAX];
+        for (int j = 0; j < len; j++) {
+            size_t l = snprintf(lblbuf[j], sizeof(lblbuf[j]), "%f",
+                                server.latency_tracking_info_percentiles[j]);
+            trimDoubleString(lblbuf[j], l);
+            plabels[j] = lblbuf[j];
+        }
+        genRedisInfoStringCommandAndLatencyStatsImpl(server.commands, cs_out, ls_out, plabels);
+        return;
+    }
+    /* len==0, or an unusually large config: format labels per-call. */
+    genRedisInfoStringCommandAndLatencyStatsImpl(server.commands, cs_out, ls_out, NULL);
+}
+
 /* Takes a null terminated sections list, and adds them to the dict. */
 void addInfoSectionsToDict(dict *section_dict, char **sections) {
     while (*sections) {
@@ -7030,11 +7118,30 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         info = genModulesInfoString(info);
     }
 
+    /* Fused command-table walk: INFO everything (and any single call that
+     * asks for BOTH commandstats + latencystats) currently iterates
+     * server.commands twice — once in genRedisInfoStringCommandStats() and
+     * again in genRedisInfoStringLatencyStats(). Walk it once when both
+     * sections are wanted, splicing the pre-rendered bodies below. */
+    int want_cs = all_sections || (dictFind(section_dict,"commandstats") != NULL);
+    int want_ls = all_sections || (dictFind(section_dict,"latencystats") != NULL);
+    int fuse_cmd_walks = want_cs && want_ls && server.latency_tracking_enabled;
+    sds cs_buf = NULL, ls_buf = NULL;
+    if (fuse_cmd_walks) {
+        cs_buf = sdsempty();
+        ls_buf = sdsempty();
+        genRedisInfoStringCommandAndLatencyStats(&cs_buf, &ls_buf);
+    }
+
     /* Command statistics */
-    if (all_sections || (dictFind(section_dict,"commandstats") != NULL)) {
+    if (want_cs) {
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
-        info = genRedisInfoStringCommandStats(info, server.commands);
+        if (fuse_cmd_walks) {
+            info = sdscatsds(info, cs_buf);
+        } else {
+            info = genRedisInfoStringCommandStats(info, server.commands);
+        }
     }
 
     /* Error statistics */
@@ -7057,12 +7164,20 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
     }
 
     /* Latency by percentile distribution per command */
-    if (all_sections || (dictFind(section_dict,"latencystats") != NULL)) {
+    if (want_ls) {
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Latencystats\r\n");
         if (server.latency_tracking_enabled) {
-            info = genRedisInfoStringLatencyStats(info, server.commands);
+            if (fuse_cmd_walks) {
+                info = sdscatsds(info, ls_buf);
+            } else {
+                info = genRedisInfoStringLatencyStats(info, server.commands);
+            }
         }
+    }
+    if (fuse_cmd_walks) {
+        sdsfree(cs_buf);
+        sdsfree(ls_buf);
     }
 
     /* Cluster */
