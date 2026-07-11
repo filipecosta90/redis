@@ -2433,12 +2433,12 @@ unsigned long hashTypeLength(const robj *o, int subtractExpiredFields) {
                                               commandTimeSnapshot());
         }
         length = dictSize(d) - expiredItems;
-    } else if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+    } else if (unlikely(o->encoding == OBJ_ENCODING_TMPL_LP)) {
         /* First entry is the template ID, the rest are values. */
         unsigned long n = lpLength(o->ptr);
         serverAssert(n >= 1);
         length = n - 1;
-    } else if (o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+    } else if (unlikely(o->encoding == OBJ_ENCODING_TMPL_ARRAY)) {
         hashTemplateArray *hta = o->ptr;
         length = hta->tmpl->field_count;
     } else {
@@ -2458,10 +2458,10 @@ size_t hashTypeAllocSize(const robj *o) {
     } else if (o->encoding == OBJ_ENCODING_HT) {
         dict *d = o->ptr;
         size += sizeof(dict) + dictMemUsage(d) + *htGetMetadataSize(d);
-    } else if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+    } else if (unlikely(o->encoding == OBJ_ENCODING_TMPL_LP)) {
         unsigned char *lp = o->ptr;
         size = lpBytes(lp);
-    } else if (o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+    } else if (unlikely(o->encoding == OBJ_ENCODING_TMPL_ARRAY)) {
         hashTemplateArray *hta = o->ptr;
         size = sizeof(hashTemplateArray) + sizeof(sds) * hta->tmpl->field_count;
         for (unsigned long long i = 0; i < hta->tmpl->field_count; i++) {
@@ -2486,8 +2486,8 @@ void hashTypeInitIterator(hashTypeIterator *hi, robj *subject) {
         hi->expire_time = EB_EXPIRE_TIME_INVALID;
     } else if (hi->encoding == OBJ_ENCODING_HT) {
         dictInitIterator(&hi->di, subject->ptr);
-    } else if (hi->encoding == OBJ_ENCODING_TMPL_LP ||
-               hi->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+    } else if (unlikely(hi->encoding == OBJ_ENCODING_TMPL_LP ||
+                        hi->encoding == OBJ_ENCODING_TMPL_ARRAY)) {
         hi->tmpl_index = -1;  /* Not started yet. */
         hi->vptr = NULL;
         hi->expire_time = EB_EXPIRE_TIME_INVALID;
@@ -2587,7 +2587,7 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
             return C_OK;
         }
         return C_ERR;
-    } else if (hi->encoding == OBJ_ENCODING_TMPL_LP) {
+    } else if (unlikely(hi->encoding == OBJ_ENCODING_TMPL_LP)) {
         unsigned char *lp = hi->subject->ptr;
 
         /* Advance to next field. lpNext returning NULL signals end. */
@@ -2595,7 +2595,7 @@ int hashTypeNext(hashTypeIterator *hi, int skipExpiredFields) {
         hi->vptr = (hi->tmpl_index == 0) ?
                    hashTemplateLpFirstValue(lp) : lpNext(lp, hi->vptr);
         if (!hi->vptr) return C_ERR;
-    } else if (hi->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+    } else if (unlikely(hi->encoding == OBJ_ENCODING_TMPL_ARRAY)) {
         /* Advance to next field. */
         hi->tmpl_index++;
         if ((unsigned long long)hi->tmpl_index >= hi->tmpl->field_count)
@@ -2699,6 +2699,35 @@ void hashTypeCurrentFromTmplArray(hashTypeIterator *hi, int what,
         *expireTime = EB_EXPIRE_TIME_INVALID;
 }
 
+/* Out-of-line slow path for template encodings — kept in a cold, noinline helper so
+ * the hot per-field HT/listpack dispatch in hashTypeCurrentObject stays tight when the
+ * hinted-hash feature is disabled (the default). */
+static void hashTypeCurrentObjectTemplate(hashTypeIterator *hi,
+                                          int what,
+                                          unsigned char **vstr,
+                                          size_t *vlen,
+                                          long long *vll,
+                                          uint64_t *expireTime) __attribute__((cold, noinline));
+static void hashTypeCurrentObjectTemplate(hashTypeIterator *hi,
+                                          int what,
+                                          unsigned char **vstr,
+                                          size_t *vlen,
+                                          long long *vll,
+                                          uint64_t *expireTime)
+{
+    if (hi->encoding == OBJ_ENCODING_TMPL_LP) {
+        hashTypeCurrentFromTmplLp(hi, what, vstr, vlen, vll, expireTime);
+    } else if (hi->encoding == OBJ_ENCODING_TMPL_ARRAY) {
+        char *ele;
+        size_t eleLen;
+        hashTypeCurrentFromTmplArray(hi, what, &ele, &eleLen, expireTime);
+        *vstr = (unsigned char*) ele;
+        *vlen = eleLen;
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+}
+
 /* Higher level function of hashTypeCurrent*() that returns the hash value
  * at current iterator position.
  *
@@ -2727,16 +2756,8 @@ void hashTypeCurrentObject(hashTypeIterator *hi,
         hashTypeCurrentFromHashTable(hi, what, &ele, &eleLen, expireTime);
         *vstr = (unsigned char*) ele;
         *vlen = eleLen;
-    } else if (hi->encoding == OBJ_ENCODING_TMPL_LP) {
-        hashTypeCurrentFromTmplLp(hi, what, vstr, vlen, vll, expireTime);
-    } else if (hi->encoding == OBJ_ENCODING_TMPL_ARRAY) {
-        char *ele;
-        size_t eleLen;
-        hashTypeCurrentFromTmplArray(hi, what, &ele, &eleLen, expireTime);
-        *vstr = (unsigned char*) ele;
-        *vlen = eleLen;
     } else {
-        serverPanic("Unknown hash encoding");
+        hashTypeCurrentObjectTemplate(hi, what, vstr, vlen, vll, expireTime);
     }
 }
 
