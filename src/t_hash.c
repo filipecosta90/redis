@@ -1867,6 +1867,92 @@ int hashTypeExists(redisDb *db, kvobj *o, sds field, int hfeFlags, int *isHashDe
 
 static_assert(HASH_SET_TAKE_VALUE == ENTRY_TAKE_VALUE, "ENTRY_TAKE_VALUE must match HASH_SET_TAKE_VALUE");
 
+/* Out-of-line handler for the template-encoded set path. Cold + noinline keeps
+ * the enlarged template body out of hashTypeSet's icache/DSB footprint so the
+ * default-off case (99% of users, hash_min_template_entries == 0) is unaffected.
+ * Adopts `value` when HASH_SET_TAKE_VALUE is set (returns 1 in *adopted) so the
+ * caller skips sdsfree(value). */
+static int hashTypeSetTemplate(redisDb *db, kvobj *o, sds field, sds value,
+                               int flags, int *adopted) __attribute__((cold, noinline));
+static int hashTypeSetTemplate(redisDb *db, kvobj *o, sds field, sds value,
+                               int flags, int *adopted) {
+    int update = 0;
+    *adopted = 0;
+    hashTemplate *tmpl = hashTypeGetTemplate(o);
+
+    /* Check if field exists in tmpl */
+    long long field_idx = hashTemplateFieldIndex(tmpl, field);
+    int is_new = field_idx < 0;
+
+    /* Promote TMPL_LP -> TMPL_ARRAY up front if the value or field count no
+     * longer fits a listpack. The template (and field_idx) is unchanged. */
+    if (o->encoding == OBJ_ENCODING_TMPL_LP &&
+        (sdslen(value) > server.hash_max_listpack_value ||
+         !lpSafeToAdd(o->ptr, sdslen(value)) ||
+         (is_new && tmpl->field_count + 1 > server.hash_max_listpack_entries)))
+    {
+        hashTypeConvert(db, o, OBJ_ENCODING_TMPL_ARRAY);
+    }
+
+    if (!is_new) {
+        /* Field exists - update value in place. */
+        if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+            unsigned char *lp = o->ptr;
+            unsigned char *p = hashTemplateLpSeekValue(lp, field_idx);
+            o->ptr = lpReplace(lp, &p, (unsigned char *)value, sdslen(value));
+        } else {
+            hashTemplateArray *hta = o->ptr;
+            if (hta->values[field_idx]) sdsfree(hta->values[field_idx]);
+            if (flags & HASH_SET_TAKE_VALUE) {
+                hta->values[field_idx] = value;  /* adopt, don't copy */
+                *adopted = 1;
+            } else {
+                hta->values[field_idx] = sdsdup(value);
+            }
+        }
+        return 1;
+    }
+
+    /* Field not in tmpl - switch to the template that adds it at insert_pos. */
+    long long insert_pos = -field_idx - 1;
+    unsigned long long new_field_count = tmpl->field_count + 1;
+    hashTemplate *new_tmpl = hashTemplateForInsertedField(tmpl, field, insert_pos);
+
+    /* Insert value at insert_pos in existing structure. */
+    if (o->encoding == OBJ_ENCODING_TMPL_LP) {
+        unsigned char *lp = o->ptr;
+        /* Update template ID. */
+        lp = hashTemplateLpSetTemplate(lp, new_tmpl);
+        /* Insert value at position (offset +1 for template ID). */
+        if ((unsigned long long)insert_pos == tmpl->field_count) {
+            lp = lpAppend(lp, (unsigned char *)value, sdslen(value));
+        } else {
+            unsigned char *p = hashTemplateLpSeekValue(lp, insert_pos);
+            lp = lpInsertString(lp, (unsigned char *)value, sdslen(value), p, LP_BEFORE, NULL);
+        }
+        hashTemplateDecrKeyRef(tmpl);
+        o->ptr = lp;
+    } else {
+        hashTemplateArray *hta = o->ptr;
+        /* Expand struct and shift elements to make room. */
+        hta = zrealloc(hta, sizeof(*hta) + sizeof(sds) * new_field_count);
+        if ((unsigned long long)insert_pos < tmpl->field_count) {
+            memmove(&hta->values[insert_pos + 1], &hta->values[insert_pos],
+                    sizeof(sds) * (tmpl->field_count - insert_pos));
+        }
+        if (flags & HASH_SET_TAKE_VALUE) {
+            hta->values[insert_pos] = value;  /* adopt, don't copy */
+            *adopted = 1;
+        } else {
+            hta->values[insert_pos] = sdsdup(value);
+        }
+        hashTemplateDecrKeyRef(tmpl);
+        hta->tmpl = new_tmpl;
+        o->ptr = hta;
+    }
+    return update;
+}
+
 int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
     int update = 0;
 
@@ -1998,81 +2084,12 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
             *alloc_size += usableDiff;
             update = 1;
         }
-    } else if (o->encoding == OBJ_ENCODING_TMPL_LP ||
-               o->encoding == OBJ_ENCODING_TMPL_ARRAY) {
-        hashTemplate *tmpl = hashTypeGetTemplate(o);
-
-        /* Check if field exists in tmpl */
-        long long field_idx = hashTemplateFieldIndex(tmpl, field);
-        int is_new = field_idx < 0;
-
-        /* Promote TMPL_LP -> TMPL_ARRAY up front if the value or field count no
-         * longer fits a listpack. The template (and field_idx) is unchanged. */
-        if (o->encoding == OBJ_ENCODING_TMPL_LP &&
-            (sdslen(value) > server.hash_max_listpack_value ||
-             !lpSafeToAdd(o->ptr, sdslen(value)) ||
-             (is_new && tmpl->field_count + 1 > server.hash_max_listpack_entries)))
-        {
-            hashTypeConvert(db, o, OBJ_ENCODING_TMPL_ARRAY);
-        }
-
-        if (!is_new) {
-            /* Field exists - update value in place. */
-            if (o->encoding == OBJ_ENCODING_TMPL_LP) {
-                unsigned char *lp = o->ptr;
-                unsigned char *p = hashTemplateLpSeekValue(lp, field_idx);
-                o->ptr = lpReplace(lp, &p, (unsigned char *)value, sdslen(value));
-            } else {
-                hashTemplateArray *hta = o->ptr;
-                if (hta->values[field_idx]) sdsfree(hta->values[field_idx]);
-                if (flags & HASH_SET_TAKE_VALUE) {
-                    hta->values[field_idx] = value;  /* adopt, don't copy */
-                    value = NULL;
-                } else {
-                    hta->values[field_idx] = sdsdup(value);
-                }
-            }
-            update = 1;
-            goto cleanup;
-        }
-
-        /* Field not in tmpl - switch to the template that adds it at insert_pos. */
-        long long insert_pos = -field_idx - 1;
-        unsigned long long new_field_count = tmpl->field_count + 1;
-        hashTemplate *new_tmpl = hashTemplateForInsertedField(tmpl, field, insert_pos);
-
-        /* Insert value at insert_pos in existing structure. */
-        if (o->encoding == OBJ_ENCODING_TMPL_LP) {
-            unsigned char *lp = o->ptr;
-            /* Update template ID. */
-            lp = hashTemplateLpSetTemplate(lp, new_tmpl);
-            /* Insert value at position (offset +1 for template ID). */
-            if ((unsigned long long)insert_pos == tmpl->field_count) {
-                lp = lpAppend(lp, (unsigned char *)value, sdslen(value));
-            } else {
-                unsigned char *p = hashTemplateLpSeekValue(lp, insert_pos);
-                lp = lpInsertString(lp, (unsigned char *)value, sdslen(value), p, LP_BEFORE, NULL);
-            }
-            hashTemplateDecrKeyRef(tmpl);
-            o->ptr = lp;
-        } else {
-            hashTemplateArray *hta = o->ptr;
-            /* Expand struct and shift elements to make room. */
-            hta = zrealloc(hta, sizeof(*hta) + sizeof(sds) * new_field_count);
-            if ((unsigned long long)insert_pos < tmpl->field_count) {
-                memmove(&hta->values[insert_pos + 1], &hta->values[insert_pos],
-                        sizeof(sds) * (tmpl->field_count - insert_pos));
-            }
-            if (flags & HASH_SET_TAKE_VALUE) {
-                hta->values[insert_pos] = value;  /* adopt, don't copy */
-                value = NULL;
-            } else {
-                hta->values[insert_pos] = sdsdup(value);
-            }
-            hashTemplateDecrKeyRef(tmpl);
-            hta->tmpl = new_tmpl;
-            o->ptr = hta;
-        }
+    } else if (unlikely(o->encoding == OBJ_ENCODING_TMPL_LP ||
+                        o->encoding == OBJ_ENCODING_TMPL_ARRAY)) {
+        int adopted = 0;
+        update = hashTypeSetTemplate(db, o, field, value, flags, &adopted);
+        if (adopted) value = NULL;
+        goto cleanup;
     } else {
         serverPanic("Unknown hash encoding");
     }
@@ -2085,9 +2102,11 @@ cleanup:
 
     /* Auto-convert to template if threshold met and not already template.
      * Skipped when HASH_SET_NO_TEMPLATE_CONVERT is set: multi-field callers defer
-     * this to a single post-loop conversion to avoid per-field template lookup. */
-    if (!(flags & HASH_SET_NO_TEMPLATE_CONVERT) &&
-        server.hash_min_template_entries > 0)
+     * this to a single post-loop conversion to avoid per-field template lookup.
+     * The feature is disabled by default (hash_min_template_entries == 0), so
+     * gate the whole tail on that config to keep this branch out of the hot path. */
+    if (unlikely(server.hash_min_template_entries > 0) &&
+        !(flags & HASH_SET_NO_TEMPLATE_CONVERT))
     {
         hashTypeTryConvertToTemplate(o, server.hash_min_template_entries,
                                     server.hash_max_template_entries, NULL);
