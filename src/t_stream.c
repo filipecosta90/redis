@@ -385,8 +385,7 @@ int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamI
 
        /* If we are iterating in normal order, skip the master fields
         * to seek the first actual entry. */
-       for (int64_t i = 0; i < master_fields_count; i++)
-           lp_ele = lpNext(lp, lp_ele);
+       lp_ele = lpNextN(lp,lp_ele,master_fields_count);
 
        /* If we are going forward, skip the previous entry's
         * lp-count field (or in case of the master entry, the zero
@@ -407,8 +406,7 @@ int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamI
        if (lp_count == 0) /* We reached the master entry. */
            return 0;
 
-       while (lp_count--)
-           lp_ele = lpPrev(lp, lp_ele);
+       lp_ele = lpPrevN(lp,lp_ele,lp_count);
    }
 
    lp_ele = lpNext(lp, lp_ele); /* Seek ID (lp_ele currently points to 'flags'). */
@@ -925,8 +923,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         /* Skip all the master fields. */
         int64_t master_fields_count = lpGetInteger(p);
         p = lpNext(lp,p); /* Skip the first field. */
-        for (int64_t j = 0; j < master_fields_count; j++)
-            p = lpNext(lp,p); /* Skip all master fields. */
+        p = lpNextN(lp,p,master_fields_count);
         p = lpNext(lp,p); /* Skip the zero master entry terminator. */
 
         /* 'p' is now pointing to the first entry inside the listpack.
@@ -969,7 +966,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
                 to_skip *= 2; /* Fields and values. */
             }
 
-            while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
+            p = lpNextN(lp,p,to_skip); /* Skip the whole entry. */
             p = lpNext(lp,p); /* Skip the final lp-count field. */
 
             /* Mark the entry as deleted if allowed. */
@@ -1428,8 +1425,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
             if (!si->rev) {
                 /* If we are iterating in normal order, skip the master fields
                  * to seek the first actual entry. */
-                for (uint64_t i = 0; i < si->master_fields_count; i++)
-                    si->lp_ele = lpNext(si->lp,si->lp_ele);
+                si->lp_ele = lpNextN(si->lp,si->lp_ele,si->master_fields_count);
             } else {
                 /* If we are iterating in reverse direction, just seek the
                  * last part of the last entry in the listpack (that is, the
@@ -1442,7 +1438,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
              * emitted the current entry, and have to go back to the previous
              * one. */
             int64_t lp_count = lpGetInteger(si->lp_ele);
-            while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+            si->lp_ele = lpPrevN(si->lp,si->lp_ele,lp_count);
             /* Seek lp-count of prev entry. */
             si->lp_ele = lpPrev(si->lp,si->lp_ele);
         }
@@ -1466,7 +1462,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->lp_ele = NULL;
                     break;
                 }
-                while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+                si->lp_ele = lpPrevN(si->lp,si->lp_ele,lp_count);
             }
 
             /* Get the flags entry. */
@@ -1528,8 +1524,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
             if (!si->rev) {
                 int64_t to_discard = (flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
                                       *numfields : *numfields*2;
-                for (int64_t i = 0; i < to_discard; i++)
-                    si->lp_ele = lpNext(si->lp,si->lp_ele);
+                si->lp_ele = lpNextN(si->lp,si->lp_ele,to_discard);
             } else {
                 int64_t prev_times = 4; /* flag + id ms + id seq + one more to
                                            go back to the previous entry "count"
@@ -1537,7 +1532,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 /* If the entry was not flagged SAMEFIELD we also read the
                  * number of fields, so go back one more. */
                 if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS)) prev_times++;
-                while(prev_times--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+                si->lp_ele = lpPrevN(si->lp,si->lp_ele,prev_times);
             }
         }
 
