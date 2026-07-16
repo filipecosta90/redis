@@ -2203,6 +2203,59 @@ static int hashTypeBuildFreshListpack(kvobj *o, robj **argv, int numfields) {
     return n;
 }
 
+/* PROTOTYPE (order-free variant, PR #15345 follow-up): build a fresh listpack
+ * hash WITHOUT preserving field insertion order. Dedups in-command duplicate
+ * fields (last-wins) with a sort instead of the transient dict, trading argv
+ * order for a lighter dedup with no hashing and no dict allocation. Fields are
+ * emitted in sorted (field-content) order. Same caller guarantees as
+ * hashTypeBuildFreshListpack(). Returns the number of unique fields created. */
+typedef struct { sds field; sds value; int idx; } freshHashPair;
+static int freshHashPairCmp(const void *a, const void *b) {
+    const freshHashPair *pa = a, *pb = b;
+    size_t la = sdslen(pa->field), lb = sdslen(pb->field);
+    size_t m = la < lb ? la : lb;
+    int c = m ? memcmp(pa->field, pb->field, m) : 0;
+    if (c) return c;
+    if (la != lb) return la < lb ? -1 : 1;
+    return pa->idx - pb->idx; /* same field: original order, so last dup sorts last */
+}
+static int hashTypeBuildFreshListpackUnordered(kvobj *o, robj **argv, int numfields) {
+    serverAssert(o->encoding == OBJ_ENCODING_LISTPACK && lpLength(o->ptr) == 0);
+
+    freshHashPair stackp[HSET_LP_STACK_PAIRS];
+    freshHashPair *p = (numfields <= HSET_LP_STACK_PAIRS) ? stackp :
+                       zmalloc(sizeof(freshHashPair) * (size_t)numfields);
+    for (int j = 0; j < numfields; j++) {
+        p[j].field = argv[j*2]->ptr;
+        p[j].value = argv[j*2+1]->ptr;
+        p[j].idx = j;
+    }
+    qsort(p, numfields, sizeof(freshHashPair), freshHashPairCmp);
+
+    /* Equal fields are now adjacent and sorted by original index, so the last
+     * element of each run is the last-wins value. Keep only that one. */
+    listpackEntry stackpairs[2 * HSET_LP_STACK_PAIRS];
+    listpackEntry *pairs = (numfields <= HSET_LP_STACK_PAIRS) ? stackpairs :
+                           zmalloc(sizeof(listpackEntry) * 2 * (size_t)numfields);
+    int n = 0;
+    for (int j = 0; j < numfields; j++) {
+        if (j + 1 < numfields &&
+            sdslen(p[j].field) == sdslen(p[j+1].field) &&
+            (sdslen(p[j].field) == 0 ||
+             memcmp(p[j].field, p[j+1].field, sdslen(p[j].field)) == 0))
+            continue; /* a later duplicate of this field wins */
+        pairs[n*2].sval = (unsigned char*)p[j].field;
+        pairs[n*2].slen = sdslen(p[j].field);
+        pairs[n*2+1].sval = (unsigned char*)p[j].value;
+        pairs[n*2+1].slen = sdslen(p[j].value);
+        n++;
+    }
+    o->ptr = lpBatchAppend(o->ptr, pairs, (unsigned long)n * 2);
+    if (pairs != stackpairs) zfree(pairs);
+    if (p != stackp) zfree(p);
+    return n;
+}
+
 void hsetCommand(client *c) {
     int i, created = 0;
     size_t oldsize = 0;
@@ -2224,8 +2277,8 @@ void hsetCommand(client *c) {
      * off once the field count is large enough; 5 fields is a reasonable
      * threshold, below it the per-field loop is cheaper. */
     if (kv->encoding == OBJ_ENCODING_LISTPACK && numfields >= 5 && lpLength(kv->ptr) == 0) {
-        /* Fresh wide build: single dict pass (last-wins) + one batch append. */
-        created = hashTypeBuildFreshListpack(kv, c->argv + 2, numfields);
+        /* Fresh wide build: order-free sort dedup (last-wins) + one batch append. */
+        created = hashTypeBuildFreshListpackUnordered(kv, c->argv + 2, numfields);
     } else {
         for (i = 2; i < c->argc; i += 2)
             created += !hashTypeSet(c->db, kv, c->argv[i]->ptr, c->argv[i+1]->ptr, HASH_SET_COPY);
