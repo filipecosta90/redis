@@ -2256,6 +2256,41 @@ static int hashTypeBuildFreshListpackUnordered(kvobj *o, robj **argv, int numfie
     return n;
 }
 
+/* PROTOTYPE 2 (@sundb's exact suggestion): store field->value in a dict
+ * (last-wins on dup), then TRAVERSE the dict to fill the listpack (dict-iteration
+ * order, no qsort). Same caller guarantees as hashTypeBuildFreshListpack().
+ * NOTE: dict-iteration order is non-deterministic — this exact shape was tried and
+ * rejected in #15345 R2 (broke moduleapi/basics.tcl rm_call). Prototyped here only
+ * to measure whether it is faster than the merged single-pass dict->slot path. */
+static int hashTypeBuildFreshListpackDictOrder(kvobj *o, robj **argv, int numfields) {
+    serverAssert(o->encoding == OBJ_ENCODING_LISTPACK && lpLength(o->ptr) == 0);
+    dict *d = dictCreate(&sdsReplyDictType);
+    dictExpand(d, numfields);
+    for (int j = 0; j < numfields; j++) {
+        sds field = argv[j*2]->ptr, value = argv[j*2+1]->ptr;
+        dictEntry *existing, *de = dictAddRaw(d, field, &existing);
+        if (de == NULL) de = existing;   /* duplicate field -> overwrite (last-wins) */
+        dictSetVal(d, de, value);         /* borrow the argv value sds (no dup/free) */
+    }
+    int n = dictSize(d);
+    listpackEntry stackpairs[2 * HSET_LP_STACK_PAIRS];
+    listpackEntry *pairs = (n <= HSET_LP_STACK_PAIRS) ? stackpairs :
+                           zmalloc(sizeof(listpackEntry) * 2 * (size_t)n);
+    dictIterator *it = dictGetIterator(d);
+    dictEntry *de; int i = 0;
+    while ((de = dictNext(it)) != NULL) {
+        sds f = dictGetKey(de), v = dictGetVal(de);
+        pairs[i*2].sval = (unsigned char*)f;   pairs[i*2].slen = sdslen(f);
+        pairs[i*2+1].sval = (unsigned char*)v; pairs[i*2+1].slen = sdslen(v);
+        i++;
+    }
+    dictReleaseIterator(it);
+    o->ptr = lpBatchAppend(o->ptr, pairs, (unsigned long)i * 2);
+    if (pairs != stackpairs) zfree(pairs);
+    dictRelease(d);
+    return n;
+}
+
 void hsetCommand(client *c) {
     int i, created = 0;
     size_t oldsize = 0;
@@ -2277,8 +2312,8 @@ void hsetCommand(client *c) {
      * off once the field count is large enough; 5 fields is a reasonable
      * threshold, below it the per-field loop is cheaper. */
     if (kv->encoding == OBJ_ENCODING_LISTPACK && numfields >= 5 && lpLength(kv->ptr) == 0) {
-        /* Fresh wide build: order-free sort dedup (last-wins) + one batch append. */
-        created = hashTypeBuildFreshListpackUnordered(kv, c->argv + 2, numfields);
+        /* Fresh wide build: @sundb variant — dict store + dict-traverse emit. */
+        created = hashTypeBuildFreshListpackDictOrder(kv, c->argv + 2, numfields);
     } else {
         for (i = 2; i < c->argc; i += 2)
             created += !hashTypeSet(c->db, kv, c->argv[i]->ptr, c->argv[i+1]->ptr, HASH_SET_COPY);
