@@ -6322,3 +6322,5 @@ static void idmpEvictOldestEntry(stream *s, idmpProducer *producer) {
 }
 
 /* bench distinct-hash datapoint 1 (no-op comment) */
+
+/* bench distinct-hash datapoint 2 (no-op comment) */
