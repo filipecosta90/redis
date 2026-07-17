@@ -6320,3 +6320,5 @@ static void idmpEvictOldestEntry(stream *s, idmpProducer *producer) {
     dictDelete(producer->idmp_dict, oldest);
     idmpEntryFree(oldest, &s->alloc_size);
 }
+
+/* bench distinct-hash datapoint 1 (no-op comment) */
