@@ -4835,3 +4835,62 @@ start_server {tags {"repl external:skip" "stream"}} {
     }
 }
 
+start_server {tags {"stream"}} {
+    # Regression test for the cgroups_ref accounting fix: each pending stream
+    # entry that lives in one or more consumer group PELs owns a `list *` +
+    # per-group `listNode *` inside `s->cgroups_ref`. Before the fix those
+    # allocations bypassed the stream's `alloc_size` counter, so MEMORY USAGE
+    # under-reported by ~48 + 24*G bytes per pending entry (G = number of
+    # groups). The assertions below fail on the buggy code and pass on the fix.
+    test {MEMORY USAGE tracks cgroups_ref list allocations} {
+        r DEL memstream
+        set N 5000
+        for {set i 0} {$i < $N} {incr i} {
+            r XADD memstream * f v
+        }
+        # MU baseline before any consumer group holds pending entries.
+        set mu_base [r MEMORY USAGE memstream]
+
+        # After a group drains all N entries into its PEL, cgroups_ref holds
+        # N (list + listNode) allocations. On the buggy path MU is unchanged
+        # from mu_base; on the fixed path MU grows by roughly 48 B * N.
+        r XGROUP CREATE memstream g1 0
+        r XREADGROUP GROUP g1 c1 COUNT $N STREAMS memstream >
+        set mu1 [r MEMORY USAGE memstream]
+        # Buggy path: MU only tracks raxNode growth (~97 B/entry). Fix adds
+        # the list container + listNode (~72 B/entry). Threshold splits the
+        # two with margin.
+        assert {[expr {$mu1 - $mu_base}] > 130 * $N}
+
+        # Adding a second group doubles the per-entry listNode cost. Each of
+        # the N cglists gains one more listNode (~24 B). On the buggy path
+        # MU is unchanged from mu1; on the fixed path it grows by ~24 B * N.
+        r XGROUP CREATE memstream g2 0
+        r XREADGROUP GROUP g2 c2 COUNT $N STREAMS memstream >
+        set mu2 [r MEMORY USAGE memstream]
+        # Adding a 2nd group re-uses the existing per-entry cglist and appends
+        # one listNode (~24 B/entry). Buggy path leaves ~86 B/entry from rax
+        # growth. Threshold splits with margin.
+        assert {[expr {$mu2 - $mu1}] > 100 * $N}
+
+        # Decrement path: ACKing everything drains both PELs. Every listNode
+        # (and, once the list is empty, the list container) is freed. On the
+        # buggy path MU is unchanged; on the fixed path MU shrinks back to
+        # roughly mu_base.
+        set g1_pending [r XPENDING memstream g1 - + $N]
+        foreach entry $g1_pending {
+            r XACK memstream g1 [lindex $entry 0]
+        }
+        set g2_pending [r XPENDING memstream g2 - + $N]
+        foreach entry $g2_pending {
+            r XACK memstream g2 [lindex $entry 0]
+        }
+        set mu3 [r MEMORY USAGE memstream]
+        # ACKing both groups drains 2 listNodes + 1 list container per entry
+        # (~96 B/entry decrement contribution) on top of the rax removal.
+        # Buggy path only sees the rax removal (~183 B/entry).
+        assert {[expr {$mu2 - $mu3}] > 200 * $N}
+        r DEL memstream
+    }
+}
+

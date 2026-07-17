@@ -103,13 +103,30 @@ void streamFreeIdmpProducerGeneric(void *producer, void *strm) {
     idmpProducerFree((idmpProducer *)producer, &s->alloc_size);
 }
 
+/* Release a cgroups_ref list, decrementing s->alloc_size for each listNode and
+ * for the list container itself. Keeps the s->alloc_size invariant balanced
+ * regardless of how many nodes the list holds when it is torn down. */
+static void streamReleaseCGroupsRefList(stream *s, list *cglist) {
+    listIter li;
+    listNode *ln;
+    listRewind(cglist, &li);
+    while ((ln = listNext(&li)) != NULL)
+        s->alloc_size -= zmalloc_size(ln);
+    s->alloc_size -= zmalloc_size(cglist);
+    listRelease(cglist);
+}
+
+static void streamReleaseCGroupsRefListGeneric(void *lst, void *strm) {
+    streamReleaseCGroupsRefList((stream *)strm, (list *)lst);
+}
+
 /* Free a stream, including the listpacks stored inside the radix tree. */
 void freeStream(stream *s) {
     raxFreeWithCbAndContext(s->rax, streamLpFreeGeneric, s);
     if (s->cgroups)
         raxFreeWithCbAndContext(s->cgroups, streamFreeCGGeneric, s);
     if (s->cgroups_ref)
-        raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
+        raxFreeWithCbAndContext(s->cgroups_ref, streamReleaseCGroupsRefListGeneric, s);
     /* Free IDMP producers rax tree */
     if (s->idmp_producers)
         raxFreeWithCbAndContext(s->idmp_producers, streamFreeIdmpProducerGeneric, s);
@@ -3235,13 +3252,16 @@ listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
     if (!raxFindLink(s->cgroups_ref, key, sizeof(streamID),
                      (void**)&cglist, &link)) {
         cglist = listCreate();
+        s->alloc_size += zmalloc_size(cglist);
         serverAssert(raxInsertAt(s->cgroups_ref, key, sizeof(streamID),
                                  cglist, NULL, &link));
     }
-    
+
     /* Add the consumer group to the list and return the list node */
     listAddNodeTail(cglist, cg);
-    return listLast(cglist);
+    listNode *node = listLast(cglist);
+    s->alloc_size += zmalloc_size(node);
+    return node;
 }
 
 /* Unlink a consumer group reference from the entry index for a specific stream ID.
@@ -3250,11 +3270,13 @@ void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *ke
     list *cglist;
     if (!s->cgroups_ref) return;
     if (raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
+        s->alloc_size -= zmalloc_size(na->cgroup_ref_node);
         listDelNode(cglist, na->cgroup_ref_node);
-        
+
         /* If the list is now empty, remove it from the index. */
         if (listLength(cglist) == 0) {
             raxRemove(s->cgroups_ref, key, sizeof(streamID), NULL);
+            s->alloc_size -= zmalloc_size(cglist);
             listRelease(cglist);
         }
     }
@@ -3292,7 +3314,7 @@ void streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
     }
 
     raxRemove(s->cgroups_ref, buf, sizeof(streamID), NULL);
-    listRelease(cglist);
+    streamReleaseCGroupsRefList(s, cglist);
 }
 
 /* Check if a stream entry is still referenced by any consumer group.
