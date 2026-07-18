@@ -1540,8 +1540,17 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
         mh->db = zrealloc(mh->db,sizeof(mh->db[0])*(mh->num_dbs+1));
         mh->db[mh->num_dbs].dbid = j;
 
-        mem = kvstoreMemUsage(db->keys) +
-              keyscount * sizeof(robj);
+        /* The per-key sizeof(robj) term was accurate before #13806 (kvobj
+         * unification), when the main dict held a separately allocated value
+         * robj per entry. Since #13806 the value is stored inside the kvobj
+         * itself (either inline in the bucket via the even-key tag, or in a
+         * dictEntryNoValue slot), and its 16 B header is already counted per
+         * key via kvobjAllocSize() in the MEMORY USAGE path. Charging it here
+         * as well double-counts, making MEMORY STATS report dataset.bytes as
+         * ~16 B/key smaller than reality; on a TTL-heavy DB the symptom is a
+         * dataset.bytes REGRESSION after EXPIRE (real +8 B/key metabit slot is
+         * dwarfed by the phantom overhead the fix removes here). */
+        mem = kvstoreMemUsage(db->keys);
         mh->db[mh->num_dbs].overhead_ht_main = mem;
         mem_total+=mem;
 

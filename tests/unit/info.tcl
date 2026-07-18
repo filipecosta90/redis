@@ -729,3 +729,32 @@ start_cluster 1 0 {tags {external:skip cluster}} {
         assert_equal [dict get $info_mem db.0 overhead.hashtable.expires] $overhead_expires
     }
 }
+
+start_server {tags {"info"}} {
+    test "MEMORY STATS overhead.hashtable.main does not include a phantom robj per key" {
+        # Regression test for the pre-#13806 phantom `+ keyscount * sizeof(robj)`
+        # term at object.c getMemoryOverheadData (was overhead_ht_main). Since
+        # kvobj unification in #13806, the 16 B robj header lives inside the
+        # kvobj (either inline in the bucket via ENTRY_PTR_IS_EVEN_KEY or in a
+        # dictEntryNoValue slot) and is already charged per key via
+        # kvobjAllocSize(); charging it again here made MEMORY STATS report
+        # dataset.bytes as ~16 B/key smaller than reality and produced the
+        # counter-intuitive dataset-shrinks-when-adding-TTL symptom.
+        #
+        # The dict internals we DO count in overhead.hashtable.main
+        # (kvstoreMemUsage) are: buckets (~8 B/key at α≈1), inline-or-alloc'd
+        # entries (worst case 16 B/key if every entry were alloc'd rather than
+        # inline-tagged, in practice ~6 B/key at α≈1 Poisson), plus O(1)
+        # kvstore + per-dict overhead. That should sit well below 30 B/key
+        # even in the worst case; the buggy value was ~42 B/key (=~26 real +
+        # 16 phantom).
+        r flushall
+        set n 10000
+        for {set i 0} {$i < $n} {incr i} { r set k$i v }
+        set info_mem [r memory stats]
+        set overhead_main [dict get $info_mem db.0 overhead.hashtable.main]
+        # Fixed: ~26 B/key. Pre-fix: ~42 B/key. Discriminating floor.
+        assert_lessthan_equal $overhead_main [expr {$n * 30}]
+        r flushall
+    }
+}
