@@ -1073,3 +1073,17 @@ start_server {tags {"hash"}} {
         }
     }
 }
+
+start_server {tags {"hash"}} {
+    if {[string match {*jemalloc*} [s mem_allocator]]} {
+        test {MEMORY USAGE - HT-encoded hash includes dict metasize} {
+            r del htonly
+            r config set hash-max-listpack-entries 4
+            for {set i 0} {$i < 5} {incr i} {
+                r hset htonly f$i v$i
+            }
+            assert_encoding hashtable htonly
+            assert_morethan_equal [r memory usage htonly] 282
+        }
+    }
+}

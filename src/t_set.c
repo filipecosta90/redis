@@ -497,7 +497,8 @@ size_t setTypeAllocSize(const robj *o) {
     size_t size = 0;
     if (o->encoding == OBJ_ENCODING_HT) {
         dict *d = o->ptr;
-        size += sizeof(dict) + dictMemUsage(d) + *htGetMetadataSize(d);
+        size += sizeof(dict) + dictMetadataSize(d) +
+                dictMemUsage(d) + *htGetMetadataSize(d);
     } else if (o->encoding == OBJ_ENCODING_INTSET) {
         size = intsetAllocSize(o->ptr);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {

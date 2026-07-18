@@ -2467,7 +2467,8 @@ size_t hashTypeAllocSize(const robj *o) {
         size = sizeof(listpackEx) + lpBytes(lpt->lp);
     } else if (o->encoding == OBJ_ENCODING_HT) {
         dict *d = o->ptr;
-        size += sizeof(dict) + dictMemUsage(d) + *htGetMetadataSize(d);
+        size += sizeof(dict) + dictMetadataSize(d) +
+                dictMemUsage(d) + *htGetMetadataSize(d);
     } else if (o->encoding == OBJ_ENCODING_TMPL_LP) {
         unsigned char *lp = o->ptr;
         size = lpBytes(lp);

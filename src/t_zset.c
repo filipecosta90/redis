@@ -1395,7 +1395,7 @@ size_t zsetAllocSize(const robj *o) {
         dict *d = ((zset*)o->ptr)->dict;
         zskiplist *zsl = ((zset*)o->ptr)->zsl;
         size = sizeof(zset) + zslAllocSize(zsl) +
-            sizeof(dict) + dictMemUsage(d);
+            sizeof(dict) + dictMetadataSize(d) + dictMemUsage(d);
     } else {
         serverPanic("Unknown sorted set encoding");
     }

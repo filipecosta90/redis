@@ -1583,3 +1583,17 @@ if {[lindex [r config get proto-max-bulk-len] 1] == 10000000000} {
 } ;# skip 32bit builds
 }
 } ;# run_solo
+
+start_server {tags {"set"}} {
+    if {[string match {*jemalloc*} [s mem_allocator]]} {
+        test {MEMORY USAGE - HT-encoded set includes dict metasize} {
+            r del htset
+            r config set set-max-listpack-entries 4
+            for {set i 0} {$i < 5} {incr i} {
+                r sadd htset m$i
+            }
+            assert_encoding hashtable htset
+            assert_morethan_equal [r memory usage htset] 247
+        }
+    }
+}
