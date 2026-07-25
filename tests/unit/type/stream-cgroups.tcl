@@ -4846,40 +4846,49 @@ start_server {tags {"stream"}} {
     # Assertions below are allocator-agnostic (jemalloc, libc, tcmalloc, musl):
     #  1. structural ordering — MU grows on each XREADGROUP, shrinks on XACK
     #  2. MU / used_memory delta ratio — both terms track the same underlying
-    #     zmalloc_size, so the ratio is invariant across allocators. Buggy path
-    #     drives it to ~0.5-0.7 (list+listNode bypass alloc_size); the fix
-    #     keeps it > 0.9. A 0.8 floor splits with margin on any allocator.
+    #     zmalloc_size, so the ratio is invariant across allocators. Empirical:
+    #     buggy path 0.55/0.70/0.62; fixed path 0.84/0.87/0.90 (jemalloc x86_64,
+    #     N=5000, 2 groups). Floor 0.75 sits at the midpoint of the buggy-peak
+    #     (0.70) and fixed-floor (0.84) so both sides have ~0.05-0.09 margin,
+    #     robust against `used_memory` background jitter (client reply-buffer
+    #     high-water growth from the multi-KB XREADGROUP/XPENDING replies is
+    #     the dominant noise term). Sampling `[s used_memory]` before
+    #     `[r MEMORY USAGE ...]` at each checkpoint biases the ratio slightly
+    #     upward (the MU-command's INFO reply-buffer alloc is not yet in um),
+    #     which is the safer bias direction.
     test {MEMORY USAGE tracks cgroups_ref list allocations} {
         r DEL memstream
         set N 5000
         for {set i 0} {$i < $N} {incr i} {
             r XADD memstream * f v
         }
-        set mu_base [r MEMORY USAGE memstream]
         set um_base [s used_memory]
+        set mu_base [r MEMORY USAGE memstream]
 
         # First group drains N entries into its PEL, allocating N (list + one
         # listNode). Buggy path only tracks rax growth; fix adds the cgroups_ref
         # allocations to alloc_size, so MU tracks used_memory closely.
         r XGROUP CREATE memstream g1 0
         r XREADGROUP GROUP g1 c1 COUNT $N STREAMS memstream >
-        set mu1 [r MEMORY USAGE memstream]
         set um1 [s used_memory]
+        set mu1 [r MEMORY USAGE memstream]
         assert {$mu1 > $mu_base}
         set mu_d1 [expr {$mu1 - $mu_base}]
         set um_d1 [expr {$um1 - $um_base}]
-        assert {$um_d1 > 0 && double($mu_d1) / double($um_d1) > 0.8}
+        assert {$um_d1 > 0}
+        assert {double($mu_d1) / double($um_d1) > 0.75}
 
         # Second group appends one listNode per cglist. Fix charges those
         # listNodes to alloc_size; buggy path misses them entirely.
         r XGROUP CREATE memstream g2 0
         r XREADGROUP GROUP g2 c2 COUNT $N STREAMS memstream >
-        set mu2 [r MEMORY USAGE memstream]
         set um2 [s used_memory]
+        set mu2 [r MEMORY USAGE memstream]
         assert {$mu2 > $mu1}
         set mu_d2 [expr {$mu2 - $mu1}]
         set um_d2 [expr {$um2 - $um1}]
-        assert {$um_d2 > 0 && double($mu_d2) / double($um_d2) > 0.8}
+        assert {$um_d2 > 0}
+        assert {double($mu_d2) / double($um_d2) > 0.75}
 
         # Decrement path: ACKing all pending frees every listNode (and, once
         # the cglist is empty, the container). Buggy path leaves MU inflated;
@@ -4892,12 +4901,13 @@ start_server {tags {"stream"}} {
         foreach pend $g2_pending {
             r XACK memstream g2 [lindex $pend 0]
         }
-        set mu3 [r MEMORY USAGE memstream]
         set um3 [s used_memory]
+        set mu3 [r MEMORY USAGE memstream]
         assert {$mu3 < $mu2}
         set mu_d3 [expr {$mu2 - $mu3}]
         set um_d3 [expr {$um2 - $um3}]
-        assert {$um_d3 > 0 && double($mu_d3) / double($um_d3) > 0.8}
+        assert {$um_d3 > 0}
+        assert {double($mu_d3) / double($um_d3) > 0.75}
         r DEL memstream
     }
 }
