@@ -4841,55 +4841,63 @@ start_server {tags {"stream"}} {
     # per-group `listNode *` inside `s->cgroups_ref`. Before the fix those
     # allocations bypassed the stream's `alloc_size` counter, so MEMORY USAGE
     # under-reported by ~48 + 24*G bytes per pending entry (G = number of
-    # groups). The assertions below fail on the buggy code and pass on the fix.
+    # groups).
+    #
+    # Assertions below are allocator-agnostic (jemalloc, libc, tcmalloc, musl):
+    #  1. structural ordering — MU grows on each XREADGROUP, shrinks on XACK
+    #  2. MU / used_memory delta ratio — both terms track the same underlying
+    #     zmalloc_size, so the ratio is invariant across allocators. Buggy path
+    #     drives it to ~0.5-0.7 (list+listNode bypass alloc_size); the fix
+    #     keeps it > 0.9. A 0.8 floor splits with margin on any allocator.
     test {MEMORY USAGE tracks cgroups_ref list allocations} {
         r DEL memstream
         set N 5000
         for {set i 0} {$i < $N} {incr i} {
             r XADD memstream * f v
         }
-        # MU baseline before any consumer group holds pending entries.
         set mu_base [r MEMORY USAGE memstream]
+        set um_base [s used_memory]
 
-        # After a group drains all N entries into its PEL, cgroups_ref holds
-        # N (list + listNode) allocations. On the buggy path MU is unchanged
-        # from mu_base; on the fixed path MU grows by roughly 48 B * N.
+        # First group drains N entries into its PEL, allocating N (list + one
+        # listNode). Buggy path only tracks rax growth; fix adds the cgroups_ref
+        # allocations to alloc_size, so MU tracks used_memory closely.
         r XGROUP CREATE memstream g1 0
         r XREADGROUP GROUP g1 c1 COUNT $N STREAMS memstream >
         set mu1 [r MEMORY USAGE memstream]
-        # Buggy path: MU only tracks raxNode growth (~97 B/entry). Fix adds
-        # the list container + listNode (~72 B/entry). Threshold splits the
-        # two with margin.
-        assert {[expr {$mu1 - $mu_base}] > 130 * $N}
+        set um1 [s used_memory]
+        assert {$mu1 > $mu_base}
+        set mu_d1 [expr {$mu1 - $mu_base}]
+        set um_d1 [expr {$um1 - $um_base}]
+        assert {$um_d1 > 0 && double($mu_d1) / double($um_d1) > 0.8}
 
-        # Adding a second group doubles the per-entry listNode cost. Each of
-        # the N cglists gains one more listNode (~24 B). On the buggy path
-        # MU is unchanged from mu1; on the fixed path it grows by ~24 B * N.
+        # Second group appends one listNode per cglist. Fix charges those
+        # listNodes to alloc_size; buggy path misses them entirely.
         r XGROUP CREATE memstream g2 0
         r XREADGROUP GROUP g2 c2 COUNT $N STREAMS memstream >
         set mu2 [r MEMORY USAGE memstream]
-        # Adding a 2nd group re-uses the existing per-entry cglist and appends
-        # one listNode (~24 B/entry). Buggy path leaves ~86 B/entry from rax
-        # growth. Threshold splits with margin.
-        assert {[expr {$mu2 - $mu1}] > 100 * $N}
+        set um2 [s used_memory]
+        assert {$mu2 > $mu1}
+        set mu_d2 [expr {$mu2 - $mu1}]
+        set um_d2 [expr {$um2 - $um1}]
+        assert {$um_d2 > 0 && double($mu_d2) / double($um_d2) > 0.8}
 
-        # Decrement path: ACKing everything drains both PELs. Every listNode
-        # (and, once the list is empty, the list container) is freed. On the
-        # buggy path MU is unchanged; on the fixed path MU shrinks back to
-        # roughly mu_base.
+        # Decrement path: ACKing all pending frees every listNode (and, once
+        # the cglist is empty, the container). Buggy path leaves MU inflated;
+        # fix drives it back down proportionally to used_memory.
         set g1_pending [r XPENDING memstream g1 - + $N]
-        foreach entry $g1_pending {
-            r XACK memstream g1 [lindex $entry 0]
+        foreach pend $g1_pending {
+            r XACK memstream g1 [lindex $pend 0]
         }
         set g2_pending [r XPENDING memstream g2 - + $N]
-        foreach entry $g2_pending {
-            r XACK memstream g2 [lindex $entry 0]
+        foreach pend $g2_pending {
+            r XACK memstream g2 [lindex $pend 0]
         }
         set mu3 [r MEMORY USAGE memstream]
-        # ACKing both groups drains 2 listNodes + 1 list container per entry
-        # (~96 B/entry decrement contribution) on top of the rax removal.
-        # Buggy path only sees the rax removal (~183 B/entry).
-        assert {[expr {$mu2 - $mu3}] > 200 * $N}
+        set um3 [s used_memory]
+        assert {$mu3 < $mu2}
+        set mu_d3 [expr {$mu2 - $mu3}]
+        set um_d3 [expr {$um2 - $um3}]
+        assert {$um_d3 > 0 && double($mu_d3) / double($um_d3) > 0.8}
         r DEL memstream
     }
 }
