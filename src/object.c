@@ -1321,9 +1321,17 @@ char *strEncoding(int encoding) {
 /* =========================== Memory introspection ========================= */
 
 /* Returns the size in bytes consumed by the object header, key and value in RAM.
- * Note that the returned value is just an approximation, especially in the
- * case of aggregated data types where only "sample_size" elements
- * are checked and averaged to estimate the total size. */
+ *
+ * For core types (STRING/LIST/SET/ZSET/HASH/STREAM/ARRAY, plus OBJ_GCRA when
+ * compiled in) `sample_size` is ignored: the value is derived from
+ * kvobjAllocSize(), a tracked allocation-size counter maintained at add/remove
+ * time (see #14363). The counter is a self-consistent accounting of the
+ * object's own allocations; see the adjacent kvobjAllocSize() comment for
+ * caveats (some paths accumulate requested sizes, others jemalloc-usable).
+ *
+ * For OBJ_MODULE the returned value is still an approximation: the module
+ * type's mem_usage callback samples sample_size elements to estimate the
+ * total, so the argument is honored on that path only. */
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
 size_t kvobjComputeSize(robj *key, kvobj *o, size_t sample_size, int dbid) {
     if (o->type == OBJ_STRING ||
@@ -1817,8 +1825,10 @@ void memoryCommand(client *c) {
 "STATS",
 "    Return information about the memory usage of the server.",
 "USAGE <key> [SAMPLES <count>]",
-"    Return memory in bytes used by <key> and its value. Nested values are",
-"    sampled up to <count> times (default: 5, 0 means sample all).",
+"    Return memory in bytes used by <key> and its value. For core types the",
+"    size is tracked and <count> is ignored (kept for backward compatibility).",
+"    For module-type keys nested values are sampled up to <count> times",
+"    (default: 5, 0 means sample all).",
 NULL
         };
         addReplyHelp(c, help);

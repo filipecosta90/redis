@@ -1,7 +1,7 @@
 {
     "USAGE": {
-        "summary": "Estimates the memory usage of a key.",
-        "complexity": "O(N) where N is the number of samples.",
+        "summary": "Returns the memory used by a key. SAMPLES applies only to module-type keys.",
+        "complexity": "O(N) where N is the number of samples (module-type keys only; core-type keys ignore SAMPLES and use a tracked size).",
         "group": "server",
         "since": "4.0.0",
         "arity": -3,
