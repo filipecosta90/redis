@@ -1595,7 +1595,7 @@ start_server {tags {"set"}} {
     # 244 B; fix MU = 252 B. Floor `> 248` gives ~4 B either way — robust
     # against normal jemalloc slab-class jitter but still fails on the buggy.
     if {[string match {*jemalloc*} [s mem_allocator]] &&
-        $::tcl_platform(pointerSize) == 8} {
+        [s arch_bits] == 64} {
         test {MEMORY USAGE - HT-encoded set includes dict metasize} {
             # Regression: setTypeAllocSize() must add dictMetadataSize(d) to
             # match kvstoreMemUsage()'s sizeof(dict) + metaSize formula at

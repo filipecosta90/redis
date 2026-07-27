@@ -1079,7 +1079,7 @@ start_server {tags {"hash"}} {
     # tests/unit/type/set.tcl's HT-encoded regression). Fix delta is
     # sizeof(size_t) = 8 B on 64-bit for non-HFE, ~32 B for HFE.
     if {[string match {*jemalloc*} [s mem_allocator]] &&
-        $::tcl_platform(pointerSize) == 8} {
+        [s arch_bits] == 64} {
         test {MEMORY USAGE - HT-encoded hash includes dict metasize} {
             # Regression: hashTypeAllocSize() must add dictMetadataSize(d) to
             # match kvstoreMemUsage()'s sizeof(dict) + metaSize formula. See
