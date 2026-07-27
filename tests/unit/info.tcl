@@ -731,41 +731,23 @@ start_cluster 1 0 {tags {external:skip cluster}} {
 }
 
 start_server {tags {"info external:skip"}} {
-    # Gate to jemalloc + 64-bit — the overhead breakdown is jemalloc-slab-
-    # class quantized (via kvstoreMemUsage's bucket allocations), and the
-    # phantom term's magnitude (sizeof(robj) = 16 B on 64-bit, ~10 B on
-    # 32-bit) differs enough by pointer width that the fixed 30-B/key
-    # ceiling would false-pass on the buggy 32-bit binary (buggy 32-bit
-    # ~150-250K, well below 300K).
+    # jemalloc + 64-bit gate: overhead accounting is allocator-quantized and
+    # sizeof(robj) differs by pointer width — on 32-bit the buggy binary would
+    # also fit below the ceiling, defeating the discriminator.
     if {[string match {*jemalloc*} [s mem_allocator]] &&
         [s arch_bits] == 64} {
         test "MEMORY STATS overhead.hashtable.main does not include a phantom robj per key" {
-            # Regression: the pre-#13806 phantom `+ keyscount * sizeof(robj)`
-            # term at src/object.c::getMemoryOverheadData double-counted the
-            # 16-B robj header. Post-#13806, the header lives inside the
-            # kvobj (inline via ENTRY_PTR_IS_EVEN_KEY tag or in a
-            # dictEntryNoValue slot) and is charged per key by
-            # kvobjAllocSize(); the getMemoryOverheadData addition was stale.
-            # Symptom pre-fix: dataset.bytes shrinks when adding TTLs (the
-            # real +8 B/key expire metabit is dwarfed by the 16-B phantom).
-            #
-            # Assertion is a two-sided range to (a) discriminate the phantom
-            # (buggy ~45 B/key on this jemalloc x86_64 fits at ~450K, well
-            # above the 400K ceiling), and (b) tolerate normal dict-rehash
-            # jitter on the fix side (empirical 29.14 B/key = 291K; fix ceiling
-            # of 400K = 40 B/key sits between the fix (29) and buggy (45)
-            # midpoint 37 with ~11 B either way).
+            # Regression: post-#13806 the robj header is inside the kvobj and
+            # is already counted per key via kvobjAllocSize(); the old
+            # "+ keyscount * sizeof(robj)" in getMemoryOverheadData was stale.
+            # Empirical jemalloc x86_64, N=10K: fix ~29 B/key, buggy ~45 B/key.
+            # Range [20, 40] discriminates and tolerates rehash-transient jitter.
             r flushall
             set n 10000
             for {set i 0} {$i < $n} {incr i} { r set k$i v }
             set info_mem [r memory stats]
             set overhead_main [dict get $info_mem db.0 overhead.hashtable.main]
-            # Fix midpoint: ~29 B/key; buggy ~45 B/key. Ceiling 40 B/key.
             assert_lessthan_equal $overhead_main [expr {$n * 40}]
-            # Sanity lower bound: real overhead is at least the entry-slot
-            # (16 B/key) + bucket-table (~8 B/key), i.e., >= 20 B/key. This
-            # protects against a future change that accidentally zeroes the
-            # accounting (silent success would be catastrophic).
             assert_morethan_equal $overhead_main [expr {$n * 20}]
             r flushall
         }
