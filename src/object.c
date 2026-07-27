@@ -1339,9 +1339,7 @@ size_t kvobjComputeSize(robj *key, kvobj *o, size_t sample_size, int dbid) {
     {
         return kvobjAllocSize(o);
     } else if (o->type == OBJ_MODULE) {
-        moduleValue *mv = o->ptr;
-        return zmalloc_size(o) + zmalloc_size(mv) +
-               moduleGetMemUsage(key, o, sample_size, dbid);
+        return kvobjAllocSize(o) + moduleGetMemUsage(key, o, sample_size, dbid);
     }
     serverPanic("Unknown object type");
 }
@@ -1385,7 +1383,12 @@ size_t kvobjAllocSize(kvobj *o) {
         redisArray *ar = o->ptr;
         asize += ar->alloc_size;
     } else if (o->type == OBJ_MODULE) {
-        /* TODO: Provide moduleGetAllocSize() module API for O(1) allocation size retrieval */
+        /* Account for the moduleValue wrapper (moduleType* + value*) that
+         * createModuleObject() allocates for every module key. The module's
+         * own payload is out of scope here — kvobjComputeSize() adds it via
+         * moduleGetMemUsage() at the caller. */
+        moduleValue *mv = o->ptr;
+        asize += zmalloc_size(mv);
     }
     return asize;
 }
