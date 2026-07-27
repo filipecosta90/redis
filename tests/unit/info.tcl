@@ -730,31 +730,44 @@ start_cluster 1 0 {tags {external:skip cluster}} {
     }
 }
 
-start_server {tags {"info"}} {
-    test "MEMORY STATS overhead.hashtable.main does not include a phantom robj per key" {
-        # Regression test for the pre-#13806 phantom `+ keyscount * sizeof(robj)`
-        # term at object.c getMemoryOverheadData (was overhead_ht_main). Since
-        # kvobj unification in #13806, the 16 B robj header lives inside the
-        # kvobj (either inline in the bucket via ENTRY_PTR_IS_EVEN_KEY or in a
-        # dictEntryNoValue slot) and is already charged per key via
-        # kvobjAllocSize(); charging it again here made MEMORY STATS report
-        # dataset.bytes as ~16 B/key smaller than reality and produced the
-        # counter-intuitive dataset-shrinks-when-adding-TTL symptom.
-        #
-        # The dict internals we DO count in overhead.hashtable.main
-        # (kvstoreMemUsage) are: buckets (~8 B/key at α≈1), inline-or-alloc'd
-        # entries (worst case 16 B/key if every entry were alloc'd rather than
-        # inline-tagged, in practice ~6 B/key at α≈1 Poisson), plus O(1)
-        # kvstore + per-dict overhead. That should sit well below 30 B/key
-        # even in the worst case; the buggy value was ~42 B/key (=~26 real +
-        # 16 phantom).
-        r flushall
-        set n 10000
-        for {set i 0} {$i < $n} {incr i} { r set k$i v }
-        set info_mem [r memory stats]
-        set overhead_main [dict get $info_mem db.0 overhead.hashtable.main]
-        # Fixed: ~26 B/key. Pre-fix: ~42 B/key. Discriminating floor.
-        assert_lessthan_equal $overhead_main [expr {$n * 30}]
-        r flushall
+start_server {tags {"info external:skip"}} {
+    # Gate to jemalloc + 64-bit — the overhead breakdown is jemalloc-slab-
+    # class quantized (via kvstoreMemUsage's bucket allocations), and the
+    # phantom term's magnitude (sizeof(robj) = 16 B on 64-bit, ~10 B on
+    # 32-bit) differs enough by pointer width that the fixed 30-B/key
+    # ceiling would false-pass on the buggy 32-bit binary (buggy 32-bit
+    # ~150-250K, well below 300K).
+    if {[string match {*jemalloc*} [s mem_allocator]] &&
+        [s arch_bits] == 64} {
+        test "MEMORY STATS overhead.hashtable.main does not include a phantom robj per key" {
+            # Regression: the pre-#13806 phantom `+ keyscount * sizeof(robj)`
+            # term at src/object.c::getMemoryOverheadData double-counted the
+            # 16-B robj header. Post-#13806, the header lives inside the
+            # kvobj (inline via ENTRY_PTR_IS_EVEN_KEY tag or in a
+            # dictEntryNoValue slot) and is charged per key by
+            # kvobjAllocSize(); the getMemoryOverheadData addition was stale.
+            # Symptom pre-fix: dataset.bytes shrinks when adding TTLs (the
+            # real +8 B/key expire metabit is dwarfed by the 16-B phantom).
+            #
+            # Assertion is a two-sided range to (a) discriminate the phantom
+            # (buggy ~45 B/key on this jemalloc x86_64 fits at ~450K, well
+            # above the 400K ceiling), and (b) tolerate normal dict-rehash
+            # jitter on the fix side (empirical 29.14 B/key = 291K; fix ceiling
+            # of 400K = 40 B/key sits between the fix (29) and buggy (45)
+            # midpoint 37 with ~11 B either way).
+            r flushall
+            set n 10000
+            for {set i 0} {$i < $n} {incr i} { r set k$i v }
+            set info_mem [r memory stats]
+            set overhead_main [dict get $info_mem db.0 overhead.hashtable.main]
+            # Fix midpoint: ~29 B/key; buggy ~45 B/key. Ceiling 40 B/key.
+            assert_lessthan_equal $overhead_main [expr {$n * 40}]
+            # Sanity lower bound: real overhead is at least the entry-slot
+            # (16 B/key) + bucket-table (~8 B/key), i.e., >= 20 B/key. This
+            # protects against a future change that accidentally zeroes the
+            # accounting (silent success would be catastrophic).
+            assert_morethan_equal $overhead_main [expr {$n * 20}]
+            r flushall
+        }
     }
 }
