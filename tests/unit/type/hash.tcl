@@ -1075,15 +1075,48 @@ start_server {tags {"hash"}} {
 }
 
 start_server {tags {"hash"}} {
-    if {[string match {*jemalloc*} [s mem_allocator]]} {
+    # Gate to jemalloc + 64-bit (same reasoning as
+    # tests/unit/type/set.tcl's HT-encoded regression). Fix delta is
+    # sizeof(size_t) = 8 B on 64-bit for non-HFE, ~32 B for HFE.
+    if {[string match {*jemalloc*} [s mem_allocator]] &&
+        $::tcl_platform(pointerSize) == 8} {
         test {MEMORY USAGE - HT-encoded hash includes dict metasize} {
+            # Regression: hashTypeAllocSize() must add dictMetadataSize(d) to
+            # match kvstoreMemUsage()'s sizeof(dict) + metaSize formula. See
+            # tests/unit/type/set.tcl for the jemalloc/64-bit gate rationale.
             r del htonly
             r config set hash-max-listpack-entries 4
             for {set i 0} {$i < 5} {incr i} {
                 r hset htonly f$i v$i
             }
             assert_encoding hashtable htonly
-            assert_morethan_equal [r memory usage htonly] 282
+            # Buggy = 275; fix = 283; floor 279 = midpoint with ~4 B margin.
+            assert_morethan [r memory usage htonly] 279
+        }
+
+        # HFE HT hashes use entryHashDictTypeWithHFE whose dictMetadataBytes
+        # returns sizeof(htMetadataEx) ≈ 32 B — 4× the non-HFE case. Locks in
+        # the largest branch's delta independently so a refactor that zeroes
+        # the HFE metadata callback is caught.
+        test {MEMORY USAGE - HFE HT-encoded hash includes dict metasize} {
+            r del htexp
+            r config set hash-max-listpack-entries 4
+            for {set i 0} {$i < 5} {incr i} {
+                r hset htexp f$i v$i
+            }
+            # Attach a TTL to at least one field to promote the dict to
+            # entryHashDictTypeWithHFE. Encoding stays HT because we forced
+            # hash-max-listpack-entries=4 above.
+            r hexpire htexp 60 FIELDS 1 f0
+            assert_encoding hashtable htexp
+            # HFE metasize is sizeof(htMetadataEx) = 32 B on 64-bit; the
+            # buggy binary under-counts by that amount. Empirical on jemalloc
+            # x86_64: buggy = 274 (identical to non-HFE MU because the buggy
+            # path drops all `dictMetadataSize` contribution), fix = 306
+            # (buggy + exactly 32 B). Floor 290 sits at the midpoint with
+            # ~16 B margin either way — 4× the non-HFE margin because the
+            # delta is 4× larger.
+            assert_morethan [r memory usage htexp] 290
         }
     }
 }

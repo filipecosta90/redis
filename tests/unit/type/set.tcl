@@ -1585,15 +1585,31 @@ if {[lindex [r config get proto-max-bulk-len] 1] == 10000000000} {
 } ;# run_solo
 
 start_server {tags {"set"}} {
-    if {[string match {*jemalloc*} [s mem_allocator]]} {
+    # Gate to jemalloc + 64-bit: the fix delta is
+    # dictMetadataSize(setDictType) = sizeof(size_t) = 8 B on 64-bit
+    # (4 B on 32-bit — same test with a re-calibrated threshold, out of
+    # scope here). The per-key contribution is small vs total MU (~3%),
+    # so the aggregate MU/used_memory ratio doesn't discriminate cleanly
+    # across `used_memory` jitter; we use a direct MU floor with generous
+    # margin instead. Empirical jemalloc x86_64: buggy MU(HT set, 5 m) =
+    # 244 B; fix MU = 252 B. Floor `> 248` gives ~4 B either way — robust
+    # against normal jemalloc slab-class jitter but still fails on the buggy.
+    if {[string match {*jemalloc*} [s mem_allocator]] &&
+        $::tcl_platform(pointerSize) == 8} {
         test {MEMORY USAGE - HT-encoded set includes dict metasize} {
+            # Regression: setTypeAllocSize() must add dictMetadataSize(d) to
+            # match kvstoreMemUsage()'s sizeof(dict) + metaSize formula at
+            # src/kvstore.c. Pre-fix undercounts every HT-encoded set by
+            # sizeof(size_t) = 8 B on 64-bit jemalloc.
             r del htset
             r config set set-max-listpack-entries 4
             for {set i 0} {$i < 5} {incr i} {
                 r sadd htset m$i
             }
             assert_encoding hashtable htset
-            assert_morethan_equal [r memory usage htset] 247
+            # Buggy = 244; fix = 252; floor 248 = midpoint. Gate above
+            # keeps the empirical calibration invariant.
+            assert_morethan [r memory usage htset] 248
         }
     }
 }
