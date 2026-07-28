@@ -74,11 +74,48 @@ static TString *newlstr (lua_State *L, const char *str, size_t l,
 
 TString *luaS_newlstr (lua_State *L, const char *str, size_t l) {
   GCObject *o;
-  unsigned int h = cast(unsigned int, l);  /* seed */
-  size_t step = 1;
-  size_t l1;
-  for (l1=l; l1>=step; l1-=step)  /* compute hash */
-    h = h ^ ((h<<5)+(h>>2)+cast(unsigned char, str[l1-1]));
+  /* MurmurHash3_x86_32-style mixer: 4-byte blocks with high ILP.
+     Preserves interning semantics (memcmp below guarantees correctness);
+     hash is per-process (intern table only), so distribution can change. */
+  unsigned int h;
+  {
+    const unsigned int c1 = 0xcc9e2d51u;
+    const unsigned int c2 = 0x1b873593u;
+    unsigned int h32 = cast(unsigned int, l);  /* seed */
+    size_t nblocks = l >> 2;
+    size_t i;
+    for (i = 0; i < nblocks; i++) {
+      unsigned int k;
+      memcpy(&k, str + (i << 2), 4);
+      k *= c1;
+      k = (k << 15) | (k >> 17);
+      k *= c2;
+      h32 ^= k;
+      h32 = (h32 << 13) | (h32 >> 19);
+      h32 = h32 * 5u + 0xe6546b64u;
+    }
+    {
+      const unsigned char *tail = (const unsigned char *)(str + (nblocks << 2));
+      unsigned int k = 0;
+      size_t rem = l & 3u;
+      if (rem >= 3) k ^= (unsigned int)tail[2] << 16;
+      if (rem >= 2) k ^= (unsigned int)tail[1] << 8;
+      if (rem >= 1) {
+        k ^= (unsigned int)tail[0];
+        k *= c1;
+        k = (k << 15) | (k >> 17);
+        k *= c2;
+        h32 ^= k;
+      }
+    }
+    h32 ^= (unsigned int)l;
+    h32 ^= h32 >> 16;
+    h32 *= 0x85ebca6bu;
+    h32 ^= h32 >> 13;
+    h32 *= 0xc2b2ae35u;
+    h32 ^= h32 >> 16;
+    h = h32;
+  }
   for (o = G(L)->strt.hash[lmod(h, G(L)->strt.size)];
        o != NULL;
        o = o->gch.next) {
