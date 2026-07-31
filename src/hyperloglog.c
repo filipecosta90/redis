@@ -1965,42 +1965,55 @@ void pfselftestCommand(client *c) {
         }
     }
 
-    /* Test 1b: hllDenseCompress() against a HLL_DENSE_SET_REGISTER() reference.
-     * Whichever implementation is dispatched -- AVX2, NEON or scalar -- must
-     * agree with the macro that defines the dense layout. This keeps an
-     * independent oracle for all of them: comparing two optimized packers
-     * against each other would not catch a fault they share. */
+    /* Test 1b: the dense packers against a HLL_DENSE_SET_REGISTER() reference.
+     * The macro defines the dense layout, so it is the only independent oracle
+     * available: comparing two optimized packers against each other cannot
+     * catch a fault they share.
+     *
+     * Both the dispatched implementation (AVX2 or NEON where available) and the
+     * scalar one are checked. Calling hllDenseCompress() alone would leave the
+     * scalar path untested wherever a SIMD kernel is selected, which is every
+     * mainstream platform. */
     {
+        sds packed = sdsnewlen(NULL,HLL_DENSE_SIZE);
         sds reference = sdsnewlen(NULL,HLL_DENSE_SIZE);
+        struct hllhdr *packedhdr = (struct hllhdr*) packed;
         struct hllhdr *refhdr = (struct hllhdr*) reference;
+        const char *failed = NULL;
+        size_t denselen = HLL_DENSE_SIZE-HLL_HDR_SIZE;
 
-        for (j = 0; j < 16; j++) {
+        for (j = 0; !failed && j < 16; j++) {
             for (i = 0; i < HLL_REGISTERS; i++) {
                 /* Cover the extremes as well as random values. */
                 if (j == 0) bytecounters[i] = 0;
                 else if (j == 1) bytecounters[i] = HLL_REGISTER_MAX;
                 else bytecounters[i] = rand() & HLL_REGISTER_MAX;
             }
-            /* Both destinations start dirty, so a packer that fails to
-             * overwrite every bit is caught rather than masked by zeros. */
-            memset(hdr->registers,0x5a,HLL_DENSE_SIZE-HLL_HDR_SIZE);
-            memset(refhdr->registers,0x5a,HLL_DENSE_SIZE-HLL_HDR_SIZE);
-
-            hllDenseCompress(hdr->registers,bytecounters);
+            /* Every destination starts dirty, so a packer that fails to
+             * overwrite some bits is caught rather than masked by zeros. */
+            memset(refhdr->registers,0x5a,denselen);
             for (i = 0; i < HLL_REGISTERS; i++)
                 HLL_DENSE_SET_REGISTER(refhdr->registers,i,bytecounters[i]);
 
-            if (memcmp(hdr->registers,refhdr->registers,
-                       HLL_DENSE_SIZE-HLL_HDR_SIZE) != 0)
-            {
-                sdsfree(reference);
-                addReplyError(c,
-                    "TESTFAILED hllDenseCompress() disagrees with "
-                    "HLL_DENSE_SET_REGISTER()");
-                goto cleanup;
-            }
+            memset(packedhdr->registers,0x5a,denselen);
+            hllDenseCompress(packedhdr->registers,bytecounters);
+            if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)
+                failed = "hllDenseCompress";
+#if HLL_BITS == 6
+            memset(packedhdr->registers,0x5a,denselen);
+            hllDenseCompressScalar(packedhdr->registers,bytecounters);
+            if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)
+                failed = "hllDenseCompressScalar";
+#endif
         }
+        sdsfree(packed);
         sdsfree(reference);
+        if (failed) {
+            addReplyErrorFormat(c,
+                "TESTFAILED %s() disagrees with HLL_DENSE_SET_REGISTER()",
+                failed);
+            goto cleanup;
+        }
     }
 
     /* Test 2: approximation error.
