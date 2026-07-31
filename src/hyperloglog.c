@@ -1546,7 +1546,52 @@ void hllDenseCompressAarch64(uint8_t *reg_dense, const uint8_t *reg_raw) {
 }
 #endif
 
-/* Compress raw registers to dense representation. */
+#if HLL_BITS == 6
+/* A specialized version of hllDenseCompress, optimized for default configurations.
+ * Based on the AVX2 version.
+ *
+ * Requirements:
+ * 1) HLL_BITS == 6
+ *
+ * 4 registers (4*HLL_BITS = 24 bits) pack into exactly 3 bytes, so every output
+ * byte is built and stored once. HLL_DENSE_SET_REGISTER() is deliberately not
+ * used here: it read-modify-writes both bytes a register straddles, and since
+ * registers share bytes each iteration would wait on the previous iteration's
+ * store. Nothing needs preserving, because the registers tile the dense array
+ * exactly (asserted below).
+ *
+ * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
+ * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
+ */
+static_assert((HLL_REGISTERS / 4) * 3 == HLL_DENSE_SIZE - HLL_HDR_SIZE,
+              "hllDenseCompressScalar packs 4 registers into 3 bytes");
+static void hllDenseCompressScalar(uint8_t *reg_dense, const uint8_t *reg_raw) {
+    const uint8_t *r = reg_raw;
+    uint8_t *t = reg_dense;
+
+    for (int i = 0; i < HLL_REGISTERS / 4; ++i) {
+        uint32_t w = (uint32_t)(r[0] & HLL_REGISTER_MAX) |
+                     (uint32_t)(r[1] & HLL_REGISTER_MAX) << HLL_BITS |
+                     (uint32_t)(r[2] & HLL_REGISTER_MAX) << (2*HLL_BITS) |
+                     (uint32_t)(r[3] & HLL_REGISTER_MAX) << (3*HLL_BITS);
+
+        /* Endian neutral: 'w' is stored one byte at a time. */
+        t[0] = (uint8_t)w;
+        t[1] = (uint8_t)(w >> 8);
+        t[2] = (uint8_t)(w >> 16);
+
+        r += 4;
+        t += 3;
+    }
+}
+#endif
+
+/* Compress raw registers to dense representation.
+ *
+ * reg_dense must have room for HLL_DENSE_SIZE-HLL_HDR_SIZE bytes plus one
+ * addressable trailing byte, which the AVX2 and NEON tail loops write through
+ * HLL_DENSE_SET_REGISTER(). sds NUL termination satisfies this.
+ * reg_raw must have HLL_REGISTERS bytes. */
 void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
 #if HLL_REGISTERS == 16384 && HLL_BITS == 6
 #ifdef HAVE_AVX2
@@ -1564,31 +1609,8 @@ void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
 #endif
 #endif
 
-#if HLL_BITS == 6 && (HLL_REGISTERS % 4) == 0
-    /* Scalar fallback, same transform as the SIMD kernels above: 4 registers
-     * (4*6 = 24 bits) pack into exactly 3 bytes, so every output byte is built
-     * once and stored once.
-     *
-     * HLL_DENSE_SET_REGISTER() cannot be used in a loop here: it does a
-     * read-modify-write of both bytes it straddles, and since 6-bit registers
-     * share bytes, each iteration's load depends on the previous iteration's
-     * store. That turns the whole loop into one store-to-load forwarding chain.
-     * Building each byte once is ~19x faster and produces identical output,
-     * because the 16384 registers tile the 12288 dense bytes exactly, leaving
-     * no pre-existing bits to preserve. */
-    for (int i = 0; i < HLL_REGISTERS / 4; i++) {
-        uint32_t w = (uint32_t)(reg_raw[0] & HLL_REGISTER_MAX) |
-                     (uint32_t)(reg_raw[1] & HLL_REGISTER_MAX) << 6 |
-                     (uint32_t)(reg_raw[2] & HLL_REGISTER_MAX) << 12 |
-                     (uint32_t)(reg_raw[3] & HLL_REGISTER_MAX) << 18;
-        /* Stored byte-at-a-time on purpose: endian-neutral, unlike a 32 bit
-         * store or a memcpy() of 'w'. */
-        reg_dense[0] = (uint8_t)(w);
-        reg_dense[1] = (uint8_t)(w >> 8);
-        reg_dense[2] = (uint8_t)(w >> 16);
-        reg_raw += 4;
-        reg_dense += 3;
-    }
+#if HLL_BITS == 6
+    hllDenseCompressScalar(reg_dense, reg_raw);
 #else
     for (int i = 0; i < HLL_REGISTERS; i++) {
         HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
@@ -1941,6 +1963,44 @@ void pfselftestCommand(client *c) {
                 goto cleanup;
             }
         }
+    }
+
+    /* Test 1b: hllDenseCompress() against a HLL_DENSE_SET_REGISTER() reference.
+     * Whichever implementation is dispatched -- AVX2, NEON or scalar -- must
+     * agree with the macro that defines the dense layout. This keeps an
+     * independent oracle for all of them: comparing two optimized packers
+     * against each other would not catch a fault they share. */
+    {
+        sds reference = sdsnewlen(NULL,HLL_DENSE_SIZE);
+        struct hllhdr *refhdr = (struct hllhdr*) reference;
+
+        for (j = 0; j < 16; j++) {
+            for (i = 0; i < HLL_REGISTERS; i++) {
+                /* Cover the extremes as well as random values. */
+                if (j == 0) bytecounters[i] = 0;
+                else if (j == 1) bytecounters[i] = HLL_REGISTER_MAX;
+                else bytecounters[i] = rand() & HLL_REGISTER_MAX;
+            }
+            /* Both destinations start dirty, so a packer that fails to
+             * overwrite every bit is caught rather than masked by zeros. */
+            memset(hdr->registers,0x5a,HLL_DENSE_SIZE-HLL_HDR_SIZE);
+            memset(refhdr->registers,0x5a,HLL_DENSE_SIZE-HLL_HDR_SIZE);
+
+            hllDenseCompress(hdr->registers,bytecounters);
+            for (i = 0; i < HLL_REGISTERS; i++)
+                HLL_DENSE_SET_REGISTER(refhdr->registers,i,bytecounters[i]);
+
+            if (memcmp(hdr->registers,refhdr->registers,
+                       HLL_DENSE_SIZE-HLL_HDR_SIZE) != 0)
+            {
+                sdsfree(reference);
+                addReplyError(c,
+                    "TESTFAILED hllDenseCompress() disagrees with "
+                    "HLL_DENSE_SET_REGISTER()");
+                goto cleanup;
+            }
+        }
+        sdsfree(reference);
     }
 
     /* Test 2: approximation error.

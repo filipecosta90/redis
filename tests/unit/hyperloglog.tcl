@@ -317,6 +317,39 @@ start_server {tags {"hll"}} {
 
     } {} {needs:pfdebug}
 
+    test {PFMERGE results with simd on a populated dense destination} {
+        r del hllscalar2{t} hllsimd2{t} hllsrc1{t} hllsrc2{t}
+        for {set x 1} {$x < 5000} {incr x} {
+            r pfadd hllsrc1{t} a-$x
+            r pfadd hllsrc2{t} b-$x
+        }
+        r pfdebug todense hllsrc1{t}
+        r pfdebug todense hllsrc2{t}
+
+        # Seed both destinations so the compared merge overwrites registers
+        # that already hold non-zero values. The test above deletes its
+        # destinations first, so it only ever compresses into a zeroed buffer.
+        for {set x 1} {$x < 5000} {incr x} {
+            r pfadd hllscalar2{t} seed-$x
+            r pfadd hllsimd2{t} seed-$x
+        }
+        r pfdebug todense hllscalar2{t}
+        r pfdebug todense hllsimd2{t}
+        assert_equal [r get hllscalar2{t}] [r get hllsimd2{t}]
+
+        # Merge twice, so the second merge is idempotent over packed bytes.
+        r pfdebug simd off
+        r pfmerge hllscalar2{t} hllsrc1{t} hllsrc2{t}
+        r pfmerge hllscalar2{t} hllsrc1{t} hllsrc2{t}
+        r pfdebug simd on
+        r pfmerge hllsimd2{t} hllsrc1{t} hllsrc2{t}
+        r pfmerge hllsimd2{t} hllsrc1{t} hllsrc2{t}
+
+        assert_equal [r get hllscalar2{t}] [r get hllsimd2{t}]
+        assert_equal [r pfdebug getreg hllscalar2{t}] [r pfdebug getreg hllsimd2{t}]
+        assert_equal [r pfcount hllscalar2{t}] [r pfcount hllsimd2{t}]
+    } {} {needs:pfdebug}
+
     test {PFCOUNT multiple-keys merge returns cardinality of union #1} {
         r del hll1{t} hll2{t} hll3{t}
         for {set x 1} {$x < 10000} {incr x} {
