@@ -350,6 +350,44 @@ start_server {tags {"hll"}} {
         assert_equal [r pfcount hllscalar2{t}] [r pfcount hllsimd2{t}]
     } {} {needs:pfdebug}
 
+    test {PFMERGE dense packing agrees with an independently built HLL} {
+        # The dense packer is reached from exactly one place, the dense branch
+        # of PFMERGE. PFADD never routes through it, so building the same HLL
+        # by adding the union of the elements directly is an oracle that shares
+        # no implementation with the code under test.
+        #
+        # The SIMD-vs-scalar comparisons above cannot do this: "PFDEBUG SIMD
+        # ON/OFF" is compiled out unless HAVE_AVX2 or HAVE_AARCH64_NEON is
+        # defined, so on a build with neither -- which is precisely the build
+        # where the scalar packer is the only implementation -- both arms run
+        # the same code and the assertion holds no matter what the packer does.
+        r del hllmerged{t} hllunion{t} hllsrca{t} hllsrcb{t}
+        for {set x 1} {$x < 5000} {incr x} {
+            r pfadd hllsrca{t} a-$x
+            r pfadd hllsrcb{t} b-$x
+            r pfadd hllunion{t} a-$x b-$x
+        }
+        r pfdebug todense hllsrca{t}
+        r pfdebug todense hllsrcb{t}
+        r pfdebug todense hllunion{t}
+        set expected [r pfdebug getreg hllunion{t}]
+
+        # Check every packer this build can reach against that oracle. On a
+        # build with no SIMD the two arms are the same code and "PFDEBUG SIMD"
+        # is a no-op reply -- which is fine, because there the scalar packer is
+        # what both arms run and it is what we want covered.
+        foreach mode {off on} {
+            r del hllmerged{t}
+            r pfdebug simd $mode
+            # At least one source is dense, so PFMERGE takes the dense path.
+            r pfmerge hllmerged{t} hllsrca{t} hllsrcb{t}
+            assert_encoding raw hllmerged{t}
+            assert_equal $expected [r pfdebug getreg hllmerged{t}]
+            assert_equal [r pfcount hllunion{t}] [r pfcount hllmerged{t}]
+        }
+        r pfdebug simd on
+    } {} {needs:pfdebug}
+
     test {PFCOUNT multiple-keys merge returns cardinality of union #1} {
         r del hll1{t} hll2{t} hll3{t}
         for {set x 1} {$x < 10000} {incr x} {

@@ -1473,12 +1473,17 @@ void hllDenseCompressAVX2(uint8_t *reg_dense, const uint8_t *reg_raw) {
         t += 24;
     }
 
-    /* Merge the last 32 registers normally 
+    /* Merge the last 32 registers normally
      * as the AVX2 algorithm needs 4 padding bytes at the end */
     for (int i = HLL_REGISTERS - 32; i < HLL_REGISTERS; i++) {
         HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
     }
 }
+
+/* Whether this host can execute the kernel above. Used by the hllDensePackers[]
+ * table; unlike HLL_USE_AVX2 it ignores simd_enabled, which is a debug toggle
+ * rather than a statement about the hardware. */
+static int hllPackerUsableAVX2(void) { return __builtin_cpu_supports("avx2"); }
 #endif
 
 #ifdef HAVE_AARCH64_NEON
@@ -1546,24 +1551,27 @@ void hllDenseCompressAarch64(uint8_t *reg_dense, const uint8_t *reg_raw) {
 }
 #endif
 
+/* The scalar dense packer. Two variants, selected at compile time: a
+ * specialized one for the default HLL_BITS == 6 layout, and a generic one for
+ * any other HLL_BITS. Exactly one is always defined, so callers can name the
+ * scalar path directly instead of reaching it through hllDenseCompress().
+ *
+ * reg_dense: pointer to the dense representation array (12288 bytes at
+ *            HLL_P 14 / HLL_BITS 6, HLL_BITS bits per register)
+ * reg_raw: pointer to the raw representation array (HLL_REGISTERS bytes, one
+ *          byte per register) */
 #if HLL_BITS == 6
-/* A specialized version of hllDenseCompress, optimized for default configurations.
- * Based on the AVX2 version.
- *
- * Requirements:
- * 1) HLL_BITS == 6
- *
- * 4 registers (4*HLL_BITS = 24 bits) pack into exactly 3 bytes, so every output
+/* 4 registers (4*HLL_BITS = 24 bits) pack into exactly 3 bytes, so every output
  * byte is built and stored once. HLL_DENSE_SET_REGISTER() is deliberately not
  * used here: it read-modify-writes both bytes a register straddles, and since
  * registers share bytes each iteration would wait on the previous iteration's
  * store. Nothing needs preserving, because the registers tile the dense array
- * exactly (asserted below).
- *
- * reg_dense: pointer to the dense representation array (12288 bytes, 6 bits per register)
- * reg_raw: pointer to the raw representation array (16384 bytes, one byte per register)
- */
-static_assert((HLL_REGISTERS / 4) * 3 == HLL_DENSE_SIZE - HLL_HDR_SIZE,
+ * exactly — the static_assert below documents that identity, which holds for
+ * every HLL_P >= 2. Unlike the generic variant this one writes only the
+ * HLL_DENSE_SIZE-HLL_HDR_SIZE payload bytes and never touches the byte past
+ * the last register. */
+static_assert(HLL_BITS == 6 && (HLL_REGISTERS & 3) == 0 &&
+              (HLL_REGISTERS / 4) * 3 == HLL_DENSE_SIZE - HLL_HDR_SIZE,
               "hllDenseCompressScalar packs 4 registers into 3 bytes");
 static void hllDenseCompressScalar(uint8_t *reg_dense, const uint8_t *reg_raw) {
     const uint8_t *r = reg_raw;
@@ -1584,14 +1592,25 @@ static void hllDenseCompressScalar(uint8_t *reg_dense, const uint8_t *reg_raw) {
         t += 3;
     }
 }
+#else
+static void hllDenseCompressScalar(uint8_t *reg_dense, const uint8_t *reg_raw) {
+    for (int i = 0; i < HLL_REGISTERS; i++) {
+        HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
+    }
+}
 #endif
 
 /* Compress raw registers to dense representation.
  *
  * reg_dense must have room for HLL_DENSE_SIZE-HLL_HDR_SIZE bytes plus one
- * addressable trailing byte, which the AVX2 and NEON tail loops write through
- * HLL_DENSE_SET_REGISTER(). sds NUL termination satisfies this.
- * reg_raw must have HLL_REGISTERS bytes. */
+ * addressable trailing byte: HLL_DENSE_SET_REGISTER() read-modify-writes the
+ * byte after the register it sets, and the last register straddles into it.
+ * That is the access already documented above HLL_DENSE_GET_REGISTER(); for
+ * the final register both halves of it are inert (the mask is 0xff and the OR
+ * term is 0), so an existing NUL terminator survives, and sds NUL termination
+ * satisfies the requirement. The SIMD tail loops and the generic scalar
+ * variant all take this path; the HLL_BITS == 6 scalar variant does not touch
+ * the byte at all. reg_raw must have HLL_REGISTERS bytes. */
 void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
 #if HLL_REGISTERS == 16384 && HLL_BITS == 6
 #ifdef HAVE_AVX2
@@ -1609,14 +1628,34 @@ void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
 #endif
 #endif
 
-#if HLL_BITS == 6
     hllDenseCompressScalar(reg_dense, reg_raw);
-#else
-    for (int i = 0; i < HLL_REGISTERS; i++) {
-        HLL_DENSE_SET_REGISTER(reg_dense, i, reg_raw[i]);
-    }
-#endif
 }
+
+/* Every dense packer this build contains, for PFSELFTEST to check against
+ * HLL_DENSE_SET_REGISTER(). Listing them here rather than inside the test keeps
+ * all the "which kernels exist" conditionals in this one region, and lets the
+ * test check each kernel by name instead of going through hllDenseCompress(),
+ * whose choice depends on the runtime-mutable simd_enabled. 'usable' reports
+ * whether the host can actually execute the kernel; simd_enabled is
+ * deliberately not consulted, since it is a debug toggle and the kernel is
+ * compiled in either way. */
+static int hllPackerUsableAlways(void) { return 1; }
+
+static const struct {
+    const char *name;
+    void (*compress)(uint8_t *reg_dense, const uint8_t *reg_raw);
+    int (*usable)(void);
+} hllDensePackers[] = {
+#if HLL_REGISTERS == 16384 && HLL_BITS == 6
+#ifdef HAVE_AVX2
+    {"hllDenseCompressAVX2", hllDenseCompressAVX2, hllPackerUsableAVX2},
+#endif
+#ifdef HAVE_AARCH64_NEON
+    {"hllDenseCompressAarch64", hllDenseCompressAarch64, hllPackerUsableAlways},
+#endif
+#endif
+    {"hllDenseCompressScalar", hllDenseCompressScalar, hllPackerUsableAlways},
+};
 
 /* ========================== HyperLogLog commands ========================== */
 
@@ -1970,10 +2009,13 @@ void pfselftestCommand(client *c) {
      * available: comparing two optimized packers against each other cannot
      * catch a fault they share.
      *
-     * Both the dispatched implementation (AVX2 or NEON where available) and the
-     * scalar one are checked. Calling hllDenseCompress() alone would leave the
-     * scalar path untested wherever a SIMD kernel is selected, which is every
-     * mainstream platform. */
+     * Every kernel compiled into this build is checked by name, via the
+     * hllDensePackers[] table. Reaching them through hllDenseCompress() instead
+     * would test whichever one the dispatcher happens to select, and that
+     * selection depends on the runtime-mutable simd_enabled: after a
+     * "PFDEBUG SIMD OFF" the dispatcher runs the scalar path, so the SIMD
+     * kernel would be checked by nothing and the scalar one checked twice,
+     * silently. */
     {
         sds packed = sdsnewlen(NULL,HLL_DENSE_SIZE);
         sds reference = sdsnewlen(NULL,HLL_DENSE_SIZE);
@@ -1995,16 +2037,16 @@ void pfselftestCommand(client *c) {
             for (i = 0; i < HLL_REGISTERS; i++)
                 HLL_DENSE_SET_REGISTER(refhdr->registers,i,bytecounters[i]);
 
-            memset(packedhdr->registers,0x5a,denselen);
-            hllDenseCompress(packedhdr->registers,bytecounters);
-            if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)
-                failed = "hllDenseCompress";
-#if HLL_BITS == 6
-            memset(packedhdr->registers,0x5a,denselen);
-            hllDenseCompressScalar(packedhdr->registers,bytecounters);
-            if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)
-                failed = "hllDenseCompressScalar";
-#endif
+            for (size_t k = 0;
+                 !failed && k < sizeof(hllDensePackers)/sizeof(hllDensePackers[0]);
+                 k++)
+            {
+                if (!hllDensePackers[k].usable()) continue;
+                memset(packedhdr->registers,0x5a,denselen);
+                hllDensePackers[k].compress(packedhdr->registers,bytecounters);
+                if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)
+                    failed = hllDensePackers[k].name;
+            }
         }
         sdsfree(packed);
         sdsfree(reference);
