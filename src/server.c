@@ -2914,6 +2914,7 @@ void resetServerStats(void) {
     int j;
 
     server.stat_numcommands = 0;
+    server.stat_backwards_clock_samples = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredkeys_active = 0;
@@ -4082,6 +4083,26 @@ void call(client *c, int flags) {
         duration = getMonotonicUs() - monotonic_start;
     else
         duration = ustime() - call_timer;
+
+    /* A command cannot take a negative amount of time, but the clock used to
+     * measure it can move backwards: the non-monotonic path reads CLOCK_REALTIME
+     * via ustime(), which an NTP step or a manual clock set moves freely, and the
+     * HW path reads the TSC, which is only coherent across cores when the
+     * platform says so. Discard such a sample rather than propagate it:
+     * c->duration feeds two unsigned accumulators (hotkeyMetrics.cpu_time_usec
+     * and kvstoreDictMetadata.cpu_usec) where a negative value becomes ~1.8e19
+     * and then dominates every ranking and total derived from them. This mirrors
+     * the clamp 'dirty' gets on the next line. */
+    if (duration < 0) {
+        if (server.stat_backwards_clock_samples++ == 0)
+            serverLog(LL_WARNING,
+                "Command duration was negative (%lld us): the clock moved "
+                "backwards during command execution, so the sample was discarded. "
+                "Monotonic clock: %s. Further occurrences are counted by "
+                "backwards_clock_samples in INFO stats.",
+                (long long)duration, monotonicInfoString());
+        duration = 0;
+    }
 
     c->duration += duration;
     dirty = server.dirty-dirty;
@@ -6756,6 +6777,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscatprintf(info, "# Stats\r\n" FMTARGS(
             "total_connections_received:%lld\r\n", server.stat_numconnections,
             "total_commands_processed:%lld\r\n", server.stat_numcommands,
+            "backwards_clock_samples:%lld\r\n", server.stat_backwards_clock_samples,
             "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
             "total_net_input_bytes:%lld\r\n", stat_net_input_bytes + stat_net_repl_input_bytes,
             "total_net_output_bytes:%lld\r\n", stat_net_output_bytes + stat_net_repl_output_bytes,

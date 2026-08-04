@@ -92,7 +92,15 @@ void blockClient(client *c, int btype) {
  * the command will not be reprocessed and we need to make stats update.
  * This function will make updates to the commandstats, slowlog and monitors.*/
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_errors){
-    const ustime_t total_cmd_duration = c->duration + blocked_us + reply_us;
+    /* blocked_us and reply_us are measured independently of c->duration, so a
+     * backwards clock step can make this sum negative even though call() already
+     * clamped its own component. clusterSlotStatsAddCpuDuration() feeds an
+     * unsigned accumulator, so guard here too rather than only at the call() site. */
+    ustime_t total_cmd_duration = c->duration + blocked_us + reply_us;
+    if (total_cmd_duration < 0) {
+        server.stat_backwards_clock_samples++;
+        total_cmd_duration = 0;
+    }
     clusterSlotStatsAddCpuDuration(c, total_cmd_duration);
     c->lastcmd->microseconds += total_cmd_duration;
     c->lastcmd->calls++;

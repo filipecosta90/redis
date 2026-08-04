@@ -2169,6 +2169,8 @@ struct redisServer {
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
+    long long stat_backwards_clock_samples; /* Command duration samples discarded
+                                              because the clock moved backwards */
     long long stat_numconnections;  /* Number of connections received */
     long long stat_expiredkeys;     /* Number of expired keys */
     long long stat_expiredkeys_active; /* Number of expired keys by active expire */
