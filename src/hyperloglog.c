@@ -213,8 +213,12 @@ static int simd_enabled = 1;
 
 #ifdef HAVE_AVX2
 #define HLL_USE_AVX2 (simd_enabled && __builtin_cpu_supports("avx2"))
+/* Same probe without simd_enabled, which is a debug toggle rather than a
+ * statement about the hardware. Used by the hllDensePackers[] table. */
+#define HLL_HOST_HAS_AVX2 __builtin_cpu_supports("avx2")
 #else
 #define HLL_USE_AVX2 0
+#define HLL_HOST_HAS_AVX2 0
 #endif
 
 #ifdef HAVE_AARCH64_NEON
@@ -1480,10 +1484,6 @@ void hllDenseCompressAVX2(uint8_t *reg_dense, const uint8_t *reg_raw) {
     }
 }
 
-/* Whether this host can execute the kernel above. Used by the hllDensePackers[]
- * table; unlike HLL_USE_AVX2 it ignores simd_enabled, which is a debug toggle
- * rather than a statement about the hardware. */
-static int hllPackerUsableAVX2(void) { return __builtin_cpu_supports("avx2"); }
 #endif
 
 #ifdef HAVE_AARCH64_NEON
@@ -1635,26 +1635,24 @@ void hllDenseCompress(uint8_t *reg_dense, const uint8_t *reg_raw) {
  * HLL_DENSE_SET_REGISTER(). Listing them here rather than inside the test keeps
  * all the "which kernels exist" conditionals in this one region, and lets the
  * test check each kernel by name instead of going through hllDenseCompress(),
- * whose choice depends on the runtime-mutable simd_enabled. 'usable' reports
- * whether the host can actually execute the kernel; simd_enabled is
+ * whose choice depends on the runtime-mutable simd_enabled. 'needs_avx2' marks
+ * the kernels the host must be probed for before calling; simd_enabled is
  * deliberately not consulted, since it is a debug toggle and the kernel is
  * compiled in either way. */
-static int hllPackerUsableAlways(void) { return 1; }
-
 static const struct {
     const char *name;
     void (*compress)(uint8_t *reg_dense, const uint8_t *reg_raw);
-    int (*usable)(void);
+    int needs_avx2;
 } hllDensePackers[] = {
 #if HLL_REGISTERS == 16384 && HLL_BITS == 6
 #ifdef HAVE_AVX2
-    {"hllDenseCompressAVX2", hllDenseCompressAVX2, hllPackerUsableAVX2},
+    {"hllDenseCompressAVX2", hllDenseCompressAVX2, 1},
 #endif
 #ifdef HAVE_AARCH64_NEON
-    {"hllDenseCompressAarch64", hllDenseCompressAarch64, hllPackerUsableAlways},
+    {"hllDenseCompressAarch64", hllDenseCompressAarch64, 0},
 #endif
 #endif
-    {"hllDenseCompressScalar", hllDenseCompressScalar, hllPackerUsableAlways},
+    {"hllDenseCompressScalar", hllDenseCompressScalar, 0},
 };
 
 /* ========================== HyperLogLog commands ========================== */
@@ -2041,7 +2039,8 @@ void pfselftestCommand(client *c) {
                  !failed && k < sizeof(hllDensePackers)/sizeof(hllDensePackers[0]);
                  k++)
             {
-                if (!hllDensePackers[k].usable()) continue;
+                if (hllDensePackers[k].needs_avx2 && !HLL_HOST_HAS_AVX2)
+                    continue;
                 memset(packedhdr->registers,0x5a,denselen);
                 hllDensePackers[k].compress(packedhdr->registers,bytecounters);
                 if (memcmp(packedhdr->registers,refhdr->registers,denselen) != 0)

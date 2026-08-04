@@ -381,11 +381,16 @@ start_server {tags {"hll"}} {
             r pfdebug simd $mode
             # At least one source is dense, so PFMERGE takes the dense path.
             r pfmerge hllmerged{t} hllsrca{t} hllsrcb{t}
-            assert_encoding raw hllmerged{t}
+            # OBJECT ENCODING is raw for sparse and dense HLLs alike, so it
+            # cannot witness that the dense packer ran. PFDEBUG ENCODING can.
+            assert_equal {dense} [r pfdebug encoding hllmerged{t}]
             assert_equal $expected [r pfdebug getreg hllmerged{t}]
             assert_equal [r pfcount hllunion{t}] [r pfcount hllmerged{t}]
         }
+        # PFDEBUG SIMD returns a status reply, so swallow it: the test body's
+        # value is compared against the empty expected result above.
         r pfdebug simd on
+        set _ {}
     } {} {needs:pfdebug}
 
     test {PFCOUNT multiple-keys merge returns cardinality of union #1} {
