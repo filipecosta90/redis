@@ -2970,6 +2970,7 @@ void resetServerStats(void) {
     server.stat_unexpected_error_replies = 0;
     server.stat_total_error_replies = 0;
     server.stat_dump_payload_sanitizations = 0;
+    server.stat_discarded_duration_samples = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
     server.stat_reply_buffer_expands = 0;
@@ -3858,6 +3859,44 @@ void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int
     hdr_record_value(*latency_histogram,duration_hist);
 }
 
+/* Discard a duration sample that came out negative, and count it.
+ *
+ * A command cannot take a negative amount of time, but the value we compute for
+ * it can: the fallback timing path in call() reads CLOCK_REALTIME via ustime(),
+ * which an NTP step or a manual clock set moves backwards freely. The sample
+ * must not propagate, because three consumers sum it into unsigned storage --
+ * hotkeyMetrics.cpu_time_usec behind the weighted TopK of HOTKEYS,
+ * kvstoreDictMetadata.cpu_usec behind CLUSTER SLOT-STATS, and durationStats
+ * behind INFO's eventloop_duration_cmd_sum -- where it wraps.
+ *
+ * Zero rather than a saturated value: inventing a large duration would pin
+ * durationStats.max and the latency percentiles for the life of the process,
+ * while under-counting one sample is self-healing. Only the backwards half of a
+ * step is detectable; a forward jump is indistinguishable from a slow command.
+ *
+ * Non-negative input is returned untouched. call() still tests the sign itself
+ * to keep this off the hot path in builds that do not inline it. */
+ustime_t discardNegativeDurationIfNeeded(ustime_t duration, const char *measured_with) {
+    /* Rate-limit the warning with a dedicated flag, not with the counter, so
+     * that CONFIG RESETSTAT resets the statistic without re-arming the log.
+     * measured_with == NULL means an injected sample: count it, but leave the
+     * one-shot warning armed for a real clock step. */
+    static int warned = 0;
+
+    if (duration >= 0) return duration;
+
+    server.stat_discarded_duration_samples++;
+    if (!warned && measured_with) {
+        warned = 1;
+        serverLog(LL_WARNING,
+            "Discarded a negative duration sample (%lld us) measured with %s: "
+            "time moved backwards. Further occurrences are counted by "
+            "discarded_duration_samples in INFO stats.",
+            duration, measured_with);
+    }
+    return 0;
+}
+
 /* Handle the alsoPropagate() API to handle commands that want to propagate
  * multiple separated commands. Note that alsoPropagate() is not affected
  * by CLIENT_PREVENT_PROP flag. */
@@ -4079,10 +4118,24 @@ void call(client *c, int flags) {
     /* In order to avoid performance implication due to querying the clock using a system call 3 times,
      * we use a monotonic clock, when we are sure its cost is very low, and fall back to non-monotonic call otherwise. */
     ustime_t duration;
-    if (use_hw_clock)
-        duration = getMonotonicUs() - monotonic_start;
-    else
+    if (use_hw_clock) {
+        /* Both operands are unsigned, so order them and subtract the smaller from
+         * the larger: each difference is then in range for ustime_t, instead of
+         * relying on an out-of-range conversion to come back as a negative.
+         * getMonotonicUs() is a boot-relative counter scaled to microseconds, so
+         * neither difference approaches 2^63 and the negation cannot overflow. */
+        monotime monotonic_end = getMonotonicUs();
+        if (likely(monotonic_end >= monotonic_start))
+            duration = (ustime_t)(monotonic_end - monotonic_start);
+        else
+            duration = -(ustime_t)(monotonic_start - monotonic_end);
+    } else {
         duration = ustime() - call_timer;
+    }
+
+    if (duration < 0) /* Keep the helper off the hot path. */
+        duration = discardNegativeDurationIfNeeded(duration, use_hw_clock ?
+            "the monotonic hardware clock" : "gettimeofday (CLOCK_REALTIME)");
 
     c->duration += duration;
     dirty = server.dirty-dirty;
@@ -6827,7 +6880,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "slowlog_commands_time_ms_max:%.2f\r\n", (double)server.stat_slowlog_time_us_max / 1000,
             "slowlog_commands_time_ms_sum:%.2f\r\n", (double)server.stat_slowlog_time_us_sum / 1000,
             "hash_templates:%zu\r\n", hashTemplateRegistrySize(),
-            "hash_template_keys:%zu\r\n", hashTemplateKeyCount()));
+            "hash_template_keys:%zu\r\n", hashTemplateKeyCount(),
+            "discarded_duration_samples:%lld\r\n", server.stat_discarded_duration_samples));
         info = genRedisInfoStringACLStats(info);
         if (!server.cluster_enabled && server.cluster_compatibility_sample_ratio) {
             info = sdscatprintf(info, "cluster_incompatible_ops:%lld\r\n", server.stat_cluster_incompatible_ops);

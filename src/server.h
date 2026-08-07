@@ -2243,6 +2243,7 @@ struct redisServer {
     long long stat_unexpected_error_replies; /* Number of unexpected (aof-loading, replica to master, etc.) error replies */
     long long stat_total_error_replies; /* Total number of issued error replies ( command + rejected errors ) */
     long long stat_dump_payload_sanitizations; /* Number deep dump payloads integrity validations. */
+    long long stat_discarded_duration_samples; /* Number of negative duration samples discarded */
     redisAtomic long long stat_client_qbuf_limit_disconnections;  /* Total number of clients reached query buf length limit */
     long long stat_client_outbuf_limit_disconnections;  /* Total number of clients reached output buf length limit */
     long long stat_cluster_incompatible_ops; /* Number of operations that are incompatible with cluster mode */
@@ -3866,6 +3867,7 @@ void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration);
 void updateCommandLatencyHistogram(struct hdr_histogram** latency_histogram, int64_t duration_hist);
+ustime_t discardNegativeDurationIfNeeded(ustime_t duration, const char *measured_with);
 int prepareForShutdown(int flags);
 void replyToClientsBlockedOnShutdown(void);
 int abortShutdown(void);
@@ -4465,7 +4467,7 @@ void blockPostponeClientWithType(client *c, int btype);
 void blockForReplication(client *c, mstime_t timeout, long long offset, long numreplicas);
 void blockForAofFsync(client *c, mstime_t timeout, long long offset, int numlocal, long numreplicas);
 void signalDeletedKeyAsReady(redisDb *db, robj *key, int type);
-void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_errors);
+void updateStatsOnUnblock(client *c, ustime_t blocked_us, ustime_t reply_us, int had_errors);
 void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with, struct slotRangeArray *slots);
 void totalNumberOfStatefulKeys(unsigned long *blocking_keys, unsigned long *blocking_keys_on_nokey, unsigned long *watched_keys);
 void blockedBeforeSleep(void);

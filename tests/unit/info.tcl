@@ -640,6 +640,34 @@ start_server {tags {"info" "external:skip"} overrides {io-threads 4 io-threads-d
 }
 
 start_server {tags {"info" "external:skip"}} {
+    test {stats: negative command durations are discarded and counted} {
+        r config resetstat
+        assert_equal 0 [s discarded_duration_samples]
+
+        # A non-negative sample is returned untouched and is not counted.
+        assert_equal 0 [r debug duration-sample 0]
+        assert_equal 1234 [r debug duration-sample 1234]
+        assert_equal 0 [s discarded_duration_samples]
+
+        # A negative sample is replaced by zero and counted.
+        assert_equal 0 [r debug duration-sample -1000]
+        assert_equal 1 [s discarded_duration_samples]
+        assert_equal 0 [r debug duration-sample -1]
+        assert_equal 2 [s discarded_duration_samples]
+
+        # Counting a discard must not disturb the pass-through contract.
+        assert_equal 7 [r debug duration-sample 7]
+        assert_equal 2 [s discarded_duration_samples]
+    }
+
+    test {stats: discarded_duration_samples is reset by CONFIG RESETSTAT} {
+        r config resetstat
+        r debug duration-sample -5
+        assert_equal 1 [s discarded_duration_samples]
+        r config resetstat
+        assert_equal 0 [s discarded_duration_samples]
+    }
+
     test {memory: database and pubsub overhead and rehashing dict count} {
         r flushall
 

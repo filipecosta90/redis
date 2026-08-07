@@ -514,6 +514,10 @@ void debugCommand(client *c) {
 "QUICKLIST-PACKED-THRESHOLD <size>",
 "    Sets the threshold for elements to be inserted as plain vs packed nodes",
 "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
+"DURATION-SAMPLE <us>",
+"    Feed <us> to the guard that rejects command durations measured across a",
+"    backwards clock step, and reply with what it returns. Negative values are",
+"    discarded (reply 0) and counted by discarded_duration_samples in INFO stats.",
 "SET-SKIP-CHECKSUM-VALIDATION <0|1>",
 "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
 "SLEEP <seconds>",
@@ -970,6 +974,14 @@ NULL
         } else {
             addReply(c,shared.ok);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"duration-sample") && c->argc == 3) {
+        /* The condition this guards is a property of the host clock, so it is
+         * unreachable from the test suite. Expose the guard itself instead. */
+        long long us;
+        if (getLongLongFromObjectOrReply(c,c->argv[2],&us,NULL) != C_OK) return;
+        /* NULL source: count the sample but leave the one-shot warning armed, so
+         * running this does not silence a later real clock step. */
+        addReplyLongLong(c, discardNegativeDurationIfNeeded((ustime_t)us, NULL));
     } else if (!strcasecmp(c->argv[1]->ptr,"set-skip-checksum-validation") &&
                c->argc == 3)
     {
