@@ -935,8 +935,9 @@ void* defragStreamCGPendingEntry(raxIterator *ri, void *privdata) {
     /* Update cgroup_ref_node to the possibly-relocated CG for every NACK.
      * Consumer-owned entries will get this overwritten again redundantly by
      * defragStreamConsumerPendingEntry; unowned (NACK zone) entries have no
-     * consumer PEL walk, so this is their only chance. */
-    nack->cgroup_ref_node->value = cg;
+     * consumer PEL walk, so this is their only chance. The node is NULL on
+     * streams below the cgroups_ref indexing threshold, which keep no index. */
+    if (nack->cgroup_ref_node) nack->cgroup_ref_node->value = cg;
     newnack = activeDefragAlloc(nack);
     if (newnack) {
         /* If this NACK is owned by a consumer, update the consumer's PEL. */

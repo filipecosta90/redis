@@ -3221,13 +3221,98 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id) {
     cg->last_id = *id;
 }
 
+/* The cgroups_ref index maps a stream ID to the list of consumer groups that
+ * hold that ID in their PEL. It turns streamEntryIsReferenced() and
+ * streamCleanupEntryCGroupRefs() into a single O(log N) rax lookup instead of
+ * an O(C * log N_pel) scan over every consumer group, but it is paid for on
+ * every single message delivery: one rax insert plus a list node per NACK,
+ * on the XREADGROUP hot path.
+ *
+ * That trade is only worth making when C is large. Streams with a handful of
+ * consumer groups - the common case - are better off scanning the groups
+ * directly during the comparatively rare XDEL/XTRIM, and keeping delivery
+ * cheap. So the index is maintained only while the stream has at least
+ * STREAM_CGROUPS_REF_MIN_GROUPS consumer groups, and is built/dropped as that
+ * count crosses the boundary.
+ *
+ * The drop threshold sits below the build threshold on purpose: without the
+ * gap, a workload that repeatedly creates and destroys a group while sitting
+ * exactly on the boundary would rebuild the whole index (O(total PEL)) on
+ * every XGROUP CREATE. */
+#define STREAM_CGROUPS_REF_MIN_GROUPS 100
+#define STREAM_CGROUPS_REF_DROP_GROUPS 50
+
+/* Build the cgroups_ref index from scratch, indexing every NACK currently in
+ * every consumer group's PEL. Called when the group count grows past the
+ * build threshold. */
+static void streamCGroupsRefBuild(stream *s) {
+    serverAssert(s->cgroups_ref == NULL);
+    s->cgroups_ref = raxNewEx(0, &s->alloc_size, sizeof(streamID));
+
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        raxIterator pi;
+        raxStart(&pi, cg->pel);
+        raxSeek(&pi, "^", NULL, 0);
+        while (raxNext(&pi)) {
+            streamNACK *nack = pi.data;
+            nack->cgroup_ref_node = streamLinkCGroupToEntry(s, cg, pi.key);
+        }
+        raxStop(&pi);
+    }
+    raxStop(&ri);
+}
+
+/* Free the cgroups_ref index and clear the now-dangling back-pointers held by
+ * every NACK. Called when the group count shrinks past the drop threshold. */
+static void streamCGroupsRefDrop(stream *s) {
+    serverAssert(s->cgroups_ref != NULL);
+
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        raxIterator pi;
+        raxStart(&pi, cg->pel);
+        raxSeek(&pi, "^", NULL, 0);
+        while (raxNext(&pi)) {
+            streamNACK *nack = pi.data;
+            nack->cgroup_ref_node = NULL;
+        }
+        raxStop(&pi);
+    }
+    raxStop(&ri);
+
+    raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
+    s->cgroups_ref = NULL;
+}
+
+/* Bring the presence of the cgroups_ref index in line with the current
+ * consumer group count. Call after any change to s->cgroups. */
+static void streamCGroupsRefUpdate(stream *s) {
+    size_t numgroups = s->cgroups ? raxSize(s->cgroups) : 0;
+    if (!s->cgroups_ref) {
+        if (numgroups >= STREAM_CGROUPS_REF_MIN_GROUPS)
+            streamCGroupsRefBuild(s);
+    } else {
+        if (numgroups <= STREAM_CGROUPS_REF_DROP_GROUPS)
+            streamCGroupsRefDrop(s);
+    }
+}
+
 /* Link a consumer group to a stream entry in the cgroups_ref index.
- * Returns a pointer to the list node, so that it can be used for future deletion. */
+ * Returns a pointer to the list node, so that it can be used for future
+ * deletion, or NULL when the index is not currently maintained. */
 listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
     list *cglist;
 
-    if (!s->cgroups_ref)
-        s->cgroups_ref = raxNewEx(0, &s->alloc_size, sizeof(streamID));
+    /* Below the group-count threshold there is no index: callers store the
+     * NULL and the lookup paths scan the consumer groups directly. */
+    if (!s->cgroups_ref) return NULL;
 
     /* Find-or-insert in a single rax walk: raxFindLink stashes the stop
      * position so raxInsertAt commits without re-walking the tree. */
@@ -3263,12 +3348,36 @@ void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *ke
 /* Remove all consumer group references to a specific stream message.
  * Returns 1 if any references were removed, otherwise 0. */
 int streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
-    if (!s->cgroups_ref) return 0;
+    if (!s->cgroups || !raxSize(s->cgroups)) return 0;
     list *cglist;
     listIter li;
     listNode *ln;
     unsigned char buf[sizeof(streamID)];
     streamEncodeID(buf, id);
+
+    /* Without the index, find the referencing groups by scanning every
+     * consumer group's PEL for this ID. */
+    if (!s->cgroups_ref) {
+        int removed = 0;
+        raxIterator ri;
+        raxStart(&ri, s->cgroups);
+        raxSeek(&ri, "^", NULL, 0);
+        while (raxNext(&ri)) {
+            streamCG *group = ri.data;
+            streamNACK *nack;
+            if (!raxFind(group->pel, buf, sizeof(buf), (void **)&nack))
+                continue;
+
+            pelListUnlink(group, nack);
+            raxRemove(group->pel, buf, sizeof(buf), NULL);
+            if (nack->consumer)
+                raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
+            streamFreeNACK(s, nack);
+            removed = 1;
+        }
+        raxStop(&ri);
+        return removed;
+    }
 
     /* If message is not in any consumer group, nothing to do */
     if (!raxFind(s->cgroups_ref, buf, sizeof(streamID), (void **)&cglist))
@@ -3329,10 +3438,24 @@ int streamEntryIsReferenced(stream *s, streamID *id) {
         return 1;
 
     /* Check if the message is in any consumer group's PEL */
-    if (!s->cgroups_ref) return 0;
     unsigned char buf[sizeof(streamID)];
     streamEncodeID(buf, id);
-    return raxFind(s->cgroups_ref, buf, sizeof(streamID), NULL);
+    if (s->cgroups_ref)
+        return raxFind(s->cgroups_ref, buf, sizeof(streamID), NULL);
+
+    /* No index: scan the consumer groups directly. */
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        if (raxFind(cg->pel, buf, sizeof(buf), NULL)) {
+            raxStop(&ri);
+            return 1;
+        }
+    }
+    raxStop(&ri);
+    return 0;
 }
 
 /* Create a NACK entry setting the delivery count to 1 and the delivery
@@ -3428,6 +3551,8 @@ streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, lo
     streamUpdateCGroupLastId(s, cg, id);
     cg->entries_read = entries_read;
     raxInsertAt(s->cgroups,(unsigned char*)name,namelen,cg,NULL,&link);
+    /* The new group may push this stream over the indexing threshold. */
+    streamCGroupsRefUpdate(s);
     return cg;
 }
 
@@ -3465,6 +3590,11 @@ void streamDestroyCG(stream *s, streamCG *cg) {
         s->min_cgroup_last_id_valid = 0;
 
     streamFreeCG(s, cg);
+
+    /* Losing a group may take this stream back below the indexing threshold.
+     * Done after the free so the dropped group is out of s->cgroups and is not
+     * walked by streamCGroupsRefDrop(). */
+    streamCGroupsRefUpdate(s);
 }
 
 /* Generic version of streamFreeCG. */
