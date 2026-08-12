@@ -295,14 +295,45 @@ void scriptingReset(int async) {
  * EVAL and SCRIPT commands implementation
  * ------------------------------------------------------------------------- */
 
+/* One-entry memoization of the last EVAL body -> SHA1 hex mapping.
+ *
+ * A plain EVAL must hash the whole script body on every invocation just to
+ * find the already-cached function. Clients that resend the body (rather than
+ * using EVALSHA) therefore pay SHA1 over it on every call, which shows up as
+ * the top self-time symbol on EVAL-only workloads.
+ *
+ * Comparing the body against the previous one is substantially cheaper than
+ * hashing it, and is exact: the entry is keyed on the full byte string, so a
+ * hit reproduces precisely the SHA1 that would have been computed. Script
+ * execution is serialized on the main thread, so a single static entry needs
+ * no locking. Oversized bodies are not cached, to bound the memory held. */
+#define EVAL_SHA_CACHE_MAX_BODY (64*1024)
+static sds eval_sha_cache_body = NULL;
+static char eval_sha_cache_hex[40];
+
 static void evalCalcFunctionName(int evalsha, sds script, char *out_funcname) {
     /* We obtain the script SHA1, then check if this function is already
      * defined into the Lua state */
     out_funcname[0] = 'f';
     out_funcname[1] = '_';
     if (!evalsha) {
-        /* Hash the code if this is an EVAL call */
-        sha1hex(out_funcname+2,script,sdslen(script));
+        /* Hash the code if this is an EVAL call, reusing the previous digest
+         * when this is a byte-for-byte repeat of the last body hashed. */
+        size_t len = sdslen(script);
+        if (eval_sha_cache_body != NULL &&
+            sdslen(eval_sha_cache_body) == len &&
+            memcmp(eval_sha_cache_body,script,len) == 0)
+        {
+            memcpy(out_funcname+2,eval_sha_cache_hex,40);
+            out_funcname[42] = '\0';
+            return;
+        }
+        sha1hex(out_funcname+2,script,len);
+        if (len <= EVAL_SHA_CACHE_MAX_BODY) {
+            sdsfree(eval_sha_cache_body);
+            eval_sha_cache_body = sdsnewlen(script,len);
+            memcpy(eval_sha_cache_hex,out_funcname+2,40);
+        }
     } else {
         /* We already have the SHA if it is an EVALSHA */
         int j;
