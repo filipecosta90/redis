@@ -330,8 +330,13 @@ static void evalCalcFunctionName(int evalsha, sds script, char *out_funcname) {
         }
         sha1hex(out_funcname+2,script,len);
         if (len <= EVAL_SHA_CACHE_MAX_BODY) {
-            sdsfree(eval_sha_cache_body);
-            eval_sha_cache_body = sdsnewlen(script,len);
+            /* Reuse the existing buffer rather than free+alloc, so that a
+             * workload rotating between several scripts -- which misses here
+             * on every call -- adds no allocator traffic. */
+            if (eval_sha_cache_body == NULL)
+                eval_sha_cache_body = sdsnewlen(script,len);
+            else
+                eval_sha_cache_body = sdscpylen(eval_sha_cache_body,script,len);
             memcpy(eval_sha_cache_hex,out_funcname+2,40);
         }
     } else {
