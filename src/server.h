@@ -3354,6 +3354,7 @@ void addReplyBulk(client *c, robj *obj);
 void addReplyBulkWithFlag(client *c, robj *obj, int avoid_copy);
 void addReplyBulkCString(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
+void addReplyBulkCBufferVector(client *c, const void *const *ptrs, const size_t *lens, int n);
 void addReplyBulkLongLong(client *c, long long ll);
 void addReply(client *c, robj *obj);
 void addReplyStatusLength(client *c, const char *s, size_t len);

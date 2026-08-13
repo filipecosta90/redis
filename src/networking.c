@@ -1427,6 +1427,59 @@ void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     _addReplySegmentsToBufferOrList(c, seg, sizeof(seg) / sizeof(seg[0]));
 }
 
+/* Bulk strings assembled per batched append. Bounds the on-stack scratch below
+ * to 3 segments + one header buffer per element. */
+#define ADDREPLY_BULK_VECTOR_MAX 32
+
+/* Append 'n' bulk strings as a single logical reply.
+ *
+ * Semantically identical to calling addReplyBulkCBuffer() once per element, but
+ * _prepareClientToWrite() and the replica-reject / push-postpone / reqres-offset
+ * preamble inside _addReplySegmentsToBufferOrList() run once per batch rather
+ * than once per element. On commands that reply with many small bulk strings
+ * (HGETALL over a large hash emits 2 per field) that preamble, not the payload
+ * copy, is what dominates the inner loop's instruction footprint. */
+void addReplyBulkCBufferVector(client *c, const void *const *ptrs, const size_t *lens, int n) {
+    if (n <= 0) return;
+    if (_prepareClientToWrite(c) != C_OK) return;
+
+    while (n > 0) {
+        int chunk = n < ADDREPLY_BULK_VECTOR_MAX ? n : ADDREPLY_BULK_VECTOR_MAX;
+        replySegment seg[ADDREPLY_BULK_VECTOR_MAX * 3];
+        /* '$' + up to 20 digits (64-bit) + "\r\n"; LONG_STR_SIZE already budgets the NUL. */
+        char hdrbuf[ADDREPLY_BULK_VECTOR_MAX][LONG_STR_SIZE + 3];
+        int nseg = 0;
+
+        for (int i = 0; i < chunk; i++) {
+            size_t len = lens[i];
+            const char *hdr;
+            size_t hdr_len;
+            if (likely(len < OBJ_SHARED_BULKHDR_LEN)) {
+                /* Point straight at the shared "$<len>\r\n" object — no copy needed. */
+                hdr = shared.bulkhdr[len]->ptr;
+                hdr_len = OBJ_SHARED_HDR_STRLEN(len);
+            } else {
+                char *h = hdrbuf[i];
+                *h++ = '$';
+                /* Room left after '$', reserving the 2 trailing bytes for "\r\n". */
+                h += ll2string(h, sizeof(hdrbuf[i]) - (size_t)(h - hdrbuf[i]) - 2, (long long)len);
+                *h++ = '\r';
+                *h++ = '\n';
+                hdr = hdrbuf[i];
+                hdr_len = (size_t)(h - hdrbuf[i]);
+            }
+            seg[nseg++] = (replySegment){ hdr, hdr_len };
+            seg[nseg++] = (replySegment){ (const char *)ptrs[i], len };
+            seg[nseg++] = (replySegment){ "\r\n", 2 };
+        }
+        _addReplySegmentsToBufferOrList(c, seg, nseg);
+
+        ptrs += chunk;
+        lens += chunk;
+        n -= chunk;
+    }
+}
+
 /* Add sds to reply (takes ownership of sds and frees it) */
 void addReplyBulkSds(client *c, sds s) {
     if (_prepareClientToWrite(c) != C_OK) {

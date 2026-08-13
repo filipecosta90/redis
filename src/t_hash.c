@@ -5422,19 +5422,30 @@ void genericHgetallCommand(client *c, int flags) {
                 valid_count++;
             }
 
-            /* Phase 3: emit replies — field + value data is cache-warm. */
+            /* Phase 3: emit replies — field + value data is cache-warm. The
+             * whole batch is handed over in one call so the per-bulk-string
+             * reply preamble is paid once per batch instead of once per
+             * element. */
+            const void *rep_ptr[HGETALL_BATCH * 2];
+            size_t rep_len[HGETALL_BATCH * 2];
+            int nrep = 0;
             for (int i = 0; i < valid_count; i++) {
                 if (flags & OBJ_HASH_KEY) {
                     sds field = entryGetField(batch_entry[i]);
-                    addReplyBulkCBuffer(c, field, sdslen(field));
+                    rep_ptr[nrep] = field;
+                    rep_len[nrep] = sdslen(field);
+                    nrep++;
                     count++;
                 }
                 if (flags & OBJ_HASH_VALUE) {
                     sds val = batch_val[i];
-                    addReplyBulkCBuffer(c, val, sdslen(val));
+                    rep_ptr[nrep] = val;
+                    rep_len[nrep] = sdslen(val);
+                    nrep++;
                     count++;
                 }
             }
+            addReplyBulkCBufferVector(c, rep_ptr, rep_len, nrep);
         }
         dictResetIterator(&di);
         goto done;
