@@ -529,9 +529,19 @@ typedef struct replySegment {
  *
  * always_inline so the single-segment wrapper below scalarizes its on-stack segment
  * and stays branch-for-branch identical to a direct append on the hot reply path. */
+/* Per-run preamble, shared by the single-reply path and the batched path below.
+ *
+ * Returns 0 when the caller must emit nothing at all. On success *push_list is the
+ * list to append to when the reply has to be postponed as a push message, or NULL
+ * for the normal buffer-then-list path.
+ *
+ * Split out so a caller emitting a long run of replies — HGETALL over a
+ * hashtable-encoded hash emits two bulk strings per field — can run the preamble
+ * once for the whole run while still appending each element with a
+ * compile-time-constant segment count, keeping the append scalarized. */
 static inline __attribute__((always_inline))
-void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nseg) {
-    if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return;
+int _addReplyRunBegin(client *c, list **push_list) {
+    if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return 0;
 
     /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
      * replication link that caused a reply to be generated we'll simply disconnect it.
@@ -541,10 +551,9 @@ void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nse
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
-        return;
+        return 0;
     }
 
-    for (int i = 0; i < nseg; i++) c->net_output_bytes_curr_cmd += seg[i].len;
     /* We call it here because this may affect the reply buffer offset (see the
      * reqres function comment); it is idempotent per request. */
     reqresSaveClientReplyOffset(c);
@@ -555,13 +564,22 @@ void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nse
      * the SUBSCRIBE command family, which (currently) have a push message instead of a proper reply.
      * The check for executing_client also avoids affecting push messages that are part of eviction.
      * Check CLIENT_PUSHING first to avoid race conditions, as it's absent in module's fake client. */
-    if ((c->flags & CLIENT_PUSHING) && c == server.current_client &&
-        server.executing_client && !cmdHasPushAsReply(server.executing_client->cmd))
-    {
+    *push_list = ((c->flags & CLIENT_PUSHING) && c == server.current_client &&
+                  server.executing_client && !cmdHasPushAsReply(server.executing_client->cmd))
+                 ? server.pending_push_messages : NULL;
+    return 1;
+}
+
+/* Append one ordered group of segments as part of a run already opened by
+ * _addReplyRunBegin(). */
+static inline __attribute__((always_inline))
+void _addReplyRunSegments(client *c, list *push_list, const replySegment *seg, int nseg) {
+    for (int i = 0; i < nseg; i++) c->net_output_bytes_curr_cmd += seg[i].len;
+
+    if (push_list) {
         for (int i = 0; i < nseg; i++)
             if (seg[i].len)
-                _addReplyPayloadToList(c, server.pending_push_messages,
-                                       seg[i].ptr, seg[i].len, PLAIN_REPLY);
+                _addReplyPayloadToList(c, push_list, seg[i].ptr, seg[i].len, PLAIN_REPLY);
         return;
     }
 
@@ -573,6 +591,13 @@ void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nse
         if (len > reply_len)
             _addReplyPayloadToList(c, c->reply, s + reply_len, len - reply_len, PLAIN_REPLY);
     }
+}
+
+static inline __attribute__((always_inline))
+void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nseg) {
+    list *push_list;
+    if (!_addReplyRunBegin(c, &push_list)) return;
+    _addReplyRunSegments(c, push_list, seg, nseg);
 }
 
 /* Append a single contiguous reply segment (thin wrapper over the batched form). */
@@ -1425,6 +1450,46 @@ void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
         { "\r\n", 2 },
     };
     _addReplySegmentsToBufferOrList(c, seg, sizeof(seg) / sizeof(seg[0]));
+}
+
+/* Open a run of bulk-string replies. Commands that emit many bulk strings back to
+ * back can call this once, then addReplyBulkCBufferRun() per element, instead of
+ * paying _prepareClientToWrite() and the per-reply preamble on every element.
+ *
+ * b->emit is 0 when nothing must be written; callers still have to walk their data
+ * (element counters must advance either way), they just skip the append. */
+void addReplyBulkRunBegin(client *c, replyRun *b) {
+    b->push_list = NULL;
+    b->emit = (_prepareClientToWrite(c) == C_OK) && _addReplyRunBegin(c, (list **)&b->push_list);
+}
+
+/* Append one bulk string to a run opened by addReplyBulkRunBegin(). Emits exactly
+ * the same bytes as addReplyBulkCBuffer(); only the hoisted preamble differs. */
+void addReplyBulkCBufferRun(client *c, replyRun *b, const void *p, size_t len) {
+    const char *hdr;
+    size_t hdr_len;
+    /* '$' + up to 20 digits (64-bit) + "\r\n"; LONG_STR_SIZE already budgets the NUL. */
+    char hdrbuf[LONG_STR_SIZE + 3];
+    if (likely(len < OBJ_SHARED_BULKHDR_LEN)) {
+        /* Point straight at the shared "$<len>\r\n" object — no copy needed. */
+        hdr = shared.bulkhdr[len]->ptr;
+        hdr_len = OBJ_SHARED_HDR_STRLEN(len);
+    } else {
+        char *h = hdrbuf;
+        *h++ = '$';
+        /* Room left after '$', reserving the 2 trailing bytes for "\r\n". */
+        h += ll2string(h, sizeof(hdrbuf) - (size_t)(h - hdrbuf) - 2, (long long)len);
+        *h++ = '\r';
+        *h++ = '\n';
+        hdr = hdrbuf;
+        hdr_len = (size_t)(h - hdrbuf);
+    }
+    replySegment seg[3] = {
+        { hdr,    hdr_len },
+        { p,      len },
+        { "\r\n", 2 },
+    };
+    _addReplyRunSegments(c, b->push_list, seg, sizeof(seg) / sizeof(seg[0]));
 }
 
 /* Add sds to reply (takes ownership of sds and frees it) */

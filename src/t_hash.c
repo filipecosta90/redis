@@ -5422,16 +5422,22 @@ void genericHgetallCommand(client *c, int flags) {
                 valid_count++;
             }
 
-            /* Phase 3: emit replies — field + value data is cache-warm. */
+            /* Phase 3: emit replies — field + value data is cache-warm. The
+             * per-reply preamble is hoisted out of the loop; each element still
+             * appends its own compile-time-constant 3 segments. count must
+             * advance whether or not anything is written, so the emit test
+             * guards only the append. */
+            replyRun run;
+            addReplyBulkRunBegin(c, &run);
             for (int i = 0; i < valid_count; i++) {
                 if (flags & OBJ_HASH_KEY) {
                     sds field = entryGetField(batch_entry[i]);
-                    addReplyBulkCBuffer(c, field, sdslen(field));
+                    if (run.emit) addReplyBulkCBufferRun(c, &run, field, sdslen(field));
                     count++;
                 }
                 if (flags & OBJ_HASH_VALUE) {
                     sds val = batch_val[i];
-                    addReplyBulkCBuffer(c, val, sdslen(val));
+                    if (run.emit) addReplyBulkCBufferRun(c, &run, val, sdslen(val));
                     count++;
                 }
             }

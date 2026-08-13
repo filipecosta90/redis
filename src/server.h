@@ -3354,6 +3354,14 @@ void addReplyBulk(client *c, robj *obj);
 void addReplyBulkWithFlag(client *c, robj *obj, int avoid_copy);
 void addReplyBulkCString(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
+/* State for a run of bulk replies whose per-reply preamble is hoisted out of the
+ * caller's loop. Only addReplyBulkRunBegin() fills this in; callers read `emit`. */
+typedef struct replyRun {
+    void *push_list;    /* list* to postpone into, or NULL for the normal path */
+    int emit;           /* 0 => caller must skip the appends */
+} replyRun;
+void addReplyBulkRunBegin(client *c, replyRun *b);
+void addReplyBulkCBufferRun(client *c, replyRun *b, const void *p, size_t len);
 void addReplyBulkLongLong(client *c, long long ll);
 void addReply(client *c, robj *obj);
 void addReplyStatusLength(client *c, const char *s, size_t len);
