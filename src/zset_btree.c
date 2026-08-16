@@ -2548,6 +2548,38 @@ zbtreeSet *zbtreeCreate(void) {
     return zs;
 }
 
+/* Pre-size the member-index table for a known upcoming insertion count on a
+ * genuinely fresh set that has never held a member. Sizing the table once up
+ * front reaches the same target zbtIndexExpandIfNeeded() would reach through
+ * repeated single-element calls, but without starting the incremental
+ * member_rehash copy those calls trigger partway through the run.
+ *
+ * Callers must only use this with a count they trust: it feeds directly into
+ * one eager, non-fallible allocation (zbtIndexTableInit() via zbtAlloc(),
+ * which aborts the process on OOM like the rest of this file's allocations,
+ * not a checked ztrymalloc). Do not wire this into any path where 'count'
+ * can be an unvalidated size taken from a client payload or a replication/
+ * RDB stream -- a corrupt or hostile declared length would turn into a single
+ * disproportionate allocation attempt before a real element is ever read,
+ * which is exactly the DoS shape the RDB loader's other presize calls
+ * (e.g. dictTryExpand() for RDB_TYPE_SET) guard against with a checked,
+ * gracefully-failing call. This function intentionally has no such check,
+ * so it must only be called with a count the server itself computed.
+ *
+ * A no-op on anything but a genuinely fresh set -- guards on both the
+ * "has an index" invariant (length/member_index.size) the rest of this file
+ * already relies on, and on next_score_leaf_id to also rule out a set that
+ * was emptied by deletion and shrunk (zbtIndexShrinkIfNeeded()) but not yet
+ * compacted, since zbtIndexExpandIfNeeded()'s empty-table fast path always
+ * starts narrow (wide_ids=0) and a leftover high leaf-id counter from before
+ * the shrink could still need wide ids on reuse. */
+void zbtreeReserve(zbtreeSet *zs, unsigned long count) {
+    if (zs->length != 0 || zs->member_index.size != 0 ||
+        zs->next_score_leaf_id != 0 || count == 0)
+        return;
+    zbtIndexExpandIfNeeded(zs, count);
+}
+
 /* Copy a score tree while repairing every pointer between its pages. Leaves
  * are visited in score order, which also rebuilds their linked list and the
  * leaf ID table. Inline records can be copied unchanged. External members
@@ -3649,3 +3681,59 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
     serverAssert(group < UINT32_MAX);
     return ((uint64_t)revision << 32) | (uint32_t)(group + 1);
 }
+
+#ifdef REDIS_TEST
+#include "testhelp.h"
+
+int zsetBtreeTest(int argc, char **argv, int flags) {
+    UNUSED(argc);
+    UNUSED(argv);
+    UNUSED(flags);
+
+    printf("Testing B+ tree zbtreeReserve()\n");
+
+    /* zbtreeReserve() on a fresh set sizes the member index directly,
+     * without ever starting an incremental member_rehash. */
+    {
+        zbtreeSet *zs = zbtreeCreate();
+        zbtreeReserve(zs, 10000);
+        test_cond("zbtreeReserve presizes an empty index",
+            zs->member_index.size > ZBT_INDEX_INITIAL_BUCKETS &&
+            zs->member_rehash == NULL);
+
+        char buf[32];
+        for (int i = 0; i < 10000; i++) {
+            snprintf(buf, sizeof(buf), "member:%d", i);
+            sds ele = sdsnew(buf);
+            double score;
+            zbtreeInsertPosition position;
+            int existing = zbtreeFindForAdd(zs, ele, &score, &position);
+            serverAssert(!existing);
+            zbtreeInsertNew(zs, (double)i, ele, &position);
+        }
+        test_cond("Reserved set still holds every inserted member",
+            zbtreeLength(zs) == 10000 && zs->member_rehash == NULL);
+        zbtreeFree(zs);
+    }
+
+    /* zbtreeReserve() must be a no-op on a set that already has members or
+     * an index: it exists to presize a still-empty destination, not to
+     * silently resize a live one out from under its scan cursors. */
+    {
+        zbtreeSet *zs = zbtreeCreate();
+        sds ele = sdsnew("only-member");
+        double score;
+        zbtreeInsertPosition position;
+        zbtreeFindForAdd(zs, ele, &score, &position);
+        zbtreeInsertNew(zs, 1.0, ele, &position);
+        unsigned long size_before = zs->member_index.size;
+        zbtreeReserve(zs, 1000000);
+        test_cond("zbtreeReserve is a no-op once the set is non-empty",
+            zs->member_index.size == size_before);
+        zbtreeFree(zs);
+    }
+
+    test_report();
+    return 0;
+}
+#endif

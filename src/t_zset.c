@@ -3560,6 +3560,14 @@ static void zrangeResultFinalizeClient(zrange_result_handler *handler,
 static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
 {
     handler->dstobj = zsetTypeCreate(length >= 0 ? length : 0, 0);
+    /* The plain-rank ZRANGESTORE path (genericZrangebyrankCommand) computes
+     * an exact result count here; BYSCORE/BYLEX pass length<0 and this is a
+     * no-op, same as before this reserve existed. This is deliberately a
+     * server-computed count, not one taken from a client payload or a
+     * replication/RDB stream -- see zbtreeReserve()'s own comment for why
+     * that distinction matters before reusing this anywhere else. */
+    if (length > 0 && handler->dstobj->encoding == OBJ_ENCODING_BTREE)
+        zbtreeReserve(handler->dstobj->ptr, (unsigned long)length);
 }
 
 static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
