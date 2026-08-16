@@ -2566,14 +2566,14 @@ zbtreeSet *zbtreeCreate(void) {
  * gracefully-failing call. This function intentionally has no such check,
  * so it must only be called with a count the server itself computed.
  *
- * A no-op on anything but a genuinely fresh set -- guards on both the
- * "has an index" invariant (length/member_index.size) the rest of this file
- * already relies on, and on next_score_leaf_id to also rule out a set that
- * was emptied by deletion and shrunk (zbtIndexShrinkIfNeeded()) but not yet
- * compacted, since zbtIndexExpandIfNeeded()'s empty-table fast path always
- * starts narrow (wide_ids=0) and a leftover high leaf-id counter from before
- * the shrink could still need wide ids on reuse. */
+ * A no-op on anything but a genuinely fresh set. */
 void zbtreeReserve(zbtreeSet *zs, unsigned long count) {
+    /* length/member_index.size cover the "has an index" invariant the rest
+     * of this file already relies on. next_score_leaf_id also rules out a
+     * set that was emptied by deletion and shrunk (zbtIndexShrinkIfNeeded())
+     * but not yet compacted: the empty-table fast path below always starts
+     * narrow (wide_ids=0), and a leftover high leaf-id counter from before
+     * the shrink could still need wide ids on reuse. */
     if (zs->length != 0 || zs->member_index.size != 0 ||
         zs->next_score_leaf_id != 0 || count == 0)
         return;
@@ -3733,7 +3733,6 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zbtreeFree(zs);
     }
 
-    test_report();
     return 0;
 }
 #endif
