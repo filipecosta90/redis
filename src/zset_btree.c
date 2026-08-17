@@ -3831,6 +3831,11 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         while (inserted < N) {
             zbtTestPopulateRange(zs, inserted, inserted + 1);
             inserted++;
+            /* A resize started by this insert can also finish within it, once
+             * the table has more than one leaf to drain -- so this check can
+             * see NULL again right after a resize began and keep looping;
+             * that's fine, it just means the break below fires once the set
+             * is big enough for a resize to genuinely outlive its own call. */
             if (zs->member_rehash != NULL) break;
         }
         serverAssert(zs->member_rehash != NULL);
