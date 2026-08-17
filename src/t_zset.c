@@ -1490,12 +1490,15 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
              * dictExpand(zs->dict, cap) a few lines below for the
              * LISTPACK->SKIPLIST branch. cap here is always a real element
              * count, never an unvalidated RDB/client length: zsetConvert()'s
-             * callers (SORT ... STORE, RDB listpack-promotion loads, and
-             * this function's own SKIPLIST->LISTPACK/BTREE re-entry) pass
+             * callers (SORT/SORT_RO, RDB listpack-promotion loads) pass
              * zsetLength(zobj), the listpack's own already-decoded length;
              * zsetTypeMaybeConvert()'s ZADD caller passes elements, this
-             * command's own argc-derived count of new members; and ZADD's
-             * listpack-overflow path below passes zsetLength(zobj) + 1. */
+             * command's own argc-derived count of score-member pairs; and ZADD's
+             * listpack-overflow path below passes zsetLength(zobj) + 1.
+             * zsetConvertAfterBulkInsert()'s zsetConvert() calls never reach
+             * here: it returns immediately on OBJ_ENCODING_LISTPACK, so its
+             * BTREE conversion always lands in the SKIPLIST->BTREE branch
+             * below instead. */
             zbtreeReserve(bt, cap);
 
             eptr = lpSeek(zl,0);
