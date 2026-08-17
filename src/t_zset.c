@@ -1493,8 +1493,9 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
              * callers (SORT/SORT_RO, RDB listpack-promotion loads) pass
              * zsetLength(zobj), the listpack's own already-decoded length;
              * zsetTypeMaybeConvert()'s ZADD caller passes elements, this
-             * command's own argc-derived count of score-member pairs; and ZADD's
-             * listpack-overflow path below passes zsetLength(zobj) + 1.
+             * command's own argc-derived count of score-member pairs;
+             * and ZADD's listpack-overflow path below passes
+             * zsetLength(zobj) + 1.
              * zsetConvertAfterBulkInsert()'s zsetConvert() calls never reach
              * here: it returns immediately on OBJ_ENCODING_LISTPACK, so its
              * BTREE conversion always lands in the SKIPLIST->BTREE branch
