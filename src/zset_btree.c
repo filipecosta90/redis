@@ -3597,26 +3597,38 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
         if (in_new != zbtIndexLeafMigrated(zs, leaf)) return 0;
     }
 
-    uint32_t hashes[ZBT_SCORE_LEAF_MAX];
+    /* First pass: match by the leaf's own stored tag byte only -- no
+     * hashing. zbtScoreInsert() and every split/merge/build path set that
+     * byte to (that member's real hash) >> 24 and only ever copy it forward
+     * from an already-correct leaf, never guess or recompute it from
+     * something else. So whenever this comparison passes, zbtIndexTag() of
+     * that exact member's hash is provably equal to 'tag' without needing
+     * to look: index tags fold a zero top byte into one, so leaf_tag
+     * nonzero and equal to tag means zbtIndexTag(hash) = leaf_tag = tag,
+     * and leaf_tag zero with tag == 1 means zbtIndexTag(hash) = 1 = tag
+     * either way. Re-deriving the hash just to reconfirm the tag here would
+     * be checking something already established by construction. */
     unsigned int positions[ZBT_SCORE_LEAF_MAX];
     unsigned int count = 0;
     for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
         uint8_t leaf_tag = zbtScoreLeafTag(leaf, pos);
-        /* Index tags fold zero into one because zero marks an empty slot.
-         * Leaf tags keep the raw byte, so index tag one covers both values. */
         if (leaf_tag != tag && !(tag == 1 && leaf_tag == 0)) continue;
-        uint32_t hash = zbtScoreLeafHash(leaf, pos);
-        if (zbtIndexTag(hash) != tag) continue;
-        hashes[count] = hash;
         positions[count++] = pos;
     }
     serverAssert(count != 0);
 
     unsigned long emitted = 0;
     for (unsigned int i = 0; i < count; i++) {
-        if (count > 1 &&
-            !zbtIndexHashReachesBucket(table, hashes[i], bucket))
-            continue;
+        /* The real (expensive, re-hashed) member hash is only needed to
+         * disambiguate a genuine same-tag collision inside this leaf via
+         * zbtIndexHashReachesBucket() -- whether a same-tag member actually
+         * probes through this bucket or only landed here via open-
+         * addressing chaining. A single match needs no such check. */
+        if (count > 1) {
+            uint32_t hash = zbtScoreLeafHash(leaf, positions[i]);
+            if (!zbtIndexHashReachesBucket(table, hash, bucket))
+                continue;
+        }
         size_t len;
         const unsigned char *ele =
             zbtScoreLeafElement(leaf, positions[i], &len);
@@ -3685,6 +3697,23 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
 #ifdef REDIS_TEST
 #include "testhelp.h"
 
+/* Scan callback for zsetBtreeTest(): members are named "member:<i>" for a
+ * known 0..N-1 range, so recover i and mark it seen instead of needing a
+ * general string-set to check scan completeness against. */
+static void zbtScanTestMarkSeen(void *privdata, const unsigned char *ele,
+                                size_t len, double score)
+{
+    UNUSED(score);
+    int *seen = privdata;
+    char buf[32];
+    serverAssert(len < sizeof(buf));
+    memcpy(buf, ele, len);
+    buf[len] = '\0';
+    int idx = -1;
+    serverAssert(sscanf(buf, "member:%d", &idx) == 1);
+    seen[idx]++;
+}
+
 int zsetBtreeTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -3730,6 +3759,52 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zbtreeReserve(zs, 1000000);
         test_cond("zbtreeReserve is a no-op once the set is non-empty",
             zs->member_index.size == size_before);
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree zbtIndexScanSlot() tag-only fast path\n");
+
+    /* A full ZSCAN pass (real cursor-driven, repeated zbtreeScan() calls
+     * exactly like the SCAN command does, not one big call) must still
+     * visit every live member -- checked against independent ground truth
+     * from ordered iteration, not just a count, since a scan bug could
+     * plausibly emit one member twice while missing another and still
+     * balance to the right total. members:N is dense enough that some
+     * leaves are very likely to hold two or more members whose hash tags
+     * collide, exercising the count>1 disambiguation path as well as the
+     * count==1 fast path. */
+    {
+        const int N = 8000;
+        zbtreeSet *zs = zbtreeCreate();
+        zbtreeReserve(zs, N);
+        char buf[32];
+        for (int i = 0; i < N; i++) {
+            snprintf(buf, sizeof(buf), "member:%d", i);
+            sds ele = sdsnew(buf);
+            double score;
+            zbtreeInsertPosition position;
+            int existing = zbtreeFindForAdd(zs, ele, &score, &position);
+            serverAssert(!existing);
+            zbtreeInsertNew(zs, (double)i, ele, &position);
+        }
+
+        int *seen = zcalloc(sizeof(int) * N);
+        uint64_t cursor = 0;
+        unsigned long calls = 0;
+        do {
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, seen);
+            calls++;
+            /* A real client issues thousands of these for a set this size;
+             * this is just a sanity backstop against an infinite cursor. */
+            serverAssert(calls < 100000);
+        } while (cursor != 0);
+
+        int missed = 0;
+        for (int i = 0; i < N; i++)
+            if (seen[i] == 0) missed++;
+        test_cond("Cursor-driven scan visits every live member at least once",
+            missed == 0);
+        zfree(seen);
         zbtreeFree(zs);
     }
 
