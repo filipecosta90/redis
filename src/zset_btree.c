@@ -16,6 +16,33 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef HAVE_AVX2
+/* Define __MM_MALLOC_H to prevent importing the memory aligned
+ * allocation functions, which we don't use. */
+#define __MM_MALLOC_H
+#include <immintrin.h>
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+#include <arm_neon.h>
+#endif
+
+#if defined(HAVE_AVX2) || defined(HAVE_AARCH64_NEON)
+static int zbt_simd_enabled = 1;
+#endif
+
+#ifdef HAVE_AVX2
+#define ZBT_USE_AVX2 (zbt_simd_enabled && __builtin_cpu_supports("avx2"))
+#else
+#define ZBT_USE_AVX2 0
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+#define ZBT_USE_NEON (zbt_simd_enabled)
+#else
+#define ZBT_USE_NEON 0
+#endif
+
 /*-----------------------------------------------------------------------------
  * B+ tree implementation of the low level sorted set API
  *----------------------------------------------------------------------------*/
@@ -1198,23 +1225,106 @@ static void zbtScoreInsertBefore(zbtreeSet *zs, zbtScoreNode *right,
 
 /* ---------------------- Score tree search and insert -------------------- */
 
+/* Count how many of the first `count` entries of a sorted-ascending score
+ * array are below `threshold` -- "below" meaning "<=" when or_equal is set,
+ * "<" otherwise. Shared routing primitive for zbtScoreChild() and
+ * zbtreeIteratorSeekScore(): both do a linear scan over an inner node's
+ * max_score[] to find where a score falls; this is the coarse (score-only)
+ * part of that scan, factored out once so the SIMD variants below are
+ * written and reviewed a single time. */
+static unsigned int zbtScoreCountBelowScalar(const double *scores,
+                                              unsigned int count,
+                                              double threshold, int or_equal)
+{
+    unsigned int i = 0;
+    if (or_equal) {
+        while (i < count && scores[i] <= threshold) i++;
+    } else {
+        while (i < count && scores[i] < threshold) i++;
+    }
+    return i;
+}
+
+#ifdef HAVE_AVX2
+ATTRIBUTE_TARGET_AVX2
+static unsigned int zbtScoreCountBelowAVX2(const double *scores,
+                                           unsigned int count,
+                                           double threshold, int or_equal)
+{
+    __m256d t = _mm256_set1_pd(threshold);
+    unsigned int i = 0;
+    for (; i + 4 <= count; i += 4) {
+        __m256d v = _mm256_loadu_pd(scores + i);
+        __m256d cmp = or_equal ? _mm256_cmp_pd(v, t, _CMP_LE_OQ)
+                                : _mm256_cmp_pd(v, t, _CMP_LT_OQ);
+        unsigned int mask = (unsigned int)_mm256_movemask_pd(cmp);
+        if (mask != 0xF) {
+            /* scores[] is sorted ascending, so within this 4-wide lane
+             * group the satisfying elements are exactly the low-index
+             * prefix: popcount(mask) is their count. */
+            return i + (unsigned int)__builtin_popcount(mask);
+        }
+    }
+    return i + zbtScoreCountBelowScalar(scores + i, count - i, threshold,
+                                        or_equal);
+}
+#endif
+
+#ifdef HAVE_AARCH64_NEON
+static unsigned int zbtScoreCountBelowNEON(const double *scores,
+                                           unsigned int count,
+                                           double threshold, int or_equal)
+{
+    float64x2_t t = vdupq_n_f64(threshold);
+    unsigned int i = 0;
+    while (i + 2 <= count) {
+        float64x2_t v = vld1q_f64(scores + i);
+        uint64x2_t cmp = or_equal ? vcleq_f64(v, t) : vcltq_f64(v, t);
+        if (vgetq_lane_u64(cmp, 0) == 0) return i;
+        if (vgetq_lane_u64(cmp, 1) == 0) return i + 1;
+        i += 2;
+    }
+    return i + zbtScoreCountBelowScalar(scores + i, count - i, threshold,
+                                        or_equal);
+}
+#endif
+
+static unsigned int zbtScoreCountBelow(const double *scores,
+                                       unsigned int count, double threshold,
+                                       int or_equal)
+{
+#ifdef HAVE_AVX2
+    if (ZBT_USE_AVX2)
+        return zbtScoreCountBelowAVX2(scores, count, threshold, or_equal);
+#endif
+#ifdef HAVE_AARCH64_NEON
+    if (ZBT_USE_NEON)
+        return zbtScoreCountBelowNEON(scores, count, threshold, or_equal);
+#endif
+    return zbtScoreCountBelowScalar(scores, count, threshold, or_equal);
+}
+
 /* Select the first child whose greatest (score, member) is not below the
- * requested pair. max_score[] answers the common case. Only equal scores need
- * the member comparison that walks to the child's final leaf. */
+ * requested pair. max_score[] answers the common case via zbtScoreCountBelow;
+ * only a run of equal max_score[] entries (rare -- requires several children
+ * to share the same maximum score) needs the member comparison that walks to
+ * each child's final leaf. */
 static unsigned int zbtScoreChild(zbtScoreInner *inner, double score,
                                   const unsigned char *ele, size_t elelen)
 {
-    for (unsigned int i = 0; i < inner->n.count; i++) {
-        if (score < inner->max_score[i]) return i;
-        if (score == inner->max_score[i]) {
-            size_t maxlen;
-            const unsigned char *maxele =
-                zbtScoreNodeMaxElement(inner->child[i], &maxlen);
-            if (zbtCompareElements(ele, elelen, maxele, maxlen) <= 0)
-                return i;
-        }
+    unsigned int count = inner->n.count;
+    unsigned int lt = zbtScoreCountBelow(inner->max_score, count, score, 0);
+    unsigned int le = zbtScoreCountBelow(inner->max_score, count, score, 1);
+
+    for (unsigned int i = lt; i < le; i++) {
+        size_t maxlen;
+        const unsigned char *maxele =
+            zbtScoreNodeMaxElement(inner->child[i], &maxlen);
+        if (zbtCompareElements(ele, elelen, maxele, maxlen) <= 0)
+            return i;
     }
-    return inner->n.count - 1;
+    if (le < count) return le;
+    return count - 1;
 }
 
 /* Find the score leaf where a (score, member) pair belongs. */
@@ -3343,18 +3453,16 @@ int zbtreeIteratorSeekScore(const zbtreeSet *zs, double score, int exclusive,
 
     while (!node->isleaf) {
         zbtScoreInner *inner = (zbtScoreInner *)node;
-        unsigned int pos = 0;
+        unsigned int count = inner->n.count;
+        unsigned int pos;
         if (reverse) {
-            while (pos < inner->n.count &&
-                   (exclusive ? inner->max_score[pos] < score :
-                                inner->max_score[pos] <= score))
-                pos++;
-            if (pos == inner->n.count) pos--;
+            pos = zbtScoreCountBelow(inner->max_score, count, score,
+                                     !exclusive);
+            if (pos == count) pos--;
         } else {
-            while (pos + 1 < inner->n.count &&
-                   (exclusive ? inner->max_score[pos] <= score :
-                                inner->max_score[pos] < score))
-                pos++;
+            pos = zbtScoreCountBelow(inner->max_score, count, score,
+                                     exclusive);
+            if (pos >= count) pos = count - 1;
         }
         node = inner->child[pos];
     }
@@ -3692,6 +3800,7 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
 
 #ifdef REDIS_TEST
 #include "testhelp.h"
+#include <stdlib.h>
 
 /* Scan callback for zsetBtreeTest(): members are named "member:<i>" for a
  * known 0..N-1 range, so recover i and mark it seen instead of needing a
@@ -3898,6 +4007,130 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         test_cond("Scan mid-incremental-rehash visits every live member",
             missed == 0);
         zfree(seen);
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree zbtScoreCountBelow() SIMD/scalar equivalence\n");
+
+    /* Fuzz zbtScoreCountBelow() (whatever backend it dispatches to on this
+     * build/CPU -- AVX2, NEON, or scalar) against zbtScoreCountBelowScalar()
+     * directly, across random sorted arrays including heavy duplicate runs,
+     * since a sorted-prefix-count divergence here would silently misroute
+     * B+tree descent without any other test noticing. */
+    {
+        srand(12345);
+        int mismatches = 0;
+        for (int trial = 0; trial < 20000; trial++) {
+            unsigned int count = (unsigned int)(rand() % (ZBT_SCORE_INNER_MAX + 1));
+            double scores[ZBT_SCORE_INNER_MAX];
+            double v = (double)(rand() % 100) - 50.0;
+            for (unsigned int i = 0; i < count; i++) {
+                /* Occasionally repeat the previous value to force duplicate
+                 * runs, the case the tie-break logic in zbtScoreChild() and
+                 * zbtreeIteratorSeekScore() depends on getting right. */
+                if (i > 0 && (rand() % 3) != 0)
+                    v += (double)(rand() % 5);
+                scores[i] = v;
+            }
+            /* Threshold: in-range (possibly exact match), below, or above. */
+            double threshold;
+            int pick = rand() % 3;
+            if (count == 0 || pick == 1) {
+                threshold = -1000.0;
+            } else if (pick == 2) {
+                threshold = 1000.0;
+            } else {
+                threshold = scores[rand() % count];
+            }
+            for (int or_equal = 0; or_equal <= 1; or_equal++) {
+                unsigned int got =
+                    zbtScoreCountBelow(scores, count, threshold, or_equal);
+                unsigned int want = zbtScoreCountBelowScalar(scores, count,
+                                                              threshold,
+                                                              or_equal);
+                if (got != want) mismatches++;
+            }
+        }
+        test_cond("zbtScoreCountBelow matches the scalar reference",
+            mismatches == 0);
+    }
+
+    printf("Testing B+ tree routing/seeking with duplicate-heavy scores\n");
+
+    /* Force many B+tree children to share the same max_score, the rare path
+     * zbtScoreChild()'s member tie-break and zbtreeIteratorSeekScore()'s
+     * descent both special-case. Member names are zero-padded so lexical
+     * order matches insertion order, keeping the expected rank of every
+     * (score, exclusive, reverse) query computable by hand. */
+    {
+        const int group_size = 20, num_groups = 30;
+        const int n = group_size * num_groups;
+        zbtreeSet *zs = zbtreeCreate();
+        char buf[32];
+        for (int i = 0; i < n; i++) {
+            snprintf(buf, sizeof(buf), "member:%04d", i);
+            sds ele = sdsnew(buf);
+            double score;
+            zbtreeInsertPosition position;
+            int existing = zbtreeFindForAdd(zs, ele, &score, &position);
+            serverAssert(!existing);
+            zbtreeInsertNew(zs, (double)(i / group_size), ele, &position);
+            sdsfree(ele);
+        }
+        test_cond("Duplicate-score set holds every inserted member",
+            zbtreeLength(zs) == (unsigned long)n);
+
+        /* Full forward scan must still be exactly sorted with no member
+         * repeated or skipped, despite the duplicate-heavy scores. */
+        {
+            zbtreeIterator iter;
+            int found = zbtreeIteratorStart(zs, 0, &iter);
+            long count = 0;
+            double prev_score = -1.0;
+            int ok = 1;
+            while (found) {
+                const unsigned char *ele;
+                size_t len;
+                double score;
+                found = zbtreeIteratorNext(&iter, 0, &ele, &len, &score);
+                if (!found) break;
+                if (score < prev_score) ok = 0;
+                prev_score = score;
+                count++;
+            }
+            test_cond("Forward iteration over duplicate scores is complete and sorted",
+                ok && count == n);
+        }
+
+        struct { int g; int exclusive; int reverse; long want_rank; } probes[] = {
+            {0,  0, 0, 0},
+            {0,  1, 0, group_size},
+            {0,  1, 1, -1},
+            {0,  0, 1, group_size - 1},
+            {15, 0, 0, 15 * group_size},
+            {15, 1, 0, 16 * group_size},
+            {15, 0, 1, 16 * group_size - 1},
+            {15, 1, 1, 15 * group_size - 1},
+            {29, 0, 0, 29 * group_size},
+            {29, 1, 0, -1},
+            {29, 0, 1, n - 1},
+            {29, 1, 1, 29 * group_size - 1},
+        };
+        int seek_ok = 1;
+        for (size_t p = 0; p < sizeof(probes) / sizeof(probes[0]); p++) {
+            zbtreeIterator iter;
+            unsigned long rank = 0;
+            int found = zbtreeIteratorSeekScore(zs, (double)probes[p].g,
+                probes[p].exclusive, probes[p].reverse, &iter, &rank);
+            if (probes[p].want_rank < 0) {
+                if (found) seek_ok = 0;
+            } else {
+                if (!found || (long)rank != probes[p].want_rank) seek_ok = 0;
+            }
+        }
+        test_cond("zbtreeIteratorSeekScore lands on the expected rank across duplicate-score groups",
+            seek_ok);
+
         zbtreeFree(zs);
     }
 
