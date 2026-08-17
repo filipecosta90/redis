@@ -3821,25 +3821,52 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
      * that member's real hash. zbtreeReserve() sidesteps member_rehash
      * entirely, so the block above never actually exercises a scan while
      * zs->member_rehash != NULL -- the split old/new-table walk in
-     * zbtreeScan() and the leaf-migration bookkeeping it depends on. Grow
-     * this set incrementally (no reserve) so a real resize starts mid-
-     * population, and scan while it is still in progress. */
+     * zbtreeScan() and the leaf-migration bookkeeping it depends on.
+     *
+     * Growing one member at a time from empty triggers a resize almost
+     * immediately (around 125 elements / 2 leaves given this build's load
+     * factor), and that first resize's own triggering insert also migrates
+     * 1-2 leaves via zbtIndexInsert()'s eager copy-on-insert -- for a set
+     * that small, that single call can migrate EVERY leaf, leaving the "old"
+     * table a near-empty husk that only the finalize step (never reached,
+     * since the test stops touching the tree) would free. A scan over that
+     * state exercises the new-table read path but not the old-table one --
+     * confirmed by mutation-testing: disabling zbtreeScan()'s old-table
+     * bucket range entirely still passed a first version of this test.
+     *
+     * Fix: reserve a large capacity first (bypasses rehash, as usual), fill
+     * it to exactly that size, then keep inserting one at a time past it.
+     * The resize this triggers has hundreds of leaves to drain and still
+     * only migrates 1-2 per call, so by the time the loop below breaks, the
+     * old table genuinely holds the vast majority of live members -- not
+     * just the migration flag with nothing left to migrate. */
     {
-        const int N = 20000;
+        const int RESERVED = 50000;
+        const int N = 100000;
         zbtreeSet *zs = zbtreeCreate();
-        int inserted = 0;
+        zbtreeReserve(zs, RESERVED);
+        zbtTestPopulateRange(zs, 0, RESERVED);
+        serverAssert(zs->member_rehash == NULL);
+
+        int inserted = RESERVED;
         while (inserted < N) {
             zbtTestPopulateRange(zs, inserted, inserted + 1);
             inserted++;
-            /* A resize started by this insert can also finish within it, once
-             * the table has more than one leaf to drain -- so this check can
-             * see NULL again right after a resize began and keep looping;
-             * that's fine, it just means the break below fires once the set
-             * is big enough for a resize to genuinely outlive its own call. */
-            if (zs->member_rehash != NULL) break;
+            /* See the comment above: a resize can start and fully drain
+             * within the same insert call while the tree is still small, so
+             * this loop doesn't stop on the first sighting of member_rehash
+             * -- it stops once a resize has genuinely outlived its own call,
+             * checked via the backstop assertion below. */
+            if (zs->member_rehash != NULL &&
+                zs->member_rehash->table.used < (unsigned long)zs->length)
+                break;
         }
         serverAssert(zs->member_rehash != NULL);
         serverAssert(inserted < N);
+        /* The real point of this test: the new table must NOT already hold
+         * every live member, or the old-table read path in zbtreeScan()'s
+         * split walk goes unexercised no matter how the loop above got here. */
+        serverAssert(zs->member_rehash->table.used < (unsigned long)zs->length);
 
         int *seen = zcalloc(sizeof(int) * inserted);
         zbtScanTestPrivdata pd = {seen, inserted};
