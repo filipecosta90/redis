@@ -3598,16 +3598,12 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     }
 
     /* First pass: match by the leaf's own stored tag byte only -- no
-     * hashing. zbtScoreInsert() and every split/merge/build path set that
-     * byte to (that member's real hash) >> 24 and only ever copy it forward
-     * from an already-correct leaf, never guess or recompute it from
-     * something else. So whenever this comparison passes, zbtIndexTag() of
-     * that exact member's hash is provably equal to 'tag' without needing
-     * to look: index tags fold a zero top byte into one, so leaf_tag
-     * nonzero and equal to tag means zbtIndexTag(hash) = leaf_tag = tag,
-     * and leaf_tag zero with tag == 1 means zbtIndexTag(hash) = 1 = tag
-     * either way. Re-deriving the hash just to reconfirm the tag here would
-     * be checking something already established by construction. */
+     * hashing. Every leaf-tag byte is set to (that member's real hash) >> 24
+     * and only ever copied forward from an already-correct leaf (see
+     * zbtScoreInsert() and the split/merge/build paths), so a tag match here
+     * already implies zbtIndexTag(hash) == tag; re-deriving the hash to
+     * reconfirm it would just check something already established by
+     * construction. */
     unsigned int positions[ZBT_SCORE_LEAF_MAX];
     unsigned int count = 0;
     for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
@@ -3699,19 +3695,46 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
 
 /* Scan callback for zsetBtreeTest(): members are named "member:<i>" for a
  * known 0..N-1 range, so recover i and mark it seen instead of needing a
- * general string-set to check scan completeness against. */
+ * general string-set to check scan completeness against. 'seen' has 'n'
+ * elements; the sscanf'd index is bounds-checked before use since it comes
+ * from the scanned data, not from a value the test already trusts. */
+typedef struct {
+    int *seen;
+    int n;
+} zbtScanTestPrivdata;
+
 static void zbtScanTestMarkSeen(void *privdata, const unsigned char *ele,
                                 size_t len, double score)
 {
     UNUSED(score);
-    int *seen = privdata;
+    zbtScanTestPrivdata *pd = privdata;
     char buf[32];
     serverAssert(len < sizeof(buf));
     memcpy(buf, ele, len);
     buf[len] = '\0';
     int idx = -1;
     serverAssert(sscanf(buf, "member:%d", &idx) == 1);
-    seen[idx]++;
+    serverAssert(idx >= 0 && idx < pd->n);
+    pd->seen[idx]++;
+}
+
+/* Insert members "member:<from>".."member:<to-1>" with scores from..to-1.
+ * Shared by every zsetBtreeTest() block that needs a populated set. */
+static void zbtTestPopulateRange(zbtreeSet *zs, int from, int to) {
+    char buf[32];
+    for (int i = from; i < to; i++) {
+        snprintf(buf, sizeof(buf), "member:%d", i);
+        sds ele = sdsnew(buf);
+        double score;
+        zbtreeInsertPosition position;
+        int existing = zbtreeFindForAdd(zs, ele, &score, &position);
+        serverAssert(!existing);
+        zbtreeInsertNew(zs, (double)i, ele, &position);
+    }
+}
+
+static void zbtTestPopulate(zbtreeSet *zs, int n) {
+    zbtTestPopulateRange(zs, 0, n);
 }
 
 int zsetBtreeTest(int argc, char **argv, int flags) {
@@ -3730,16 +3753,7 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             zs->member_index.size > ZBT_INDEX_INITIAL_BUCKETS &&
             zs->member_rehash == NULL);
 
-        char buf[32];
-        for (int i = 0; i < 10000; i++) {
-            snprintf(buf, sizeof(buf), "member:%d", i);
-            sds ele = sdsnew(buf);
-            double score;
-            zbtreeInsertPosition position;
-            int existing = zbtreeFindForAdd(zs, ele, &score, &position);
-            serverAssert(!existing);
-            zbtreeInsertNew(zs, (double)i, ele, &position);
-        }
+        zbtTestPopulate(zs, 10000);
         test_cond("Reserved set still holds every inserted member",
             zbtreeLength(zs) == 10000 && zs->member_rehash == NULL);
         zbtreeFree(zs);
@@ -3777,22 +3791,14 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         const int N = 8000;
         zbtreeSet *zs = zbtreeCreate();
         zbtreeReserve(zs, N);
-        char buf[32];
-        for (int i = 0; i < N; i++) {
-            snprintf(buf, sizeof(buf), "member:%d", i);
-            sds ele = sdsnew(buf);
-            double score;
-            zbtreeInsertPosition position;
-            int existing = zbtreeFindForAdd(zs, ele, &score, &position);
-            serverAssert(!existing);
-            zbtreeInsertNew(zs, (double)i, ele, &position);
-        }
+        zbtTestPopulate(zs, N);
 
         int *seen = zcalloc(sizeof(int) * N);
+        zbtScanTestPrivdata pd = {seen, N};
         uint64_t cursor = 0;
         unsigned long calls = 0;
         do {
-            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, seen);
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
             calls++;
             /* A real client issues thousands of these for a set this size;
              * this is just a sanity backstop against an infinite cursor. */
@@ -3803,6 +3809,51 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         for (int i = 0; i < N; i++)
             if (seen[i] == 0) missed++;
         test_cond("Cursor-driven scan visits every live member at least once",
+            missed == 0);
+        zfree(seen);
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree ZSCAN mid-incremental-rehash\n");
+
+    /* The fast path's "provably redundant" argument (see the comment in
+     * zbtIndexScanSlot()) rests on every leaf's stored tag always matching
+     * that member's real hash. zbtreeReserve() sidesteps member_rehash
+     * entirely, so the block above never actually exercises a scan while
+     * zs->member_rehash != NULL -- the split old/new-table walk in
+     * zbtreeScan() and the leaf-migration bookkeeping it depends on. Grow
+     * this set incrementally (no reserve) so a real resize starts mid-
+     * population, and scan while it is still in progress. */
+    {
+        const int N = 20000;
+        zbtreeSet *zs = zbtreeCreate();
+        int inserted = 0;
+        while (inserted < N) {
+            zbtTestPopulateRange(zs, inserted, inserted + 1);
+            inserted++;
+            if (zs->member_rehash != NULL) break;
+        }
+        serverAssert(zs->member_rehash != NULL);
+        serverAssert(inserted < N);
+
+        int *seen = zcalloc(sizeof(int) * inserted);
+        zbtScanTestPrivdata pd = {seen, inserted};
+        uint64_t cursor = 0;
+        unsigned long calls = 0;
+        do {
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
+            calls++;
+            serverAssert(calls < 100000);
+        } while (cursor != 0);
+        /* A scan is read-only with respect to the member index: it must not
+         * have advanced the very rehash this test exists to scan during. */
+        test_cond("member_rehash is still in progress after the scan",
+            zs->member_rehash != NULL);
+
+        int missed = 0;
+        for (int i = 0; i < inserted; i++)
+            if (seen[i] == 0) missed++;
+        test_cond("Scan mid-incremental-rehash visits every live member",
             missed == 0);
         zfree(seen);
         zbtreeFree(zs);
