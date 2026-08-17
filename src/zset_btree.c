@@ -27,18 +27,14 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(HAVE_AVX2) || defined(HAVE_AARCH64_NEON)
-static int zbt_simd_enabled = 1;
-#endif
-
 #ifdef HAVE_AVX2
-#define ZBT_USE_AVX2 (zbt_simd_enabled && __builtin_cpu_supports("avx2"))
+#define ZBT_USE_AVX2 (__builtin_cpu_supports("avx2"))
 #else
 #define ZBT_USE_AVX2 0
 #endif
 
 #ifdef HAVE_AARCH64_NEON
-#define ZBT_USE_NEON (zbt_simd_enabled)
+#define ZBT_USE_NEON 1
 #else
 #define ZBT_USE_NEON 0
 #endif
@@ -1231,7 +1227,12 @@ static void zbtScoreInsertBefore(zbtreeSet *zs, zbtScoreNode *right,
  * zbtreeIteratorSeekScore(): both do a linear scan over an inner node's
  * max_score[] to find where a score falls; this is the coarse (score-only)
  * part of that scan, factored out once so the SIMD variants below are
- * written and reviewed a single time. */
+ * written and reviewed a single time.
+ *
+ * zbtScoreCountBelowScalar() is the reference: zbtScoreCountBelowAVX2() and
+ * zbtScoreCountBelowNEON() below must return the exact same value for every
+ * input. Keep all three in sync -- the REDIS_TEST fuzz test compares
+ * zbtScoreCountBelow()'s dispatched result against this scalar reference. */
 static unsigned int zbtScoreCountBelowScalar(const double *scores,
                                               unsigned int count,
                                               double threshold, int or_equal)
@@ -1251,17 +1252,18 @@ static unsigned int zbtScoreCountBelowAVX2(const double *scores,
                                            unsigned int count,
                                            double threshold, int or_equal)
 {
+    const unsigned int lanes = sizeof(__m256d) / sizeof(double);
     __m256d t = _mm256_set1_pd(threshold);
     unsigned int i = 0;
-    for (; i + 4 <= count; i += 4) {
+    for (; i + lanes <= count; i += lanes) {
         __m256d v = _mm256_loadu_pd(scores + i);
         __m256d cmp = or_equal ? _mm256_cmp_pd(v, t, _CMP_LE_OQ)
                                 : _mm256_cmp_pd(v, t, _CMP_LT_OQ);
         unsigned int mask = (unsigned int)_mm256_movemask_pd(cmp);
-        if (mask != 0xF) {
-            /* scores[] is sorted ascending, so within this 4-wide lane
-             * group the satisfying elements are exactly the low-index
-             * prefix: popcount(mask) is their count. */
+        if (mask != (1u << lanes) - 1) {
+            /* scores[] is sorted ascending, so within this lane group the
+             * satisfying elements are exactly the low-index prefix:
+             * popcount(mask) is their count. */
             return i + (unsigned int)__builtin_popcount(mask);
         }
     }
@@ -1275,14 +1277,15 @@ static unsigned int zbtScoreCountBelowNEON(const double *scores,
                                            unsigned int count,
                                            double threshold, int or_equal)
 {
+    const unsigned int lanes = sizeof(float64x2_t) / sizeof(double);
     float64x2_t t = vdupq_n_f64(threshold);
     unsigned int i = 0;
-    while (i + 2 <= count) {
+    while (i + lanes <= count) {
         float64x2_t v = vld1q_f64(scores + i);
         uint64x2_t cmp = or_equal ? vcleq_f64(v, t) : vcltq_f64(v, t);
         if (vgetq_lane_u64(cmp, 0) == 0) return i;
         if (vgetq_lane_u64(cmp, 1) == 0) return i + 1;
-        i += 2;
+        i += lanes;
     }
     return i + zbtScoreCountBelowScalar(scores + i, count - i, threshold,
                                         or_equal);
@@ -1293,12 +1296,16 @@ static unsigned int zbtScoreCountBelow(const double *scores,
                                        unsigned int count, double threshold,
                                        int or_equal)
 {
+    debugServerAssert(count <= ZBT_SCORE_INNER_MAX);
 #ifdef HAVE_AVX2
-    if (ZBT_USE_AVX2)
+    /* Below one AVX2 lane group (4 doubles) the vectorized loop can't run
+     * a single iteration anyway -- skip straight to scalar and save the
+     * cpu_supports() check and call overhead on the common small-node case. */
+    if (count >= 4 && ZBT_USE_AVX2)
         return zbtScoreCountBelowAVX2(scores, count, threshold, or_equal);
 #endif
 #ifdef HAVE_AARCH64_NEON
-    if (ZBT_USE_NEON)
+    if (count >= 2 && ZBT_USE_NEON)
         return zbtScoreCountBelowNEON(scores, count, threshold, or_equal);
 #endif
     return zbtScoreCountBelowScalar(scores, count, threshold, or_equal);
@@ -3455,6 +3462,7 @@ int zbtreeIteratorSeekScore(const zbtreeSet *zs, double score, int exclusive,
         zbtScoreInner *inner = (zbtScoreInner *)node;
         unsigned int count = inner->n.count;
         unsigned int pos;
+        serverAssert(count > 0);
         if (reverse) {
             pos = zbtScoreCountBelow(inner->max_score, count, score,
                                      !exclusive);
