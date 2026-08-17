@@ -3730,6 +3730,7 @@ static void zbtTestPopulateRange(zbtreeSet *zs, int from, int to) {
         int existing = zbtreeFindForAdd(zs, ele, &score, &position);
         serverAssert(!existing);
         zbtreeInsertNew(zs, (double)i, ele, &position);
+        sdsfree(ele);
     }
 }
 
@@ -3769,6 +3770,7 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zbtreeInsertPosition position;
         zbtreeFindForAdd(zs, ele, &score, &position);
         zbtreeInsertNew(zs, 1.0, ele, &position);
+        sdsfree(ele);
         unsigned long size_before = zs->member_index.size;
         zbtreeReserve(zs, 1000000);
         test_cond("zbtreeReserve is a no-op once the set is non-empty",
@@ -3863,10 +3865,15 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         }
         serverAssert(zs->member_rehash != NULL);
         serverAssert(inserted < N);
-        /* The real point of this test: the new table must NOT already hold
-         * every live member, or the old-table read path in zbtreeScan()'s
-         * split walk goes unexercised no matter how the loop above got here. */
-        serverAssert(zs->member_rehash->table.used < (unsigned long)zs->length);
+        /* The real point of this test: the new table must hold only a small
+         * minority of live members (not just "not literally all of them"),
+         * or the old-table read path in zbtreeScan()'s split walk goes
+         * essentially unexercised no matter how the loop above got here. At
+         * RESERVED=50000, only 1-2 leaves migrate via the triggering insert,
+         * so this holds by a wide margin (table.used stays in the low
+         * hundreds against a length above 50000) -- the loose bound below is
+         * a backstop against that margin eroding, not the actual number. */
+        serverAssert(zs->member_rehash->table.used < (unsigned long)zs->length / 2);
 
         int *seen = zcalloc(sizeof(int) * inserted);
         zbtScanTestPrivdata pd = {seen, inserted};
