@@ -3845,8 +3845,11 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             calls++;
             serverAssert(calls < 100000);
         } while (cursor != 0);
-        /* A scan is read-only with respect to the member index: it must not
-         * have advanced the very rehash this test exists to scan during. */
+        /* Documents an invariant, not a discriminating check: zbtreeScan()
+         * never calls zbtIndexFind()/zbtIndexRehashStep(), and this test makes
+         * no further insert/find calls after the loop above breaks, so nothing
+         * here could have driven the rehash to completion either way. Pins
+         * the assumption for a future reader, not a claim this could fail. */
         test_cond("member_rehash is still in progress after the scan",
             zs->member_rehash != NULL);
 
