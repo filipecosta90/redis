@@ -1464,8 +1464,19 @@ void addReplyBulkRunBegin(client *c, replyRun *b) {
 }
 
 /* Append one bulk string to a run opened by addReplyBulkRunBegin(). Emits exactly
- * the same bytes as addReplyBulkCBuffer(); only the hoisted preamble differs. */
+ * the same bytes as addReplyBulkCBuffer(); only the hoisted preamble differs.
+ *
+ * The one part of the preamble that cannot be hoisted is the CLIENT_CLOSE_ASAP
+ * test. Appending is what trips the output buffer limit, so a long run can push the
+ * client over it partway through: _addReplyPayloadToList() calls
+ * closeClientOnOutputBufferLimitReached(), which flags the client CLIENT_CLOSE_ASAP.
+ * The unhoisted path notices on the very next element, because every element re-runs
+ * _prepareClientToWrite(), and stops appending there. Re-check it per element so a
+ * run stops on the same element the unhoisted path would, instead of overrunning the
+ * limit by the whole remainder of the run. It is one bit test against a word the
+ * append is about to touch anyway. */
 void addReplyBulkCBufferRun(client *c, replyRun *b, const void *p, size_t len) {
+    if (unlikely(c->flags & CLIENT_CLOSE_ASAP)) return;
     const char *hdr;
     size_t hdr_len;
     /* '$' + up to 20 digits (64-bit) + "\r\n"; LONG_STR_SIZE already budgets the NUL. */
