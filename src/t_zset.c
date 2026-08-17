@@ -1486,6 +1486,13 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         if (encoding == OBJ_ENCODING_BTREE) {
             zbtreeSet *bt = zbtreeCreate();
+            /* Presize the member index to avoid rehashing, mirroring the
+             * dictExpand(zs->dict, cap) a few lines below for the
+             * LISTPACK->SKIPLIST branch. cap is zsetLength(zobj) here (see
+             * zsetConvert()/zsetConvertAfterBulkInsert()'s callers) -- the
+             * listpack's own already-materialized element count, never an
+             * unvalidated RDB/client length. */
+            zbtreeReserve(bt, cap);
 
             eptr = lpSeek(zl,0);
             if (eptr != NULL) {
@@ -1557,6 +1564,9 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         if (encoding == OBJ_ENCODING_BTREE) {
             zs = zobj->ptr;
             zbtreeSet *bt = zbtreeCreate();
+            /* Same reserve as the LISTPACK->BTREE branch above; cap is
+             * zsetLength(zobj), the skiplist's own real length. */
+            zbtreeReserve(bt, cap);
             node = zs->zsl->header->level[0].forward;
             while (node) {
                 zbtreeInsertNew(bt, node->score, zslGetNodeElement(node),
