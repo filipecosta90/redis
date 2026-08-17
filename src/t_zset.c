@@ -1488,10 +1488,14 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             zbtreeSet *bt = zbtreeCreate();
             /* Presize the member index to avoid rehashing, mirroring the
              * dictExpand(zs->dict, cap) a few lines below for the
-             * LISTPACK->SKIPLIST branch. cap is zsetLength(zobj) here (see
-             * zsetConvert()/zsetConvertAfterBulkInsert()'s callers) -- the
-             * listpack's own already-materialized element count, never an
-             * unvalidated RDB/client length. */
+             * LISTPACK->SKIPLIST branch. cap here is always a real element
+             * count, never an unvalidated RDB/client length: zsetConvert()'s
+             * callers (SORT ... STORE, RDB listpack-promotion loads, and
+             * this function's own SKIPLIST->LISTPACK/BTREE re-entry) pass
+             * zsetLength(zobj), the listpack's own already-decoded length;
+             * zsetTypeMaybeConvert()'s ZADD caller passes elements, this
+             * command's own argc-derived count of new members; and ZADD's
+             * listpack-overflow path below passes zsetLength(zobj) + 1. */
             zbtreeReserve(bt, cap);
 
             eptr = lpSeek(zl,0);
@@ -1564,8 +1568,10 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         if (encoding == OBJ_ENCODING_BTREE) {
             zs = zobj->ptr;
             zbtreeSet *bt = zbtreeCreate();
-            /* Same reserve as the LISTPACK->BTREE branch above; cap is
-             * zsetLength(zobj), the skiplist's own real length. */
+            /* Same reserve mechanism as the LISTPACK->BTREE branch above.
+             * This branch is reached only via zsetConvert(), so cap is
+             * always zsetLength(zobj) here -- the skiplist's own real
+             * length, not a size_hint/overflow-derived count. */
             zbtreeReserve(bt, cap);
             node = zs->zsl->header->level[0].forward;
             while (node) {
