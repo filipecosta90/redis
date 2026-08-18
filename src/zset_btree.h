@@ -83,6 +83,8 @@ void zbtreeInsertNew(zbtreeSet *zs, double score, sds ele,
                      const zbtreeInsertPosition *position);
 void zbtreeInsertNewRaw(zbtreeSet *zs, double score, const unsigned char *ele,
                         size_t elelen, const zbtreeInsertPosition *position);
+void zbtreeInsertNewAppend(zbtreeSet *zs, double score,
+                           const unsigned char *ele, size_t elelen);
 int zbtreeDelete(zbtreeSet *zs, sds ele);
 void zbtreeUpdateScore(zbtreeSet *zs, sds ele, double score,
                        const zbtreeInsertPosition *position);

@@ -1579,8 +1579,14 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             zbtreeReserve(bt, cap);
             node = zs->zsl->header->level[0].forward;
             while (node) {
-                zbtreeInsertNew(bt, node->score, zslGetNodeElement(node),
-                                NULL);
+                /* The skiplist is Redis's own, always sorted, never
+                 * corrupted -- unlike the listpack branch above, safe to
+                 * use the descent-free append path (zbtScoreInsertAppend's
+                 * precondition holds by construction: zslInsert never
+                 * produces (score, member) out of order or duplicated). */
+                sds ele = zslGetNodeElement(node);
+                zbtreeInsertNewAppend(bt, node->score,
+                                      (unsigned char *)ele, sdslen(ele));
                 node = node->level[0].forward;
             }
             dictRelease(zs->dict);

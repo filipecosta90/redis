@@ -1512,6 +1512,11 @@ static zbtScoreLeaf *zbtScoreInsertEdgeLeaf(zbtreeSet *zs,
 
 /* Insert a new (score, member) pair into the score tree and return the leaf
  * that received it. The member index is updated separately by the caller.
+ * 'oldleaf'/'pos' are the target leaf and the position the pair belongs at
+ * within it; 'at_left_edge'/'at_right_edge' say whether that position is the
+ * very start/end of the whole tree. Callers that already know all four
+ * (bulk-append, see zbtScoreInsertAppend below) skip the descent that would
+ * otherwise recompute them.
  *
  * The paths, in increasing order of work, are:
  *
@@ -1523,27 +1528,14 @@ static zbtScoreLeaf *zbtScoreInsertEdgeLeaf(zbtreeSet *zs,
  * Monotonic insertion has another path that fills an edge page and then
  * starts a new one, avoiding the half-full leaves produced by normal splits.
  */
-static zbtScoreLeaf *zbtScoreInsert(zbtreeSet *zs, double score,
-                                    zbtBuildElement *ele)
+static zbtScoreLeaf *zbtScoreInsertAt(zbtreeSet *zs, zbtScoreLeaf *oldleaf,
+                                      unsigned int pos, int at_left_edge,
+                                      int at_right_edge, double score,
+                                      zbtBuildElement *ele)
 {
     uint32_t hash = ele->hash;
     uint8_t tag = hash >> 24;
-    if (zs->score_root == NULL) {
-        double scores[1] = {score};
-        uint8_t tags[1] = {tag};
-        zbtScoreLeaf *leaf = zbtScoreLeafBuild(zs, 1, scores, ele, tags,
-                                               ZBT_NEW_LEAF_ID, 0);
-        zs->score_root = &leaf->n;
-        zs->score_first = zs->score_last = leaf;
-        return leaf;
-    }
-
-    zbtScoreLeaf *oldleaf = zbtScoreFindLeaf(zs, score, ele->ptr, ele->len);
     unsigned int oldcount = oldleaf->n.count;
-    unsigned int pos = zbtScoreLeafLowerBound(oldleaf, score,
-                                              ele->ptr, ele->len);
-    int at_left_edge = pos == 0 && oldleaf == zs->score_first;
-    int at_right_edge = pos == oldcount && oldleaf == zs->score_last;
 
     /* Monotonic inserts are common when a sorted set is loaded. Once an edge
      * leaf reaches its element limit, start another full-size leaf instead of
@@ -1652,6 +1644,74 @@ static zbtScoreLeaf *zbtScoreInsert(zbtreeSet *zs, double score,
     zbtScoreInsertSibling(zs, &left->n, &right->n);
     zbtScoreRefreshParents(&left->n);
     return pos < left_count ? left : right;
+}
+
+/* Insert a new (score, member) pair anywhere in the tree: find its target
+ * leaf and position, then hand off to zbtScoreInsertAt(). */
+static zbtScoreLeaf *zbtScoreInsert(zbtreeSet *zs, double score,
+                                    zbtBuildElement *ele)
+{
+    if (zs->score_root == NULL) {
+        double scores[1] = {score};
+        uint8_t tags[1] = {(uint8_t)(ele->hash >> 24)};
+        zbtScoreLeaf *leaf = zbtScoreLeafBuild(zs, 1, scores, ele, tags,
+                                               ZBT_NEW_LEAF_ID, 0);
+        zs->score_root = &leaf->n;
+        zs->score_first = zs->score_last = leaf;
+        return leaf;
+    }
+
+    zbtScoreLeaf *oldleaf = zbtScoreFindLeaf(zs, score, ele->ptr, ele->len);
+    unsigned int pos = zbtScoreLeafLowerBound(oldleaf, score,
+                                              ele->ptr, ele->len);
+    int at_left_edge = pos == 0 && oldleaf == zs->score_first;
+    int at_right_edge = pos == oldleaf->n.count && oldleaf == zs->score_last;
+    return zbtScoreInsertAt(zs, oldleaf, pos, at_left_edge, at_right_edge,
+                            score, ele);
+}
+
+/* Insert a new (score, member) pair that the caller guarantees sorts after
+ * every pair already in the tree -- the shape zsetConvertAndExpand()'s
+ * BTREE-target loops produce, walking an already-sorted source (a listpack
+ * or skiplist) and inserting members known to be absent. Skips
+ * zbtScoreFindLeaf()'s top-down descent entirely: the target is always the
+ * current rightmost leaf, appended at its end, which zbtScoreInsertAt()
+ * already has a cheap edge-leaf path for. Precondition checked in debug
+ * builds, not derived -- callers outside a from-scratch bulk build must not
+ * use this. */
+static zbtScoreLeaf *zbtScoreInsertAppend(zbtreeSet *zs, double score,
+                                          zbtBuildElement *ele)
+{
+    if (zs->score_root == NULL) {
+        double scores[1] = {score};
+        uint8_t tags[1] = {(uint8_t)(ele->hash >> 24)};
+        zbtScoreLeaf *leaf = zbtScoreLeafBuild(zs, 1, scores, ele, tags,
+                                               ZBT_NEW_LEAF_ID, 0);
+        zs->score_root = &leaf->n;
+        zs->score_first = zs->score_last = leaf;
+        return leaf;
+    }
+
+#ifdef DEBUG_ASSERTIONS
+    {
+        zbtScoreLeaf *last = zs->score_last;
+        unsigned int lastpos = last->n.count - 1;
+        double lastscore = zbtScoreLeafScore(last, lastpos);
+        int after_last = score > lastscore;
+        if (!after_last && score == lastscore) {
+            size_t len;
+            const unsigned char *maxele =
+                zbtScoreLeafElement(last, lastpos, &len);
+            after_last = zbtCompareElements(ele->ptr, ele->len,
+                                            maxele, len) > 0;
+        }
+        debugServerAssert(after_last);
+    }
+#endif
+
+    zbtScoreLeaf *oldleaf = zs->score_last;
+    unsigned int pos = oldleaf->n.count;
+    return zbtScoreInsertAt(zs, oldleaf, pos, 0, 1, score, ele);
 }
 
 /* --------------------------- Member index ------------------------------- */
@@ -3034,6 +3094,24 @@ void zbtreeInsertNew(zbtreeSet *zs, double score, sds ele,
                        position);
 }
 
+/* Like zbtreeInsertNewRaw(), but for a caller building a tree from a source
+ * that is already fully sorted (a listpack or another zset's skiplist) and
+ * inserting members it knows are absent -- zsetConvertAndExpand()'s two
+ * BTREE-target loops, the only intended callers. Skips the top-down leaf
+ * search entirely via zbtScoreInsertAppend(); everything else (index
+ * expand/insert, length bump) matches zbtreeInsertNewRaw() exactly. */
+void zbtreeInsertNewAppend(zbtreeSet *zs, double score,
+                           const unsigned char *ele, size_t elelen)
+{
+    uint32_t hash = (uint32_t)dictGenHashFunction(ele, elelen);
+    zbtIndexExpandIfNeeded(zs, 1);
+    zbtBuildElement element;
+    zbtBuildElementFromBytes(&element, ele, elelen, hash);
+    zbtScoreLeaf *leaf = zbtScoreInsertAppend(zs, score, &element);
+    zs->length++;
+    zbtIndexInsert(zs, hash, leaf->id, NULL);
+}
+
 /* Delete a member, returning one if it existed and zero otherwise. */
 int zbtreeDelete(zbtreeSet *zs, sds ele) {
     uint32_t hash = (uint32_t)dictGenHashFunction(ele, sdslen(ele));
@@ -3899,6 +3977,95 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             missed == 0);
         zfree(seen);
         zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree zbtreeInsertNewAppend() vs the general insert path\n");
+
+    /* zbtreeInsertNewAppend() takes a shortcut only valid when the caller
+     * guarantees strictly increasing (score, member) order -- exactly what
+     * zsetConvertAndExpand()'s SKIPLIST->BTREE loop feeds it. Build the same
+     * sorted, duplicate-score-heavy sequence two ways (the fast append path,
+     * and the general zbtreeFindForAdd()+zbtreeInsertNew() path every other
+     * caller uses) and require byte-identical trees: same length, same
+     * forward order, same reverse order. Spans several thousand elements so
+     * it crosses many leaf/inner-node boundaries, and groups of 20 members
+     * share each score so multi-child same-max_score runs (the case
+     * zbtScoreChild's member tie-break exists for) are exercised on both
+     * sides. */
+    {
+        const int n = 4000, group_size = 20;
+        zbtreeSet *fast = zbtreeCreate();
+        zbtreeSet *slow = zbtreeCreate();
+        char buf[32];
+        for (int i = 0; i < n; i++) {
+            snprintf(buf, sizeof(buf), "member:%05d", i);
+            double score = (double)(i / group_size);
+
+            zbtreeInsertNewAppend(fast, score, (unsigned char *)buf,
+                                  strlen(buf));
+
+            sds ele = sdsnew(buf);
+            double existing_score;
+            zbtreeInsertPosition position;
+            int existing = zbtreeFindForAdd(slow, ele, &existing_score,
+                                            &position);
+            serverAssert(!existing);
+            zbtreeInsertNew(slow, score, ele, &position);
+            sdsfree(ele);
+        }
+        test_cond("Append and general insert build sets of the same length",
+            zbtreeLength(fast) == (unsigned long)n &&
+            zbtreeLength(slow) == (unsigned long)n);
+
+        zbtreeIterator fiter, siter;
+        int ffound = zbtreeIteratorStart(fast, 0, &fiter);
+        int sfound = zbtreeIteratorStart(slow, 0, &siter);
+        int forward_match = 1;
+        long forward_count = 0;
+        while (ffound && sfound) {
+            const unsigned char *fele, *sele;
+            size_t flen, slen;
+            double fscore, sscore;
+            ffound = zbtreeIteratorNext(&fiter, 0, &fele, &flen, &fscore);
+            sfound = zbtreeIteratorNext(&siter, 0, &sele, &slen, &sscore);
+            if (ffound != sfound) { forward_match = 0; break; }
+            if (!ffound) break;
+            if (fscore != sscore || flen != slen ||
+                memcmp(fele, sele, flen) != 0)
+            {
+                forward_match = 0;
+                break;
+            }
+            forward_count++;
+        }
+        test_cond("Forward iteration is byte-identical between the two trees",
+            forward_match && forward_count == n);
+
+        ffound = zbtreeIteratorStart(fast, 1, &fiter);
+        sfound = zbtreeIteratorStart(slow, 1, &siter);
+        int reverse_match = 1;
+        long reverse_count = 0;
+        while (ffound && sfound) {
+            const unsigned char *fele, *sele;
+            size_t flen, slen;
+            double fscore, sscore;
+            ffound = zbtreeIteratorNext(&fiter, 1, &fele, &flen, &fscore);
+            sfound = zbtreeIteratorNext(&siter, 1, &sele, &slen, &sscore);
+            if (ffound != sfound) { reverse_match = 0; break; }
+            if (!ffound) break;
+            if (fscore != sscore || flen != slen ||
+                memcmp(fele, sele, flen) != 0)
+            {
+                reverse_match = 0;
+                break;
+            }
+            reverse_count++;
+        }
+        test_cond("Reverse iteration is byte-identical between the two trees",
+            reverse_match && reverse_count == n);
+
+        zbtreeFree(fast);
+        zbtreeFree(slow);
     }
 
     return 0;
