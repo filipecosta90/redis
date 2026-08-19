@@ -3696,36 +3696,10 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
      * construction. */
     unsigned int positions[ZBT_SCORE_LEAF_MAX];
     unsigned int count = 0;
-    if (tag == 1) {
-        /* Rare (index tag 1 also matches leaf members whose real tag is 0,
-         * since 0 is reserved as "empty" in the index and real-tag-0
-         * members are stored under index tag 1 instead -- on average 1/256
-         * of calls). memchr() can't search for two byte values in one pass,
-         * so keep the plain scalar scan for this branch. */
-        for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
-            uint8_t leaf_tag = zbtScoreLeafTag(leaf, pos);
-            if (leaf_tag == tag || leaf_tag == 0) positions[count++] = pos;
-        }
-    } else {
-        /* Common case (255/256 of calls): the leaf's tag bytes are stored
-         * contiguously in physical order (zbtScoreLeafHashTags()), so
-         * memchr() finds every candidate directly instead of a per-position
-         * function call + physical-position indirection -- the same
-         * technique zbtScoreLeafFindMember()'s point lookup already uses on
-         * this exact array. zbtScoreLeafPhysicalPos() is its own inverse
-         * (count-pos-1 when reversed, identity otherwise), so it converts
-         * memchr's physical offset back to a logical position the same way
-         * it converts logical to physical elsewhere in this file. */
-        uint8_t *tags = zbtScoreLeafHashTags(leaf);
-        uint8_t *next = tags;
-        uint8_t *end = tags + leaf->n.count;
-        while (next < end) {
-            uint8_t *found = memchr(next, tag, end - next);
-            if (found == NULL) break;
-            unsigned int physical = found - tags;
-            positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
-            next = found + 1;
-        }
+    for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
+        uint8_t leaf_tag = zbtScoreLeafTag(leaf, pos);
+        if (leaf_tag != tag && !(tag == 1 && leaf_tag == 0)) continue;
+        positions[count++] = pos;
     }
     serverAssert(count != 0);
 
