@@ -2898,13 +2898,22 @@ int zuiCompareByCardinality(const void *s1, const void *s2) {
     return 0;
 }
 
-/* Orders unlinked zskiplistNode pointers the same way zslInsert() and the
- * B+tree both order entries: by score, then by member (sdscmp, matching
- * zbtCompareElements() in zset_btree.c byte-for-byte). Used to bulk-sort
- * ZUNIONSTORE's result dict before a direct-to-B+tree build. */
-static int zsetNodeScoreCompare(const void *a, const void *b) {
-    const zskiplistNode *na = *(zskiplistNode * const *)a;
-    const zskiplistNode *nb = *(zskiplistNode * const *)b;
+/* An unlinked zskiplistNode plus the member hash ZUNIONSTORE's UNION path
+ * already computed for its dict lookup -- carried through to a direct-to-
+ * B+tree bulk build so zbtreeInsertNewAppendWithHash() doesn't need to
+ * recompute it. */
+typedef struct {
+    zskiplistNode *node;
+    uint32_t hash;
+} zsetUnionMember;
+
+/* Orders zsetUnionMembers the same way zslInsert() and the B+tree both order
+ * entries: by score, then by member (sdscmp, matching zbtCompareElements()
+ * in zset_btree.c byte-for-byte). Used to bulk-sort ZUNIONSTORE's result
+ * dict before a direct-to-B+tree build. */
+static int zsetUnionMemberScoreCompare(const void *a, const void *b) {
+    const zskiplistNode *na = ((const zsetUnionMember *)a)->node;
+    const zskiplistNode *nb = ((const zsetUnionMember *)b)->node;
     if (na->score < nb->score) return -1;
     if (na->score > nb->score) return 1;
     return sdscmp(zslGetNodeElement(na), zslGetNodeElement(nb));
@@ -3350,6 +3359,19 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             dictExpand(dstzset->dict,zuiLength(&src[setnum-1]));
         }
 
+        /* Sized to the worst case (no overlap at all across inputs) so Step 1
+         * can fill it unconditionally without knowing yet whether Step 2 will
+         * end up wanting it. Captures, for every genuinely NEW member, the
+         * node plus the hash dictFindLinkWithHash() below already needed to
+         * locate the dict bucket -- reused by the B+tree fast path in Step 2
+         * (dictGetHash()/dictSdsHash() and zbtree's own hashing both reduce
+         * to dictGenHashFunction() on the same bytes, so the value is valid
+         * either way). Freed unconditionally at the end of this branch. */
+        unsigned long maxpossible = 0;
+        for (i = 0; i < setnum; i++) maxpossible += zuiLength(&src[i]);
+        zsetUnionMember *members = zmalloc(sizeof(zsetUnionMember) * (maxpossible ? maxpossible : 1));
+        unsigned long nmembers = 0;
+
         /* Step 1: Iterate all sorted sets and aggregate scores.
          * For each element, either insert into skiplist (new) or update score (existing). */
         for (i = 0; i < setnum; i++) {
@@ -3362,9 +3384,11 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (isnan(score)) score = 0;
 
                 /* Search for this element in the dict (which stores node pointers). */
+                sds elesds = zuiSdsFromValue(&zval);
+                uint64_t hash = dictGetHash(dstzset->dict, elesds);
                 dictEntryLink bucket, link;
-                link = dictFindLink(dstzset->dict, zuiSdsFromValue(&zval), &bucket);
-                
+                link = dictFindLinkWithHash(dstzset->dict, elesds, hash, &bucket);
+
                 if (link == NULL) {  /* if not exists */
                     /* New element: create node and insert into dict */
                     tmp = zuiNewSdsFromValue(&zval);
@@ -3378,6 +3402,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     znode = zslCreateNode(dstzset->zsl, zslRandomLevel(), score, tmp);
                     /* Add node pointer to dict using the bucket we already found */
                     dictSetKeyAtLink(dstzset->dict, znode, &bucket, 1);
+                    members[nmembers].node = znode;
+                    members[nmembers].hash = (uint32_t)hash;
+                    nmembers++;
                     sdsfree(tmp); /* zslCreateNode copied it, we can free our copy */
                 } else {
                     /* Existing element: aggregate score */
@@ -3403,35 +3430,31 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
          * dict hash order) followed by zsetConvertAndExpand()'s SKIPLIST->
          * BTREE branch re-walking that skiplist to bulk-append it into a
          * B+tree, then tearing the skiplist down again. Skip both passes:
-         * pull the dict's node pointers into a flat array, sort them once
-         * (matches zslInsert()'s own order -- score, then sdscmp(member)),
-         * and bulk-append directly into a fresh B+tree.
+         * sort the members captured above once (matches zslInsert()'s own
+         * order -- score, then sdscmp(member)), and bulk-append directly
+         * into a fresh B+tree, reusing each member's already-known hash.
          *
          * Only safe when dstkey is set (ZUNIONSTORE): the STORE-less ZUNION
          * variant reuses this exact accumulation code but replies straight
          * off dstzset->zsl's linked list a few lines below, so it must keep
          * getting a real, linked skiplist. */
-        unsigned long unioncount = dictSize(dstzset->dict);
+        unsigned long unioncount = nmembers; /* == dictSize(dstzset->dict) */
         if (dstkey && !(unioncount <= server.zset_max_listpack_entries &&
               maxelelen <= server.zset_max_listpack_value &&
               lpSafeToAdd(NULL, totelelen)))
         {
-            zskiplistNode **nodes = zmalloc(sizeof(zskiplistNode *) * unioncount);
-            unsigned long n = 0;
-            dictInitIterator(&di, dstzset->dict);
-            while ((de = dictNext(&di)) != NULL) nodes[n++] = dictGetKey(de);
-            dictResetIterator(&di);
-            qsort(nodes, unioncount, sizeof(zskiplistNode *), zsetNodeScoreCompare);
+            qsort(members, unioncount, sizeof(zsetUnionMember), zsetUnionMemberScoreCompare);
 
             zbtreeSet *bt = zbtreeCreate();
             zbtreeReserve(bt, unioncount);
-            for (n = 0; n < unioncount; n++) {
-                sds ele = zslGetNodeElement(nodes[n]);
-                zbtreeInsertNewAppend(bt, nodes[n]->score,
-                                      (unsigned char *)ele, sdslen(ele));
-                zslFreeNode(dstzset->zsl, nodes[n]);
+            for (unsigned long n = 0; n < unioncount; n++) {
+                zskiplistNode *node = members[n].node;
+                sds ele = zslGetNodeElement(node);
+                zbtreeInsertNewAppendWithHash(bt, node->score,
+                                              (unsigned char *)ele, sdslen(ele),
+                                              members[n].hash);
+                zslFreeNode(dstzset->zsl, node);
             }
-            zfree(nodes);
             dictRelease(dstzset->dict);
             zfree(dstzset->zsl->header);
             zfree(dstzset->zsl);
@@ -3451,6 +3474,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             }
             dictResetIterator(&di);
         }
+        zfree(members);
     } else if (op == SET_OP_DIFF) {
         zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
     } else {

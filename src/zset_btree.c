@@ -3103,7 +3103,19 @@ void zbtreeInsertNew(zbtreeSet *zs, double score, sds ele,
 void zbtreeInsertNewAppend(zbtreeSet *zs, double score,
                            const unsigned char *ele, size_t elelen)
 {
-    uint32_t hash = (uint32_t)dictGenHashFunction(ele, elelen);
+    zbtreeInsertNewAppendWithHash(zs, score, ele, elelen,
+                                  (uint32_t)dictGenHashFunction(ele, elelen));
+}
+
+/* Same as zbtreeInsertNewAppend(), but for a caller that already computed
+ * this exact member's hash for another purpose (e.g. a dict lookup using the
+ * same SipHash-based dictGenHashFunction()) and wants to avoid paying for it
+ * twice. The hash is not validated against ele/elelen -- passing a mismatched
+ * hash silently corrupts the member index. */
+void zbtreeInsertNewAppendWithHash(zbtreeSet *zs, double score,
+                                   const unsigned char *ele, size_t elelen,
+                                   uint32_t hash)
+{
     zbtIndexExpandIfNeeded(zs, 1);
     zbtBuildElement element;
     zbtBuildElementFromBytes(&element, ele, elelen, hash);
