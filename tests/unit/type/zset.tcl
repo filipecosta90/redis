@@ -1823,6 +1823,56 @@ start_server {tags {"zset"}} {
         }
     }
 
+    test {ZUNIONSTORE btree-encoded result matches aggregate-max with score collisions and weights} {
+        # Result is forced past zset-max-listpack-entries so it lands on the
+        # BTREE bulk-build fast path, with heavy score collisions (only 50
+        # distinct scores across thousands of members) to exercise the
+        # (score, member) tie-break in the same order the B+tree itself
+        # expects.
+        set orig_listpack_entries [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 8
+        r del u1{t} u2{t} udest{t}
+        array set expected {}
+        set cmd1 [list r zadd u1{t}]
+        for {set j 0} {$j < 300} {incr j} {
+            set m [format "m%05d" $j]
+            set sc [expr {$j % 20}]
+            lappend cmd1 $sc $m
+            set expected($m) $sc
+        }
+        {*}$cmd1
+        set cmd2 [list r zadd u2{t}]
+        for {set j 150} {$j < 450} {incr j} {
+            set m [format "m%05d" $j]
+            set sc [expr {($j % 20) * 2}]
+            lappend cmd2 $sc $m
+            if {[info exists expected($m)]} {
+                if {$sc > $expected($m)} { set expected($m) $sc }
+            } else {
+                set expected($m) $sc
+            }
+        }
+        {*}$cmd2
+        r zunionstore udest{t} 2 u1{t} u2{t} aggregate max
+        assert_encoding btree udest{t}
+        assert_equal [array size expected] [r zcard udest{t}]
+        set prevscore {}
+        set prevele {}
+        foreach {ele score} [r zrange udest{t} 0 -1 withscores] {
+            assert_equal $expected($ele) $score
+            if {$prevscore ne {}} {
+                if {$score == $prevscore} {
+                    assert {[string compare $ele $prevele] >= 0}
+                } else {
+                    assert {$score >= $prevscore}
+                }
+            }
+            set prevscore $score
+            set prevele $ele
+        }
+        r config set zset-max-listpack-entries $orig_listpack_entries
+    }
+
     test "ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE error if using WITHSCORES " {
         assert_error "*ERR*syntax*" {r zunionstore foo{t} 2 zsetd{t} zsetf{t} withscores}
         assert_error "*ERR*syntax*" {r zinterstore foo{t} 2 zsetd{t} zsetf{t} withscores}

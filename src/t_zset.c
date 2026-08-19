@@ -2898,6 +2898,18 @@ int zuiCompareByCardinality(const void *s1, const void *s2) {
     return 0;
 }
 
+/* Orders unlinked zskiplistNode pointers the same way zslInsert() and the
+ * B+tree both order entries: by score, then by member (sdscmp, matching
+ * zbtCompareElements() in zset_btree.c byte-for-byte). Used to bulk-sort
+ * ZUNIONSTORE's result dict before a direct-to-B+tree build. */
+static int zsetNodeScoreCompare(const void *a, const void *b) {
+    const zskiplistNode *na = *(zskiplistNode * const *)a;
+    const zskiplistNode *nb = *(zskiplistNode * const *)b;
+    if (na->score < nb->score) return -1;
+    if (na->score > nb->score) return 1;
+    return sdscmp(zslGetNodeElement(na), zslGetNodeElement(nb));
+}
+
 static int zuiCompareByRevCardinality(const void *s1, const void *s2) {
     return zuiCompareByCardinality(s1, s2) * -1;
 }
@@ -3152,6 +3164,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     int withscores = 0;
     unsigned long cardinality = 0;
     long limit = 0; /* Stop searching after reaching the limit. 0 means unlimited. */
+    int union_built_as_btree = 0; /* SET_OP_UNION only: result already converted
+                                    * to OBJ_ENCODING_BTREE in-line, skip the
+                                    * generic post-build conversion below. */
 
     /* expect setnum input keys to be given */
     if ((getLongFromObjectOrReply(c, c->argv[numkeysIndex], &setnum, NULL) != C_OK))
@@ -3376,14 +3391,66 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiClearIterator(&src[i]);
         }
 
-        /* Step 2: Done filling dict with nodes and updating scores. Now insert skiplist */
-        dictInitIterator(&di, dstzset->dict);
+        /* Step 2: dict is fully filled and scores are final, so length,
+         * maxelelen and totelelen already reflect the final result -- decide
+         * the encoding now, before paying for a skiplist link pass.
+         *
+         * If the result won't fit a listpack, it is going to end up
+         * BTREE-encoded either way (zsetConvertAfterBulkInsert() always
+         * converts a non-listpack-eligible SKIPLIST result to BTREE). The
+         * normal route gets there via zslInsertNode() here (a real
+         * search-and-link skiplist build, one O(log n) descent per node in
+         * dict hash order) followed by zsetConvertAndExpand()'s SKIPLIST->
+         * BTREE branch re-walking that skiplist to bulk-append it into a
+         * B+tree, then tearing the skiplist down again. Skip both passes:
+         * pull the dict's node pointers into a flat array, sort them once
+         * (matches zslInsert()'s own order -- score, then sdscmp(member)),
+         * and bulk-append directly into a fresh B+tree.
+         *
+         * Only safe when dstkey is set (ZUNIONSTORE): the STORE-less ZUNION
+         * variant reuses this exact accumulation code but replies straight
+         * off dstzset->zsl's linked list a few lines below, so it must keep
+         * getting a real, linked skiplist. */
+        unsigned long unioncount = dictSize(dstzset->dict);
+        if (dstkey && !(unioncount <= server.zset_max_listpack_entries &&
+              maxelelen <= server.zset_max_listpack_value &&
+              lpSafeToAdd(NULL, totelelen)))
+        {
+            zskiplistNode **nodes = zmalloc(sizeof(zskiplistNode *) * unioncount);
+            unsigned long n = 0;
+            dictInitIterator(&di, dstzset->dict);
+            while ((de = dictNext(&di)) != NULL) nodes[n++] = dictGetKey(de);
+            dictResetIterator(&di);
+            qsort(nodes, unioncount, sizeof(zskiplistNode *), zsetNodeScoreCompare);
 
-        while((de = dictNext(&di)) != NULL) {
-            zskiplistNode *znode = dictGetKey(de);
-            zslInsertNode(dstzset->zsl, znode);
+            zbtreeSet *bt = zbtreeCreate();
+            zbtreeReserve(bt, unioncount);
+            for (n = 0; n < unioncount; n++) {
+                sds ele = zslGetNodeElement(nodes[n]);
+                zbtreeInsertNewAppend(bt, nodes[n]->score,
+                                      (unsigned char *)ele, sdslen(ele));
+                zslFreeNode(dstzset->zsl, nodes[n]);
+            }
+            zfree(nodes);
+            dictRelease(dstzset->dict);
+            zfree(dstzset->zsl->header);
+            zfree(dstzset->zsl);
+            zfree(dstzset);
+            dstzset = NULL;
+            dstobj->ptr = bt;
+            dstobj->encoding = OBJ_ENCODING_BTREE;
+            union_built_as_btree = 1;
+        } else {
+            /* Small result: still listpack-eligible, keep the normal
+             * skiplist-link path -- zsetConvertAfterBulkInsert() below will
+             * convert it to a listpack, never touching the B+tree side. */
+            dictInitIterator(&di, dstzset->dict);
+            while((de = dictNext(&di)) != NULL) {
+                zskiplistNode *znode = dictGetKey(de);
+                zslInsertNode(dstzset->zsl, znode);
+            }
+            dictResetIterator(&di);
         }
-        dictResetIterator(&di);
     } else if (op == SET_OP_DIFF) {
         zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
     } else {
@@ -3399,8 +3466,12 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     }
 
     if (dstkey) {
-        if (dstzset->zsl->length) {
-            zsetConvertAfterBulkInsert(dstobj, maxelelen, totelelen);
+        if (zsetLength(dstobj)) {
+            /* Already BTREE-encoded via the ZUNIONSTORE fast path above --
+             * dstzset (and its zsl) were freed there, nothing left to
+             * convert. */
+            if (!union_built_as_btree)
+                zsetConvertAfterBulkInsert(dstobj, maxelelen, totelelen);
             setKey(c, c->db, dstkey, &dstobj, 0);
             addReplyLongLong(c, zsetLength(dstobj));
             notifyKeyspaceEvent(NOTIFY_ZSET,
