@@ -3687,6 +3687,7 @@ struct zrange_result_handler {
     robj                                *dstobj;
     void                                *userdata;
     int                                  withscores;
+    int                                  reverse;
     int                                  should_emit_array_length;
     zrangeResultBeginFunction            beginResultEmission;
     zrangeResultFinalizeFunction         finalizeResultEmission;
@@ -3773,6 +3774,19 @@ static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
 static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
     const void *value, size_t value_length_in_bytes, double score)
 {
+    /* ZRANGESTORE (forward direction only, see zrangeResultHandlerDirectionSet())
+     * emits a contiguous slice of the SOURCE zset's own sorted order into a
+     * destination that starts empty -- every element is provably greater
+     * than the last one stored and provably distinct (a zset can't hold a
+     * duplicate member). Once the destination is BTREE-encoded, that's
+     * exactly zbtreeInsertNewAppend()'s precondition, so skip zsetAdd()'s
+     * generic zbtreeFindForAdd() existence/position search (which can only
+     * ever report "not found") entirely. Small zset (still LISTPACK) and
+     * reverse-order emission both keep the original, always-correct path. */
+    if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
+        zbtreeInsertNewAppend(handler->dstobj->ptr, score, value, value_length_in_bytes);
+        return;
+    }
     double newscore;
     int retflags = 0;
     sds ele = sdsnewlen(value, value_length_in_bytes);
@@ -3784,6 +3798,15 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
 static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
     long long value, double score)
 {
+    /* Same fast path as zrangeResultEmitCBufferForStore() above, formatting
+     * the integer member directly into a stack buffer instead of an sds --
+     * zbtreeInsertNewAppend() only needs the raw bytes. */
+    if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
+        char buf[LONG_STR_SIZE];
+        size_t len = ll2string(buf, sizeof(buf), value);
+        zbtreeInsertNewAppend(handler->dstobj->ptr, score, (unsigned char *)buf, len);
+        return;
+    }
     double newscore;
     int retflags = 0;
     sds ele = sdsfromlonglong(value);
@@ -3844,6 +3867,16 @@ static void zrangeResultHandlerDestinationKeySet (zrange_result_handler *handler
     robj *dstkey)
 {
     handler->dstkey = dstkey;
+}
+
+/* Records the emission direction so the STORE handler methods know whether
+ * results arrive in ascending (score, member) order -- the only direction
+ * the descent-free B+tree append fast path is valid for. Harmless (and
+ * unused) for the CLIENT-reply handler. */
+static void zrangeResultHandlerDirectionSet(zrange_result_handler *handler,
+    int reverse)
+{
+    handler->reverse = reverse;
 }
 
 /* This command implements ZRANGE, ZREVRANGE. */
@@ -4564,6 +4597,7 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
     if (opt_withscores || store) {
         zrangeResultHandlerScoreEmissionEnable(handler);
     }
+    zrangeResultHandlerDirectionSet(handler, direction == ZRANGE_DIRECTION_REVERSE);
 
     /* Step 3: Lookup the key and get the range. */
     kvobj *zobj = lookupKeyRead(c->db, key);

@@ -2746,6 +2746,98 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $original_max
     }
 
+    test {ZRANGESTORE btree-encoded result matches expected slice, forward and REV, with score collisions} {
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 8
+        r del zsrc{t} zdst_fwd{t} zdst_rev{t} zdst_byscore{t} zdst_byscore_rev{t} zdst_lim{t}
+        set cmd [list r zadd zsrc{t}]
+        array set expected {}
+        for {set j 0} {$j < 500} {incr j} {
+            set m [format "member:%04d" $j]
+            set sc [expr {$j % 20}]
+            lappend cmd $sc $m
+            set expected($m) $sc
+        }
+        {*}$cmd
+        assert_encoding btree zsrc{t}
+
+        # Ground truth: the full (score, member) ascending order, matching
+        # both zrangestore's own selection order and the B+tree's own order.
+        set full_sorted {}
+        foreach {ele score} [r zrange zsrc{t} 0 -1 withscores] {
+            lappend full_sorted [list $score $ele]
+        }
+        assert_equal 500 [llength $full_sorted]
+
+        # Forward rank slice -- exercises the new descent-free append fast
+        # path directly (ascending direction, BTREE destination).
+        r zrangestore zdst_fwd{t} zsrc{t} 100 399
+        assert_encoding btree zdst_fwd{t}
+        set got_fwd {}
+        foreach {ele score} [r zrange zdst_fwd{t} 0 -1 withscores] {
+            lappend got_fwd [list $score $ele]
+        }
+        assert_equal [lrange $full_sorted 100 399] $got_fwd
+
+        # REV rank slice -- must keep using the original (slower but always
+        # correct) zsetAdd() path; the fast path is guarded off for reverse
+        # emission. Rank indices for REV count from the highest score down.
+        r zrangestore zdst_rev{t} zsrc{t} 100 399 REV
+        assert_encoding btree zdst_rev{t}
+        set full_desc [lreverse $full_sorted]
+        set expected_rev [lsort -command {apply {{a b} {
+            set sa [lindex $a 0]; set sb [lindex $b 0]
+            if {$sa != $sb} { return [expr {$sa < $sb ? -1 : 1}] }
+            return [string compare [lindex $a 1] [lindex $b 1]]
+        }}} [lrange $full_desc 100 399]]
+        set got_rev {}
+        foreach {ele score} [r zrange zdst_rev{t} 0 -1 withscores] {
+            lappend got_rev [list $score $ele]
+        }
+        assert_equal $expected_rev $got_rev
+
+        # BYSCORE forward -- same fast path, different selection method
+        # feeding the same STORE result handler.
+        r zrangestore zdst_byscore{t} zsrc{t} 3 7 BYSCORE
+        assert_encoding btree zdst_byscore{t}
+        set expected_byscore {}
+        foreach pair $full_sorted {
+            set sc [lindex $pair 0]
+            if {$sc >= 3 && $sc <= 7} { lappend expected_byscore $pair }
+        }
+        set got_byscore {}
+        foreach {ele score} [r zrange zdst_byscore{t} 0 -1 withscores] {
+            lappend got_byscore [list $score $ele]
+        }
+        assert_equal $expected_byscore $got_byscore
+
+        # BYSCORE REV -- fast path must NOT engage here either.
+        r zrangestore zdst_byscore_rev{t} zsrc{t} 7 3 BYSCORE REV
+        assert_encoding btree zdst_byscore_rev{t}
+        set got_byscore_rev {}
+        foreach {ele score} [r zrange zdst_byscore_rev{t} 0 -1 withscores] {
+            lappend got_byscore_rev [list $score $ele]
+        }
+        assert_equal $expected_byscore $got_byscore_rev
+
+        # BYSCORE with LIMIT offset/count -- forward, still fast-path eligible.
+        r zrangestore zdst_lim{t} zsrc{t} 0 19 BYSCORE LIMIT 10 50
+        assert_encoding btree zdst_lim{t}
+        set expected_lim {}
+        foreach pair $full_sorted {
+            set sc [lindex $pair 0]
+            if {$sc >= 0 && $sc <= 19} { lappend expected_lim $pair }
+        }
+        set expected_lim [lrange $expected_lim 10 59]
+        set got_lim {}
+        foreach {ele score} [r zrange zdst_lim{t} 0 -1 withscores] {
+            lappend got_lim [list $score $ele]
+        }
+        assert_equal $expected_lim $got_lim
+
+        r config set zset-max-listpack-entries $original_max
+    }
+
     test {ZRANGE invalid syntax} {
         catch {r zrange z1{t} 0 -1 limit 1 2} err
         assert_match "*syntax*" $err
