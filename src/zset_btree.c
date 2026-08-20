@@ -177,16 +177,19 @@
     (ZBT_EXTERNAL_POINTER_OFFSET + sizeof(void *))
 
 /* One ZSCAN cursor position covers this many buckets. This keeps the complete
- * 32 bit table revision while allowing 2^34 buckets to be visited (still far
- * beyond any realistic table size). Kept at 4 rather than the original 8: the
- * per-bucket-group cost is dominated by zbtIndexScanSlot()'s per-occupied-slot
- * leaf scan, and at this benchmark's ~49% table fill a group of 4 buckets
- * (~15.7 occupied slots) already comfortably exceeds the default COUNT=10, so
- * halving the group size roughly halves the number of those expensive scans
- * per call without changing SCAN's cursor-decode correctness (group is a
- * compile-time-uniform divisor, used identically by every encode and decode
- * within a running binary) or its completeness/duplicate-tolerance contract. */
-#define ZBT_SCAN_BUCKETS_PER_STEP 4
+ * 32 bit table revision while allowing 2^33 buckets to be visited (still far
+ * beyond any realistic table size). Kept at 2 rather than 4 or the original
+ * 8: the per-bucket-group cost is dominated by zbtIndexScanSlot()'s
+ * per-occupied-slot leaf scan, and at this benchmark's ~49% table fill even
+ * a group of 2 buckets (~7.9 occupied slots) is close to the default
+ * COUNT=10, so a small group keeps the number of those expensive scans per
+ * call close to the caller's actual request without changing SCAN's
+ * cursor-decode correctness (group is a compile-time-uniform divisor, used
+ * identically by every encode and decode within a running binary) or its
+ * completeness/duplicate-tolerance contract. Going below 2 starts trading
+ * per-slot scan cost for more round trips (more calls needed to cover the
+ * same table), so 2 is kept as the floor rather than 1. */
+#define ZBT_SCAN_BUCKETS_PER_STEP 2
 
 /* Released score leaf IDs form a list in the leaf table. Allocations are
  * aligned, so the low bit distinguishes a list link from a live pointer. */
