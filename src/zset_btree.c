@@ -3693,13 +3693,46 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
      * zbtScoreInsert() and the split/merge/build paths), so a tag match here
      * already implies zbtIndexTag(hash) == tag; re-deriving the hash to
      * reconfirm it would just check something already established by
-     * construction. */
+     * construction.
+     *
+     * The tag bytes are stored contiguously in physical order
+     * (zbtScoreLeafHashTags()), so this reuses the same 8-byte SWAR mask
+     * already relied on for index-bucket tag matching (zbtIndexTagMask()/
+     * zbtIndexFirstTag(), see zbtIndexTableFind()) instead of a per-position
+     * zbtScoreLeafTag() call (which re-derives leaf->reversed and the
+     * physical-position conversion on every candidate, not just the 0-2
+     * that actually match). As with that existing use, a mask bit can be
+     * set above a byte that isn't an exact match (documented on
+     * zbtIndexTagMask() itself), so every candidate is re-checked against
+     * the stored byte before being accepted -- same idiom, same file.
+     *
+     * Only full 8-byte words are read via the SWAR path; the tag array
+     * directly abuts live member-record bytes with no guaranteed trailing
+     * slack, so an out-of-bounds 8-byte load past a partial final word
+     * would be unsafe. The scalar tail below covers the remainder. */
     unsigned int positions[ZBT_SCORE_LEAF_MAX];
     unsigned int count = 0;
-    for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
-        uint8_t leaf_tag = zbtScoreLeafTag(leaf, pos);
+    uint8_t *tags = zbtScoreLeafHashTags(leaf);
+    unsigned int leafcount = leaf->n.count;
+    unsigned int nwords = leafcount / 8;
+    for (unsigned int w = 0; w < nwords; w++) {
+        uint64_t word;
+        memcpy(&word, tags + w * 8, 8);
+        uint64_t mask = zbtIndexTagMask(word, tag);
+        if (tag == 1) mask |= zbtIndexTagMask(word, 0);
+        while (mask) {
+            unsigned int lane = zbtIndexFirstTag(mask);
+            unsigned int physical = w * 8 + lane;
+            uint8_t leaf_tag = tags[physical];
+            if (leaf_tag == tag || (tag == 1 && leaf_tag == 0))
+                positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
+            mask &= mask - 1;
+        }
+    }
+    for (unsigned int physical = nwords * 8; physical < leafcount; physical++) {
+        uint8_t leaf_tag = tags[physical];
         if (leaf_tag != tag && !(tag == 1 && leaf_tag == 0)) continue;
-        positions[count++] = pos;
+        positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
     }
     serverAssert(count != 0);
 
