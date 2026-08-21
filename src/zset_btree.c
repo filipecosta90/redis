@@ -3132,6 +3132,168 @@ void zbtreeInsertNewAppendWithHash(zbtreeSet *zs, double score,
     zbtIndexInsert(zs, hash, leaf->id, NULL);
 }
 
+/* zbtreeInsertNewAppend() calls zbtScoreInsertFast() once per element, which
+ * pays an O(leaf size) cost on every single insert: the offsets array grows
+ * by one entry each time, so the hash-tag array that follows it in the
+ * packed layout must shift forward and gets fully snapshotted and rebuilt on
+ * every call -- O(leaf size^2) total to fill one leaf. zbtreeAppendBatch
+ * buffers up to one leaf's worth of elements and flushes them with a single
+ * zbtScoreLeafBuild() call (the same single-pass builder zbtScoreCompactLeaf()
+ * and zbtScoreInsertEdgeLeaf() already trust) instead.
+ *
+ * Same precondition as zbtreeInsertNewAppend(): every added element must sort
+ * after everything already in the tree and be known absent. A batch never
+ * spans more than one leaf -- Add() flushes first whenever adding the next
+ * element could exceed either ZBT_SCORE_LEAF_MAX or a conservative (always
+ * >= the real zbtScoreLeafRequestBytes()) byte estimate, so every flush is a
+ * single build-and-splice, reusing the append-only edge-leaf machinery
+ * unmodified rather than needing a multi-leaf split path. */
+struct zbtreeAppendBatch {
+    zbtreeSet *zs;
+    unsigned int count;
+    size_t conservative_bytes;
+    double scores[ZBT_SCORE_LEAF_MAX];
+    uint8_t tags[ZBT_SCORE_LEAF_MAX];
+    zbtBuildElement eles[ZBT_SCORE_LEAF_MAX];
+    unsigned char scratch[ZBT_SCORE_LEAF_BYTES];
+    size_t scratch_used;
+};
+
+/* offsetof(zbtScoreLeaf, data) for the leaf header, plus slack for the
+ * from-scratch reserve zbtScoreLeafBuild() may add for a non-edge leaf. */
+#define ZBT_BATCH_HEADER_SLACK (offsetof(zbtScoreLeaf, data) + 16)
+/* Per item: 8 bytes is an explicit upper bound for one packed score (see the
+ * comment at zbtScoreEncoding()'s bit-width selection), plus the offset
+ * (uint16_t) and hash tag (uint8_t) every element always carries. */
+#define ZBT_BATCH_ITEM_SLACK (sizeof(double) + sizeof(uint16_t) + sizeof(uint8_t))
+
+zbtreeAppendBatch *zbtreeAppendBatchCreate(zbtreeSet *zs) {
+    zbtreeAppendBatch *b = zcalloc(sizeof(*b));
+    b->zs = zs;
+    return b;
+}
+
+/* Build and splice one leaf from everything buffered so far. A no-op on an
+ * empty batch so Finish() can call this unconditionally. */
+static void zbtreeAppendBatchFlush(zbtreeAppendBatch *b) {
+    if (b->count == 0) return;
+    zbtreeSet *zs = b->zs;
+    zbtIndexExpandIfNeeded(zs, b->count);
+
+    zbtScoreLeaf *newleaf;
+    if (zs->score_root == NULL) {
+        newleaf = zbtScoreLeafBuild(zs, b->count, b->scores, b->eles, b->tags,
+                                    ZBT_NEW_LEAF_ID, 1);
+        zs->score_root = &newleaf->n;
+        zs->score_first = zs->score_last = newleaf;
+    } else {
+        /* Mirrors zbtScoreInsertEdgeLeaf()'s append (non-prepend) branch
+         * exactly: compact an over-allocated old edge leaf first (using its
+         * own, possibly-reassigned return value from here on), build the new
+         * leaf, then wire the doubly-linked leaf list by hand before handing
+         * off to zbtScoreInsertSibling() for the tree-side splice -- that
+         * function only ever touches zbtScoreNode fields (parent/child/
+         * rollup), never ->prev/->next/score_first/score_last. */
+        zbtScoreLeaf *oldleaf = zs->score_last;
+        if (zmalloc_usable_size(oldleaf) >= ZBT_SCORE_LEAF_BYTES)
+            oldleaf = zbtScoreCompactLeaf(zs, oldleaf);
+        newleaf = zbtScoreLeafBuild(zs, b->count, b->scores, b->eles, b->tags,
+                                    ZBT_NEW_LEAF_ID, 1);
+        newleaf->n.index_resize = oldleaf->n.index_resize;
+        newleaf->prev = oldleaf;
+        newleaf->next = oldleaf->next;
+        oldleaf->next = newleaf;
+        zs->score_last = newleaf;
+        zbtScoreInsertSibling(zs, &oldleaf->n, &newleaf->n);
+    }
+    /* zbtIndexInsert()'s member_rehash interaction assumes a newly-linked,
+     * not-yet-migrated leaf grows by exactly one member per call: its first
+     * call for such a leaf bulk-copies the leaf's *entire* current content
+     * (zbtIndexCopyLeaf(), which re-derives every member's hash from the
+     * leaf itself and doesn't care which hash was passed in) and marks the
+     * leaf migrated, which is exactly right when that "entire content" is
+     * still just the one member the single-element append path always
+     * builds a fresh edge leaf with. A batch-built leaf breaks that
+     * assumption: newleaf already holds all b->count members from the single
+     * zbtScoreLeafBuild() call above, so calling zbtIndexInsert() once per
+     * member here would let the first call's bulk copy index everything,
+     * then every subsequent call (now seeing an already-migrated leaf) would
+     * insert the same member again through the plain-insert path -- a real
+     * double-registration, not just a bookkeeping mismatch. Call it exactly
+     * once for a newly-linked, not-yet-migrated leaf during an active
+     * rehash; otherwise (no rehash in progress, or the leaf already counts
+     * as migrated -- e.g. it inherited an already-current index_resize from
+     * oldleaf when splicing after an already-migrated leaf) the plain
+     * per-member path is the only one that indexes every member, exactly as
+     * it does outside a rehash. */
+    if (zs->member_rehash && !zbtIndexLeafMigrated(zs, newleaf)) {
+        zbtIndexInsert(zs, b->eles[0].hash, newleaf->id, NULL);
+    } else {
+        for (unsigned int i = 0; i < b->count; i++)
+            zbtIndexInsert(zs, b->eles[i].hash, newleaf->id, NULL);
+    }
+    zs->length += b->count;
+    b->count = 0;
+    b->conservative_bytes = 0;
+    b->scratch_used = 0;
+}
+
+void zbtreeAppendBatchAddWithHash(zbtreeAppendBatch *b, double score,
+                                  const unsigned char *ele, size_t elelen,
+                                  uint32_t hash)
+{
+    zbtBuildElement probe;
+    zbtBuildElementFromBytes(&probe, ele, elelen, hash);
+    size_t item_cost = zbtElementStorageBytes(&probe) + ZBT_BATCH_ITEM_SLACK;
+
+    if (b->count == ZBT_SCORE_LEAF_MAX ||
+        (b->count > 0 && ZBT_BATCH_HEADER_SLACK + b->conservative_bytes +
+                         item_cost > ZBT_SCORE_LEAF_BYTES))
+        zbtreeAppendBatchFlush(b);
+
+    unsigned int i = b->count;
+    b->scores[i] = score;
+    b->tags[i] = (uint8_t)(hash >> 24);
+
+    if (zbtBuildElementIsExternal(&probe)) {
+        /* A large member's bytes never go through the shared inline scratch
+         * arena -- that arena is only sized for the leaf's *inline* byte
+         * budget. Instead, allocate this member's own external storage right
+         * now, using the exact mechanism zbtBuildElementWrite() already uses
+         * for a fresh external member with no prior allocation (see its
+         * "external == NULL" branch). Pre-setting ->external here makes that
+         * later call adopt this allocation instead of copying again. */
+        unsigned char *external = zbtAlloc(b->zs, elelen);
+        memcpy(external, ele, elelen);
+        b->eles[i].ptr = external;
+        b->eles[i].len = elelen;
+        b->eles[i].hash = hash;
+        b->eles[i].external = external;
+        b->eles[i].owner_record = NULL;
+    } else {
+        memcpy(b->scratch + b->scratch_used, ele, elelen);
+        zbtBuildElementFromBytes(&b->eles[i], b->scratch + b->scratch_used,
+                                 elelen, hash);
+        b->scratch_used += elelen;
+    }
+    b->conservative_bytes += item_cost;
+    b->count = i + 1;
+}
+
+void zbtreeAppendBatchAdd(zbtreeAppendBatch *b, double score,
+                          const unsigned char *ele, size_t elelen)
+{
+    zbtreeAppendBatchAddWithHash(b, score, ele, elelen,
+                                 (uint32_t)dictGenHashFunction(ele, elelen));
+}
+
+/* Flush whatever remains and free the batch. The batch is unusable after
+ * this returns. */
+void zbtreeAppendBatchFinish(zbtreeAppendBatch *b) {
+    zbtreeAppendBatchFlush(b);
+    zfree(b);
+}
+
 /* Delete a member, returning one if it existed and zero otherwise. */
 int zbtreeDelete(zbtreeSet *zs, sds ele) {
     uint32_t hash = (uint32_t)dictGenHashFunction(ele, sdslen(ele));

@@ -1575,16 +1575,23 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
                 /* Uncorrupted listpack (the common case, verified above):
                  * known sorted and duplicate-free, so every insert can use
                  * the descent-free append path -- no per-element duplicate
-                 * search, and no separate full-tree descent to insert. */
+                 * search, and no separate full-tree descent to insert.
+                 * Batched: buf is a per-iteration stack scratch reused every
+                 * loop pass, so raw's bytes are only valid until the next
+                 * zzlDecodeElement() call -- zbtreeAppendBatchAdd() copies
+                 * them out synchronously before returning, same contract the
+                 * unbatched zbtreeInsertNewAppend() call it replaces had. */
+                zbtreeAppendBatch *batch = zbtreeAppendBatchCreate(bt);
                 while (eptr != NULL) {
                     score = zzlGetScore(sptr);
                     char buf[LONG_STR_SIZE];
                     size_t rawlen;
                     const unsigned char *raw =
                         zzlDecodeElement(eptr, buf, sizeof(buf), &rawlen);
-                    zbtreeInsertNewAppend(bt, score, raw, rawlen);
+                    zbtreeAppendBatchAdd(batch, score, raw, rawlen);
                     zzlNext(zl,&eptr,&sptr);
                 }
+                zbtreeAppendBatchFinish(batch);
             } else {
                 while (eptr != NULL) {
                     score = zzlGetScore(sptr);
@@ -1658,6 +1665,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
              * length, not a size_hint/overflow-derived count. */
             zbtreeReserve(bt, cap);
             node = zs->zsl->header->level[0].forward;
+            zbtreeAppendBatch *batch = zbtreeAppendBatchCreate(bt);
             while (node) {
                 /* The skiplist is Redis's own, always sorted, never
                  * corrupted -- unlike the listpack branch above, safe to
@@ -1665,10 +1673,11 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
                  * precondition holds by construction: zslInsert never
                  * produces (score, member) out of order or duplicated). */
                 sds ele = zslGetNodeElement(node);
-                zbtreeInsertNewAppend(bt, node->score,
-                                      (unsigned char *)ele, sdslen(ele));
+                zbtreeAppendBatchAdd(batch, node->score,
+                                     (unsigned char *)ele, sdslen(ele));
                 node = node->level[0].forward;
             }
+            zbtreeAppendBatchFinish(batch);
             dictRelease(zs->dict);
             zslFree(zs->zsl);
             zfree(zs);
@@ -3527,14 +3536,16 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
 
             zbtreeSet *bt = zbtreeCreate();
             zbtreeReserve(bt, unioncount);
+            zbtreeAppendBatch *batch = zbtreeAppendBatchCreate(bt);
             for (unsigned long n = 0; n < unioncount; n++) {
                 zskiplistNode *node = members[n].node;
                 sds ele = zslGetNodeElement(node);
-                zbtreeInsertNewAppendWithHash(bt, node->score,
-                                              (unsigned char *)ele, sdslen(ele),
-                                              members[n].hash);
+                zbtreeAppendBatchAddWithHash(batch, node->score,
+                                             (unsigned char *)ele, sdslen(ele),
+                                             members[n].hash);
                 zslFreeNode(dstzset->zsl, node);
             }
+            zbtreeAppendBatchFinish(batch);
             dictRelease(dstzset->dict);
             zfree(dstzset->zsl->header);
             zfree(dstzset->zsl);
@@ -3689,6 +3700,7 @@ struct zrange_result_handler {
     int                                  withscores;
     int                                  reverse;
     int                                  should_emit_array_length;
+    zbtreeAppendBatch                   *append_batch;
     zrangeResultBeginFunction            beginResultEmission;
     zrangeResultFinalizeFunction         finalizeResultEmission;
     zrangeResultEmitCBufferFunction      emitResultFromCBuffer;
@@ -3779,12 +3791,18 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
      * destination that starts empty -- every element is provably greater
      * than the last one stored and provably distinct (a zset can't hold a
      * duplicate member). Once the destination is BTREE-encoded, that's
-     * exactly zbtreeInsertNewAppend()'s precondition, so skip zsetAdd()'s
-     * generic zbtreeFindForAdd() existence/position search (which can only
-     * ever report "not found") entirely. Small zset (still LISTPACK) and
-     * reverse-order emission both keep the original, always-correct path. */
+     * exactly zbtreeAppendBatch's precondition (same as the
+     * zbtreeInsertNewAppend() it batches), so skip zsetAdd()'s generic
+     * zbtreeFindForAdd() existence/position search (which can only ever
+     * report "not found") entirely. Small zset (still LISTPACK) and
+     * reverse-order emission both keep the original, always-correct path.
+     * The batch is created lazily on the first fast-path emit (the
+     * destination may start as LISTPACK and convert mid-stream) and flushed
+     * once in zrangeResultFinalizeStore(). */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
-        zbtreeInsertNewAppend(handler->dstobj->ptr, score, value, value_length_in_bytes);
+        if (!handler->append_batch)
+            handler->append_batch = zbtreeAppendBatchCreate(handler->dstobj->ptr);
+        zbtreeAppendBatchAdd(handler->append_batch, score, value, value_length_in_bytes);
         return;
     }
     double newscore;
@@ -3800,11 +3818,14 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
 {
     /* Same fast path as zrangeResultEmitCBufferForStore() above, formatting
      * the integer member directly into a stack buffer instead of an sds --
-     * zbtreeInsertNewAppend() only needs the raw bytes. */
+     * zbtreeAppendBatchAdd() copies the bytes out synchronously, so the
+     * stack buffer doesn't need to outlive this call. */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
         char buf[LONG_STR_SIZE];
         size_t len = ll2string(buf, sizeof(buf), value);
-        zbtreeInsertNewAppend(handler->dstobj->ptr, score, (unsigned char *)buf, len);
+        if (!handler->append_batch)
+            handler->append_batch = zbtreeAppendBatchCreate(handler->dstobj->ptr);
+        zbtreeAppendBatchAdd(handler->append_batch, score, (unsigned char *)buf, len);
         return;
     }
     double newscore;
@@ -3817,6 +3838,10 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
 
 static void zrangeResultFinalizeStore(zrange_result_handler *handler, size_t result_count)
 {
+    if (handler->append_batch) {
+        zbtreeAppendBatchFinish(handler->append_batch);
+        handler->append_batch = NULL;
+    }
     if (result_count) {
         setKey(handler->client, handler->client->db, handler->dstkey, &handler->dstobj, 0);
         addReplyLongLong(handler->client, result_count);

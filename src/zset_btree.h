@@ -88,6 +88,19 @@ void zbtreeInsertNewAppend(zbtreeSet *zs, double score,
 void zbtreeInsertNewAppendWithHash(zbtreeSet *zs, double score,
                                    const unsigned char *ele, size_t elelen,
                                    uint32_t hash);
+/* Buffers up to one leaf's worth of zbtreeInsertNewAppend()-style inserts and
+ * flushes them with a single bulk leaf build instead of one insert per
+ * element -- see the comment above its implementation in zset_btree.c for
+ * why. Same precondition as zbtreeInsertNewAppend(): every added element
+ * must sort after everything already in the tree and be known absent. */
+typedef struct zbtreeAppendBatch zbtreeAppendBatch;
+zbtreeAppendBatch *zbtreeAppendBatchCreate(zbtreeSet *zs);
+void zbtreeAppendBatchAdd(zbtreeAppendBatch *b, double score,
+                          const unsigned char *ele, size_t elelen);
+void zbtreeAppendBatchAddWithHash(zbtreeAppendBatch *b, double score,
+                                  const unsigned char *ele, size_t elelen,
+                                  uint32_t hash);
+void zbtreeAppendBatchFinish(zbtreeAppendBatch *b);
 int zbtreeDelete(zbtreeSet *zs, sds ele);
 void zbtreeUpdateScore(zbtreeSet *zs, sds ele, double score,
                        const zbtreeInsertPosition *position);
