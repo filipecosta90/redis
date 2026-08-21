@@ -109,6 +109,12 @@ typedef struct used_memory_entry {
     char padding[CACHE_LINE_SIZE - sizeof(long long) - sizeof(long long)];
 } used_memory_entry;
 
+/* MEASUREMENT CONTROL ONLY - DO NOT MERGE.
+ * Reproduces the BSS growth of the dedicated-slot widening (137 entries x 64 B
+ * minus 16 x 64 B = 7744 B) WITHOUT changing DEDICATED_ENTRIES, so any fleet
+ * delta this arm shows is attributable to data layout, not to the fast path. */
+static __attribute__((aligned(CACHE_LINE_SIZE), used)) char __layout_control_pad[7744];
+
 static __attribute__((aligned(CACHE_LINE_SIZE))) used_memory_entry used_memory[MAX_ENTRIES];
 static redisAtomic size_t num_active_threads = 0;
 static redisAtomic size_t zmalloc_peak = 0;
