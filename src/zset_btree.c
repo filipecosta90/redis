@@ -3180,25 +3180,37 @@ static void zbtreeAppendBatchFlush(zbtreeAppendBatch *b) {
     zbtreeSet *zs = b->zs;
     zbtIndexExpandIfNeeded(zs, b->count);
 
+    /* edge_page=0: unlike zbtScoreInsertEdgeLeaf()'s single-element edge
+     * leaves (which ask for the full ZBT_SCORE_LEAF_BYTES up front because
+     * they expect many more zbtScoreInsertFast() calls to grow them
+     * in-place), a batch-built leaf is complete and final the moment
+     * zbtScoreLeafBuild() returns -- nothing ever appends into it
+     * incrementally afterward. Asking for the full page here would only
+     * waste memory and make zmalloc_usable_size(oldleaf) >= ZBT_SCORE_LEAF_BYTES
+     * true on essentially every subsequent flush, triggering a needless
+     * compact-and-rebuild of a leaf that was never actually over-allocated
+     * relative to its own real content. */
     zbtScoreLeaf *newleaf;
     if (zs->score_root == NULL) {
         newleaf = zbtScoreLeafBuild(zs, b->count, b->scores, b->eles, b->tags,
-                                    ZBT_NEW_LEAF_ID, 1);
+                                    ZBT_NEW_LEAF_ID, 0);
         zs->score_root = &newleaf->n;
         zs->score_first = zs->score_last = newleaf;
     } else {
-        /* Mirrors zbtScoreInsertEdgeLeaf()'s append (non-prepend) branch
-         * exactly: compact an over-allocated old edge leaf first (using its
-         * own, possibly-reassigned return value from here on), build the new
-         * leaf, then wire the doubly-linked leaf list by hand before handing
-         * off to zbtScoreInsertSibling() for the tree-side splice -- that
-         * function only ever touches zbtScoreNode fields (parent/child/
-         * rollup), never ->prev/->next/score_first/score_last. */
+        /* Mirrors zbtScoreInsertEdgeLeaf()'s append (non-prepend) branch for
+         * the splice/wiring shape: compact an over-allocated old edge leaf
+         * first (using its own, possibly-reassigned return value from here
+         * on -- kept as a defensive check even though it should rarely fire
+         * for a tightly-allocated batch leaf), build the new leaf, then wire
+         * the doubly-linked leaf list by hand before handing off to
+         * zbtScoreInsertSibling() for the tree-side splice -- that function
+         * only ever touches zbtScoreNode fields (parent/child/rollup), never
+         * ->prev/->next/score_first/score_last. */
         zbtScoreLeaf *oldleaf = zs->score_last;
         if (zmalloc_usable_size(oldleaf) >= ZBT_SCORE_LEAF_BYTES)
             oldleaf = zbtScoreCompactLeaf(zs, oldleaf);
         newleaf = zbtScoreLeafBuild(zs, b->count, b->scores, b->eles, b->tags,
-                                    ZBT_NEW_LEAF_ID, 1);
+                                    ZBT_NEW_LEAF_ID, 0);
         newleaf->n.index_resize = oldleaf->n.index_resize;
         newleaf->prev = oldleaf;
         newleaf->next = oldleaf->next;
