@@ -101,6 +101,27 @@ const char *je_malloc_conf =
 #define SHARED_ENTRIES 8 /* Must be a power of 2 for modulo */
 #define SHARED_ENTRIES_MASK (SHARED_ENTRIES - 1)
 #define MAX_ENTRIES (DEDICATED_ENTRIES + SHARED_ENTRIES)
+
+/* Attempt to avoid including server.h in this file. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
+static_assert((SHARED_ENTRIES & (SHARED_ENTRIES - 1)) == 0,
+              "SHARED_ENTRIES must be a power of 2");
+
+/* Map a thread index at or beyond the dedicated range onto a shared pool entry.
+ *
+ * zmalloc_used_memory() sums entries [0, min(num_active_threads, MAX_ENTRIES)),
+ * and a thread that lands in the shared pool has already advanced
+ * num_active_threads past its own index. The sum therefore only covers that
+ * thread's entry if the mapping never sends an index upwards. Subtracting
+ * DEDICATED_ENTRIES before masking guarantees that for any DEDICATED_ENTRIES;
+ * masking the raw index only happens to work while DEDICATED_ENTRIES is a
+ * multiple of SHARED_ENTRIES, and silently drops a live thread's memory out of
+ * used_memory - and so out of the maxmemory check - when it is not. */
+#define SHARED_POOL_SLOT(idx) \
+    (DEDICATED_ENTRIES + (((idx) - DEDICATED_ENTRIES) & SHARED_ENTRIES_MASK))
 #define PEAK_CHECK_THRESHOLD (1024 * 100) /* 100KB */
 
 typedef struct used_memory_entry {
@@ -123,7 +144,7 @@ static inline void init_my_thread_index(void) {
             my_thread_index = idx;
         } else {
             /* Overflow threads share the shared pool entries (atomic RMW). */
-            my_thread_index = DEDICATED_ENTRIES + (idx & SHARED_ENTRIES_MASK);
+            my_thread_index = SHARED_POOL_SLOT(idx);
         }
     }
 }
@@ -161,7 +182,7 @@ void zmalloc_register_reserved_slot(void) {
 
         my_thread_index = slot;
     } else {
-        my_thread_index = DEDICATED_ENTRIES + (slot & SHARED_ENTRIES_MASK);
+        my_thread_index = SHARED_POOL_SLOT(slot);
     }
 }
 
