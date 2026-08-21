@@ -93,11 +93,15 @@ const char *je_malloc_conf =
 #endif
 
 /* Per-thread memory accounting slots. The first DEDICATED_ENTRIES threads
- * (typically the main thread plus io threads) each get a private slot and can
- * use the cheap single-writer atomic operation (plain load+store). 
+ * (the main thread plus the io threads) each get a private slot and can
+ * use the cheap single-writer atomic operation (plain load+store).
  * Threads beyond that share a pool hashed by thread index and pay the cost of
- * a full atomic RMW. */
-#define DEDICATED_ENTRIES 8
+ * a full atomic RMW.
+ *
+ * The dedicated range covers the largest configurable io thread count, so the
+ * fast path does not silently depend on how 'io-threads' is tuned. See
+ * ZMALLOC_DEDICATED_ENTRIES in zmalloc.h. */
+#define DEDICATED_ENTRIES ZMALLOC_DEDICATED_ENTRIES
 #define SHARED_ENTRIES 8 /* Must be a power of 2 for modulo */
 #define SHARED_ENTRIES_MASK (SHARED_ENTRIES - 1)
 #define MAX_ENTRIES (DEDICATED_ENTRIES + SHARED_ENTRIES)

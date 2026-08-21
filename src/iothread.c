@@ -16,6 +16,17 @@
  * IO threads. IO threads use default Hz for now. */
 #define run_with_period_io(_t_, _ms_) _run_with_period((_t_)->cronloops, (_ms_), IO_DEFAULT_HZ)
 
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
+/* Every io thread claims a reserved used_memory accounting slot in
+ * IOThreadMain(), and slot 0 belongs to the main thread. If the dedicated range
+ * in zmalloc.c is narrower than that, the overflow io threads fall back to a
+ * full atomic read-modify-write on every allocation. */
+static_assert(ZMALLOC_DEDICATED_ENTRIES >= IO_THREADS_MAX_NUM + 1,
+              "zmalloc dedicated accounting slots do not cover all io threads");
+
 /* IO threads. */
 IOThread IOThreads[IO_THREADS_MAX_NUM];
 
