@@ -43,6 +43,12 @@
 #endif
 #endif
 
+/* Max number of threads serving IO, i.e. the main thread plus the io threads,
+ * and the upper bound of the 'io-threads' config. Defined here rather than in
+ * server.h because zmalloc.c sizes its per-thread accounting slots from it and
+ * deliberately does not include server.h. */
+#define IO_THREADS_MAX_NUM 128
+
 /* Test for proc filesystem */
 #ifdef __linux__
 #define HAVE_PROC_STAT 1

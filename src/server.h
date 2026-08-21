@@ -222,8 +222,8 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 /* Hash table parameters */
 #define HASHTABLE_MAX_LOAD_FACTOR 1.618   /* Maximum hash table load factor. */
 
-/* Max number of IO threads */
-#define IO_THREADS_MAX_NUM 128
+/* Max number of IO threads is IO_THREADS_MAX_NUM, defined in config.h so that
+ * zmalloc.c can size its per-thread accounting slots from it. */
 
 /* To make IO threads and main thread run in parallel, we will transfer clients
  * between them if the number of clients in the pending list reaches this value. */

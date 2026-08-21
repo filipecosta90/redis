@@ -92,19 +92,35 @@ const char *je_malloc_conf =
     "lg_tcache_nslots_mul:3,tcache_nslots_small_max:1000";
 #endif
 
+/* Attempt to avoid including server.h in this file. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
 /* Per-thread memory accounting slots. The first DEDICATED_ENTRIES threads
  * (the main thread plus the io threads) each get a private slot and can
  * use the cheap single-writer atomic operation (plain load+store).
  * Threads beyond that share a pool hashed by thread index and pay the cost of
  * a full atomic RMW.
  *
- * The dedicated range covers the largest configurable io thread count, so the
- * fast path does not silently depend on how 'io-threads' is tuned. See
- * ZMALLOC_DEDICATED_ENTRIES in zmalloc.h. */
-#define DEDICATED_ENTRIES ZMALLOC_DEDICATED_ENTRIES
+ * The dedicated range is sized from IO_THREADS_MAX_NUM so that the fast path
+ * does not depend on how 'io-threads' is tuned: 'io-threads N' runs the main
+ * thread (slot 0) plus N-1 io threads, and N is capped at IO_THREADS_MAX_NUM,
+ * so slots 0..IO_THREADS_MAX_NUM-1 cover every reservable thread. */
+#define DEDICATED_ENTRIES IO_THREADS_MAX_NUM
 #define SHARED_ENTRIES 8 /* Must be a power of 2 for modulo */
 #define SHARED_ENTRIES_MASK (SHARED_ENTRIES - 1)
 #define MAX_ENTRIES (DEDICATED_ENTRIES + SHARED_ENTRIES)
+
+/* zmalloc_used_memory() sums entries [0, min(num_active_threads, MAX_ENTRIES)),
+ * and a thread that takes the shared pool has already bumped num_active_threads
+ * past its own index. That only covers the slot it lands on if the overflow
+ * mapping never maps an index upwards, i.e. if DEDICATED_ENTRIES is a multiple
+ * of SHARED_ENTRIES. Otherwise a live thread's slot is silently excluded from
+ * used_memory forever, which also drives eviction via getMaxmemoryState(). */
+static_assert(DEDICATED_ENTRIES % SHARED_ENTRIES == 0,
+              "DEDICATED_ENTRIES must be a multiple of SHARED_ENTRIES so that "
+              "every overflow slot stays inside the zmalloc_used_memory() sweep");
 #define PEAK_CHECK_THRESHOLD (1024 * 100) /* 100KB */
 
 typedef struct used_memory_entry {
