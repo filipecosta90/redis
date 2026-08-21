@@ -3967,44 +3967,6 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     return emitted;
 }
 
-/* Resolve which table (the live member_index, or the in-progress rehash
- * target) owns a scan's flattened bucket_index, and the index local to that
- * table -- shared between zbtreeScan()'s own bucket walk and its one-ahead
- * prefetch so the two can never resolve a bucket differently. */
-static inline zbtIndexTable *zbtIndexTableForBucket(zbtreeSet *zs,
-                                                     uint64_t first_buckets,
-                                                     uint64_t bucket_index,
-                                                     uint64_t *local)
-{
-    if (bucket_index < first_buckets) {
-        *local = bucket_index;
-        return &zs->member_index;
-    }
-    serverAssert(zs->member_rehash != NULL);
-    *local = bucket_index - first_buckets;
-    return &zs->member_rehash->table;
-}
-
-/* Prefetch the leaf a scan slot will dereference, without doing any of the
- * tag-scan/emission work zbtIndexScanSlot() itself does. The empty/deleted
- * checks are duplicated from zbtIndexScanSlot()'s own prefix (not shared
- * via a common helper, to keep this a pure read with no side effects and
- * no return value the real scan needs to consume) -- a slot it would skip
- * just isn't prefetched, never prefetched wrong. */
-static inline void zbtIndexPrefetchScanSlot(const zbtreeSet *zs,
-                                            const zbtIndexTable *table,
-                                            const zbtIndexBucket *bucket,
-                                            unsigned int slot_pos)
-{
-    uint8_t tag = zbtIndexTags(bucket) >> (slot_pos * 8);
-    if (tag == 0) return;
-    uint32_t id = zbtIndexGetId(table, bucket, slot_pos);
-    if (id == ZBT_INDEX_DELETED_ID || id >= zs->next_score_leaf_id) return;
-    zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
-    if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) return;
-    redis_prefetch_read(leaf);
-}
-
 /* The low half of the cursor is a group of eight buckets plus one; the high
  * half identifies the current table. A resize keeps the old table in place, so
  * the cursor remains valid while leaves are copied. Installing the new table
@@ -4037,38 +3999,17 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
         /* Finish the whole group before saving the cursor. COUNT is a hint,
          * as it is for a normal dictionary scan. */
         while (bucket_index < end) {
+            zbtIndexTable *table;
             uint64_t local;
-            zbtIndexTable *table =
-                zbtIndexTableForBucket(zs, first_buckets, bucket_index, &local);
-            zbtIndexBucket *bucket = zbtIndexBucketAt(table, local);
-
-            /* Prefetch the NEXT bucket's occupied leaves while this one's
-             * slots are being scanned for real -- zbtIndexScanSlot() has
-             * near-100% flat/self time on a profile of this exact benchmark
-             * (memtier zscan, 1K elements), almost none of it attributable
-             * to any child call, pointing at the score_leaf_by_id[id]
-             * lookup + leaf dereference it does inline as the real cost: a
-             * leaf touched by one occupied slot is rarely the same leaf a
-             * neighboring slot resolves to (member_index bucket assignment
-             * is driven by hash(member), unrelated to which leaf a member
-             * lives in), so this call's ~15 occupied slots typically touch
-             * that many distinct, likely-cold leaf allocations. Safe one
-             * bucket ahead of where processing has gotten to: nothing in
-             * the tree or index can change mid-call (Redis commands run
-             * atomically, nothing else interleaves), so the next bucket's
-             * tags/ids and the leaf pointers they resolve to are already
-             * guaranteed unchanged for the rest of this call. */
-            uint64_t next_bucket_index = bucket_index + 1;
-            if (next_bucket_index < end) {
-                uint64_t next_local;
-                zbtIndexTable *next_table = zbtIndexTableForBucket(
-                    zs, first_buckets, next_bucket_index, &next_local);
-                zbtIndexBucket *next_bucket =
-                    zbtIndexBucketAt(next_table, next_local);
-                for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
-                    zbtIndexPrefetchScanSlot(zs, next_table, next_bucket, pos);
+            if (bucket_index < first_buckets) {
+                table = &zs->member_index;
+                local = bucket_index;
+            } else {
+                serverAssert(zs->member_rehash != NULL);
+                table = &zs->member_rehash->table;
+                local = bucket_index - first_buckets;
             }
-
+            zbtIndexBucket *bucket = zbtIndexBucketAt(table, local);
             for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
                 emitted += zbtIndexScanSlot(zs, table, bucket, pos,
                                             fn, privdata);
