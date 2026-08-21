@@ -3166,6 +3166,13 @@ struct zbtreeAppendBatch {
  * comment at zbtScoreEncoding()'s bit-width selection), plus the offset
  * (uint16_t) and hash tag (uint8_t) every element always carries. */
 #define ZBT_BATCH_ITEM_SLACK (sizeof(double) + sizeof(uint16_t) + sizeof(uint8_t))
+/* How many elements ahead to software-prefetch the member-index insert's
+ * target bucket. A few iterations' worth of other per-element work (the
+ * insert itself, its own probe-chain walk) needs to happen between issuing
+ * a prefetch and consuming it for the prefetch to have finished landing;
+ * too far ahead risks the cache line being evicted again before use on a
+ * table this size. Not tuned beyond this order-of-magnitude judgment call. */
+#define ZBT_INDEX_PREFETCH_AHEAD 4
 
 zbtreeAppendBatch *zbtreeAppendBatchCreate(zbtreeSet *zs) {
     zbtreeAppendBatch *b = zcalloc(sizeof(*b));
@@ -3241,8 +3248,28 @@ static void zbtreeAppendBatchFlush(zbtreeAppendBatch *b) {
     if (zs->member_rehash && !zbtIndexLeafMigrated(zs, newleaf)) {
         zbtIndexInsert(zs, b->eles[0].hash, newleaf->id, NULL);
     } else {
-        for (unsigned int i = 0; i < b->count; i++)
+        /* zbtIndexTableInsertRaw()'s bucket lookup is a near-guaranteed
+         * cache miss on a member_index too large to fit in cache. Every
+         * element's hash is already materialized in b->eles[] (a free read,
+         * unlike re-deriving a hash from a leaf's packed bytes elsewhere in
+         * this file), so prefetch a few elements ahead to hide that miss
+         * behind the current iteration's own work. Re-derives the live
+         * target table exactly as zbtIndexInsert() does; always safe to
+         * call on a stale guess (a rehash starting or advancing mid-batch)
+         * since a prefetch is a hint, never a memory access -- a wrong
+         * address is merely a wasted prefetch, not a correctness hazard. */
+        for (unsigned int i = 0; i < b->count; i++) {
+            unsigned int ahead = i + ZBT_INDEX_PREFETCH_AHEAD;
+            if (ahead < b->count) {
+                zbtIndexTable *table = zs->member_rehash ?
+                    &zs->member_rehash->table : &zs->member_index;
+                if (table->size > 0) {
+                    unsigned long idx = b->eles[ahead].hash & (table->size - 1);
+                    redis_prefetch_write(zbtIndexBucketAt(table, idx));
+                }
+            }
             zbtIndexInsert(zs, b->eles[i].hash, newleaf->id, NULL);
+        }
     }
     zs->length += b->count;
     b->count = 0;
