@@ -114,6 +114,14 @@ void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable, size_t *old_usa
 __attribute__((malloc)) char *zstrdup(const char *s);
 __attribute__((malloc)) char *zstrdup_usable(const char *s, size_t *usable);
 size_t zmalloc_used_memory(void);
+
+/* Number of per-thread memory accounting slots that use the cheap single-writer
+ * update. Sized to cover the main thread plus every reservable IO thread, so
+ * that the fast path does not depend on the configured io-threads value. Kept
+ * here rather than in zmalloc.c so the coupling with IO_THREADS_MAX_NUM can be
+ * asserted at compile time from iothread.c. */
+#define ZMALLOC_DEDICATED_ENTRIES 129
+
 void zmalloc_reserve_thread_slots(int n);
 void zmalloc_register_reserved_slot(void);
 size_t zmalloc_get_peak_memory(void);

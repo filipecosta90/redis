@@ -970,6 +970,13 @@ int IOThreadCron(struct aeEventLoop *eventLoop, long long id, void *clientData) 
     return 1000/IO_DEFAULT_HZ;
 }
 
+/* Every io thread claims a dedicated used_memory accounting slot, so the
+ * dedicated range must hold the main thread plus every io thread we allow.
+ * If it cannot, the overflow io threads silently fall back to the atomic RMW
+ * accounting path, with no other symptom. */
+_Static_assert(IO_THREADS_MAX_NUM + 1 <= ZMALLOC_DEDICATED_ENTRIES,
+               "zmalloc dedicated slots must cover main thread + IO_THREADS_MAX_NUM");
+
 /* The main function of IO thread, it will run an event loop. The main thread
  * and IO thread will communicate through event notifier. */
 void *IOThreadMain(void *ptr) {
