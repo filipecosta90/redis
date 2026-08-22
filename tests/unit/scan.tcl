@@ -376,8 +376,8 @@ proc test_scan {type} {
                 set score [r read]
                 dict set seen $member 1
                 if {$member eq {member:0}} {
-                    assert_equal {$18} $score_header
-                    assert_equal 3.2999999999999998 $score
+                    assert_equal {$3} $score_header
+                    assert_equal 3.3 $score
                 } else {
                     assert_equal {$4} $score_header
                     assert_equal 1.25 $score
