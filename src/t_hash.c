@@ -5664,7 +5664,7 @@ void genericHgetallCommand(client *c, int flags) {
      * value SDS data, then emit replies while the data is cache-warm.
      * This hides the latency of pointer chasing through scattered
      * heap allocations (dictEntry → Entry → value SDS). */
-#define HGETALL_BATCH 16
+#define HGETALL_BATCH 8
     if (o->encoding == OBJ_ENCODING_HT) {
         int skip_expired = !server.allow_access_expired;
         dict *d = o->ptr;
