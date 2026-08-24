@@ -93,11 +93,19 @@ const char *je_malloc_conf =
 #endif
 
 /* Per-thread memory accounting slots. The first DEDICATED_ENTRIES threads
- * (typically the main thread plus io threads) each get a private slot and can
- * use the cheap single-writer atomic operation (plain load+store). 
+ * (the main thread plus every reservable io thread) each get a private slot
+ * and can use the cheap single-writer atomic operation (plain load+store).
  * Threads beyond that share a pool hashed by thread index and pay the cost of
- * a full atomic RMW. */
-#define DEDICATED_ENTRIES 8
+ * a full atomic RMW.
+ *
+ * Sized to IO_THREADS_MAX_NUM (server.h) + 1 for the main thread, so no
+ * configured io-threads count can overflow into the locked shared path --
+ * zmalloc.c intentionally does not include server.h, so the bound is
+ * duplicated here and must be kept in sync with it. Widening this costs only
+ * static BSS (~1 cache line per entry): zmalloc_used_memory()'s aggregation
+ * loop is clamped by the live thread count (num_active_threads), not by
+ * MAX_ENTRIES, so an idle/small server does not pay for the larger array. */
+#define DEDICATED_ENTRIES 129
 #define SHARED_ENTRIES 8 /* Must be a power of 2 for modulo */
 #define SHARED_ENTRIES_MASK (SHARED_ENTRIES - 1)
 #define MAX_ENTRIES (DEDICATED_ENTRIES + SHARED_ENTRIES)
