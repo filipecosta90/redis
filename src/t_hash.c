@@ -644,6 +644,22 @@ static int templateFieldsKeyCompare(dictCmpCache *cache,
     if (t1->hash != t2->hash) return 0;
     if (t1->field_count != t2->field_count) return 0;
 
+    /* One side may be a membership query carrying no ordered field array (see
+     * hashTemplateFindByFieldsInDict): match the registered template's names
+     * against the query's source dict instead of pairwise. The field counts are
+     * already known equal and a dict cannot hold the same field twice, so
+     * "every template name is present" means the two sets are identical. */
+    if (t1->fields == NULL || t2->fields == NULL) {
+        const hashTemplate *q = (t1->fields == NULL) ? t1 : t2;
+        const hashTemplate *t = (q == t1) ? t2 : t1;
+        if (t->fields == NULL) return 0; /* two queries never match each other */
+        for (unsigned long long i = 0; i < t->field_count; i++) {
+            if (dictFind(q->query_src, t->fields[i]) == NULL)
+                return 0;
+        }
+        return 1;
+    }
+
     for (unsigned long long i = 0; i < t1->field_count; i++) {
         if (sdscmplen(t1->fields[i], t2->fields[i]) != 0)
             return 0;
@@ -732,6 +748,7 @@ static hashTemplate *hashTemplateCreateInternal(uint64_t hash, sds *fields,
     tmpl->key_refcount = 0;
     tmpl->field_count = field_count;
     tmpl->fields = zmalloc(sizeof(sds) * field_count);
+    tmpl->query_src = NULL; /* Only ever set on a transient lookup key. */
     tmpl->fields_lp = NULL; /* Lazy built on first save/lookup due to RESTORE. */
     tmpl->fields_lp_last_used = 0;
     tmpl->defrag_field = 0;
@@ -784,6 +801,18 @@ static hashTemplate *hashTemplateFindByFields(uint64_t hash, sds *fields,
     debugServerAssert(hashTemplateValidateFields(fields, field_count));
 
     hashTemplate query = { .hash = hash, .field_count = field_count, .fields = fields };
+    dictEntry *de = dictFind(htemplates->by_fields, &query);
+    return de ? dictGetKey(de) : NULL;
+}
+
+/* Registry lookup for a field set the caller holds as a hash dict instead of a
+ * sorted array. 'hash' is the usual commutative fields-hash, which is a sum of
+ * per-field hashes and so can be accumulated straight off the dict in any
+ * order. Never creates on miss: creating a template needs the names sorted. */
+static hashTemplate *hashTemplateFindByFieldsInDict(uint64_t hash, dict *src,
+                                                    unsigned long long field_count) {
+    hashTemplate query = { .hash = hash, .field_count = field_count,
+                           .fields = NULL, .query_src = src };
     dictEntry *de = dictFind(htemplates->by_fields, &query);
     return de ? dictGetKey(de) : NULL;
 }
@@ -3663,25 +3692,97 @@ int hashTypeTryConvertToTemplate(robj *o,
     /* max_fields == 0 means no upper bound. */
     if (max_fields > 0 && num_fields > max_fields) return 0;
 
+    uint64_t fields_hash = 0;
+    int have_fields_hash = 0;
+
     /* Extract field/value pairs so we can sort them by field name
      * before handing them to hashTemplateGetOrCreate (which requires
      * pre-sorted fields). */
     hashTypeFvPair *pairs = zmalloc(sizeof(*pairs) * num_fields);
-
-    hashTypeIterator hi;
-    hashTypeInitIterator(&hi, o);
+    int fields_borrowed = 0; /* pairs[].field points into the source hash */
     size_t i = 0;
-    while (hashTypeNext(&hi, 0) != C_ERR) {
-        serverAssert(i < num_fields);
-        pairs[i].field = hashTypeCurrentObjectNewSds(&hi, OBJ_HASH_KEY);
-        /* Keep the value as a pointer into the source (no copy); it is written
-         * into the new encoding below, while the source is still alive. */
-        hashTypeCurrentObject(&hi, OBJ_HASH_VALUE, &pairs[i].vstr,
-                              &pairs[i].vlen, &pairs[i].vll, NULL);
-        i++;
+
+    if (o->encoding == OBJ_ENCODING_HT) {
+        /* Walk the dict directly rather than through the generic iterator: an
+         * HT entry already stores its field name as an SDS, so the pairs can
+         * borrow it instead of copying every name, and the fields-hash comes
+         * for free in the same pass. */
+        dict *src = o->ptr;
+        dictIterator di;
+        dictEntry *de;
+
+        fields_borrowed = 1;
+        dictInitSafeIterator(&di, src);
+        while ((de = dictNext(&di)) != NULL) {
+            Entry *e = dictGetKey(de);
+            sds field = entryGetField(e);
+            sds value = entryGetValue(e);
+
+            serverAssert(i < num_fields);
+            pairs[i].field = field;
+            /* Keep the value as a pointer into the source (no copy); it is
+             * written into the new encoding below, while the source is still
+             * alive. HT values are always SDS, never integer-encoded. */
+            pairs[i].vstr = (unsigned char *)value;
+            pairs[i].vlen = sdslen(value);
+            pairs[i].vll = 0;
+            fields_hash += computeFieldHash(field);
+            i++;
+        }
+        dictResetIterator(&di);
+        serverAssert(i == num_fields);
+        have_fields_hash = 1;
+
+        /* Fast path: the field set already has a template.
+         *
+         * This is the case the feature exists for - many hashes sharing one
+         * field set, where only the first of them creates the template - and it
+         * needs no ordering at all. The fields-hash is commutative, so the pass
+         * above could sum it in dict order, and a template it names supplies
+         * its own sorted names, which both confirm the match and pull the
+         * values out in template order. That leaves the sort below unnecessary,
+         * taking the conversion of an n-field hash from O(n log n) to O(n).
+         *
+         * A miss just falls through to the sort, having paid only for work that
+         * path needed anyway. Creating a template is left entirely to it (that
+         * needs the names sorted), which is also why this is safe during an
+         * RDB-load conversion: attaching to an existing template is allowed
+         * there, only creating one is throttled. */
+        hashTemplate *tmpl = hashTemplateFindByFieldsInDict(fields_hash, src,
+                                                            num_fields);
+        if (tmpl != NULL) {
+            sds *values = zmalloc(sizeof(sds) * num_fields);
+            for (size_t j = 0; j < num_fields; j++) {
+                dictEntry *fde = dictFind(src, tmpl->fields[j]);
+                /* The lookup above already established that every one of the
+                 * template's fields is present in this dict. */
+                serverAssert(fde != NULL);
+                values[j] = sdsdup(entryGetValue(dictGetKey(fde)));
+            }
+            hashTemplateArray *hta = hashTemplateArrayCreate(tmpl, values, 1);
+            zfree(values); /* array adopted the sds; free only the array */
+            dictRelease(src);
+            o->ptr = hta;
+            o->encoding = OBJ_ENCODING_TMPL_ARRAY;
+            zfree(pairs); /* fields are borrowed, nothing else to release */
+            return 1;
+        }
+    } else {
+        hashTypeIterator hi;
+        hashTypeInitIterator(&hi, o);
+        while (hashTypeNext(&hi, 0) != C_ERR) {
+            serverAssert(i < num_fields);
+            pairs[i].field = hashTypeCurrentObjectNewSds(&hi, OBJ_HASH_KEY);
+            /* Keep the value as a pointer into the source (no copy); it is
+             * written into the new encoding below, while the source is still
+             * alive. */
+            hashTypeCurrentObject(&hi, OBJ_HASH_VALUE, &pairs[i].vstr,
+                                  &pairs[i].vlen, &pairs[i].vll, NULL);
+            i++;
+        }
+        hashTypeResetIterator(&hi);
+        serverAssert(i == num_fields);
     }
-    hashTypeResetIterator(&hi);
-    serverAssert(i == num_fields);
 
     qsort(pairs, num_fields, sizeof(*pairs), hashTypeFvPairCmp);
 
@@ -3695,18 +3796,21 @@ int hashTypeTryConvertToTemplate(robj *o,
      * hash-rdb-load-template-disassembly-threshold set? */
     int rdb_load_conversion = ctx && ctx->disassembly_threshold > 0;
 
+    /* The fields-hash does not depend on field order, so the fast path above
+     * may already have computed it over the very same names. */
+    if (!have_fields_hash) fields_hash = computeFieldsHash(fields, num_fields);
+
     hashTemplate *tmpl;
     if (!rdb_load_conversion) {
-        tmpl = hashTemplateGetOrCreate(fields, num_fields);
+        tmpl = hashTemplateGetOrCreateWithHash(fields_hash, fields, num_fields);
     } else {
         /* Reuse a matching template, or create one unless the throttle has decided
          * few-key templates dominate; then leave this hash plain (a later hash
          * whose fields match an existing template still attaches to it). */
-        uint64_t fhash = computeFieldsHash(fields, num_fields);
-        tmpl = hashTemplateFindByFields(fhash, fields, num_fields);
+        tmpl = hashTemplateFindByFields(fields_hash, fields, num_fields);
         if (tmpl == NULL) {
             if (rdbLoadTemplateCtxShouldStopCreating(ctx)) goto cleanup;
-            tmpl = hashTemplateCreateInternal(fhash, fields, num_fields);
+            tmpl = hashTemplateCreateInternal(fields_hash, fields, num_fields);
             dictAdd(htemplates->by_fields, tmpl, NULL);
             ctx->number_of_templates++;
         }
@@ -3735,7 +3839,10 @@ int hashTypeTryConvertToTemplate(robj *o,
     ret = 1;
 
 cleanup:
-    for (size_t j = 0; j < num_fields; j++) sdsfree(pairs[j].field);
+    /* Borrowed field names belong to the source hash, which is either still
+     * alive (not converted) or was released by the branch that converted it. */
+    if (!fields_borrowed)
+        for (size_t j = 0; j < num_fields; j++) sdsfree(pairs[j].field);
     zfree(fields);
     zfree(pairs);
     return ret;
