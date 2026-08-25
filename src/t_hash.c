@@ -644,21 +644,12 @@ static int templateFieldsKeyCompare(dictCmpCache *cache,
     if (t1->hash != t2->hash) return 0;
     if (t1->field_count != t2->field_count) return 0;
 
-    /* One side may be a membership query carrying no ordered field array (see
-     * hashTemplateFindByFieldsInDict): match the registered template's names
-     * against the query's source dict instead of pairwise. The field counts are
-     * already known equal and a dict cannot hold the same field twice, so
-     * "every template name is present" means the two sets are identical. */
-    if (t1->fields == NULL || t2->fields == NULL) {
-        const hashTemplate *q = (t1->fields == NULL) ? t1 : t2;
-        const hashTemplate *t = (q == t1) ? t2 : t1;
-        if (t->fields == NULL) return 0; /* two queries never match each other */
-        for (unsigned long long i = 0; i < t->field_count; i++) {
-            if (dictFind(q->query_src, t->fields[i]) == NULL)
-                return 0;
-        }
-        return 1;
-    }
+    /* One side may be a candidate query carrying no ordered field array (see
+     * hashTemplateFindCandidateByHash): it cannot be compared name by name, so
+     * a matching fields-hash and field count is all this can check. The caller
+     * confirms the field set itself and falls back if it does not hold, so a
+     * fields-hash collision costs a retry rather than a wrong answer. */
+    if (t1->fields == NULL || t2->fields == NULL) return 1;
 
     for (unsigned long long i = 0; i < t1->field_count; i++) {
         if (sdscmplen(t1->fields[i], t2->fields[i]) != 0)
@@ -748,7 +739,6 @@ static hashTemplate *hashTemplateCreateInternal(uint64_t hash, sds *fields,
     tmpl->key_refcount = 0;
     tmpl->field_count = field_count;
     tmpl->fields = zmalloc(sizeof(sds) * field_count);
-    tmpl->query_src = NULL; /* Only ever set on a transient lookup key. */
     tmpl->fields_lp = NULL; /* Lazy built on first save/lookup due to RESTORE. */
     tmpl->fields_lp_last_used = 0;
     tmpl->defrag_field = 0;
@@ -805,14 +795,17 @@ static hashTemplate *hashTemplateFindByFields(uint64_t hash, sds *fields,
     return de ? dictGetKey(de) : NULL;
 }
 
-/* Registry lookup for a field set the caller holds as a hash dict instead of a
- * sorted array. 'hash' is the usual commutative fields-hash, which is a sum of
- * per-field hashes and so can be accumulated straight off the dict in any
- * order. Never creates on miss: creating a template needs the names sorted. */
-static hashTemplate *hashTemplateFindByFieldsInDict(uint64_t hash, dict *src,
-                                                    unsigned long long field_count) {
-    hashTemplate query = { .hash = hash, .field_count = field_count,
-                           .fields = NULL, .query_src = src };
+/* Registry lookup by fields-hash and field count alone, for a caller that holds
+ * its field set unordered (in a hash dict) and so has nothing to compare name by
+ * name. 'hash' is the usual commutative fields-hash, a sum of per-field hashes,
+ * so it can be accumulated in any order.
+ *
+ * The result is a CANDIDATE, not a match: the caller must confirm every field of
+ * the returned template is present in its own set before using it. Never creates
+ * on miss - creating a template needs the names sorted. */
+static hashTemplate *hashTemplateFindCandidateByHash(uint64_t hash,
+                                                     unsigned long long field_count) {
+    hashTemplate query = { .hash = hash, .field_count = field_count, .fields = NULL };
     dictEntry *de = dictFind(htemplates->by_fields, &query);
     return de ? dictGetKey(de) : NULL;
 }
@@ -3738,34 +3731,49 @@ int hashTypeTryConvertToTemplate(robj *o,
          * This is the case the feature exists for - many hashes sharing one
          * field set, where only the first of them creates the template - and it
          * needs no ordering at all. The fields-hash is commutative, so the pass
-         * above could sum it in dict order, and a template it names supplies
-         * its own sorted names, which both confirm the match and pull the
-         * values out in template order. That leaves the sort below unnecessary,
-         * taking the conversion of an n-field hash from O(n log n) to O(n).
+         * above could sum it in dict order, and a candidate template it names
+         * supplies its own sorted names, which serve both to confirm the match
+         * and to pull the values out in template order in one pass. That leaves
+         * the sort below unnecessary, taking the conversion of an n-field hash
+         * from O(n log n) to O(n).
          *
-         * A miss just falls through to the sort, having paid only for work that
-         * path needed anyway. Creating a template is left entirely to it (that
-         * needs the names sorted), which is also why this is safe during an
-         * RDB-load conversion: attaching to an existing template is allowed
-         * there, only creating one is throttled. */
-        hashTemplate *tmpl = hashTemplateFindByFieldsInDict(fields_hash, src,
-                                                            num_fields);
+         * The confirmation is what makes it a match: this dict holds exactly
+         * num_fields entries and cannot hold a field twice, so finding every one
+         * of the candidate's num_fields names in it proves the two sets are
+         * equal. A fields-hash collision therefore cannot convert to the wrong
+         * template - it just fails a lookup and falls through.
+         *
+         * A miss falls through to the sort having paid only for work that path
+         * needed anyway. Creating a template is left entirely to it (that needs
+         * the names sorted), which is also why this is safe during an RDB-load
+         * conversion: attaching to an existing template is allowed there, only
+         * creating one is throttled. */
+        debugServerAssert(dictSize(src) == num_fields);
+        hashTemplate *tmpl = hashTemplateFindCandidateByHash(fields_hash, num_fields);
         if (tmpl != NULL) {
             sds *values = zmalloc(sizeof(sds) * num_fields);
-            for (size_t j = 0; j < num_fields; j++) {
-                dictEntry *fde = dictFind(src, tmpl->fields[j]);
-                /* The lookup above already established that every one of the
-                 * template's fields is present in this dict. */
-                serverAssert(fde != NULL);
-                values[j] = sdsdup(entryGetValue(dictGetKey(fde)));
+            size_t matched = 0;
+            while (matched < num_fields) {
+                dictEntry *fde = dictFind(src, tmpl->fields[matched]);
+                if (fde == NULL) break;
+                values[matched] = sdsdup(entryGetValue(dictGetKey(fde)));
+                matched++;
             }
-            hashTemplateArray *hta = hashTemplateArrayCreate(tmpl, values, 1);
-            zfree(values); /* array adopted the sds; free only the array */
-            dictRelease(src);
-            o->ptr = hta;
-            o->encoding = OBJ_ENCODING_TMPL_ARRAY;
-            zfree(pairs); /* fields are borrowed, nothing else to release */
-            return 1;
+
+            if (matched == num_fields) {
+                hashTemplateArray *hta = hashTemplateArrayCreate(tmpl, values, 1);
+                zfree(values); /* array adopted the sds; free only the array */
+                dictRelease(src);
+                o->ptr = hta;
+                o->encoding = OBJ_ENCODING_TMPL_ARRAY;
+                zfree(pairs); /* fields are borrowed, nothing else to release */
+                return 1;
+            }
+
+            /* Fields-hash collision: same hash and count, different field set.
+             * Drop what was copied and let the sorted path resolve it. */
+            for (size_t j = 0; j < matched; j++) sdsfree(values[j]);
+            zfree(values);
         }
     } else {
         hashTypeIterator hi;

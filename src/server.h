@@ -4008,13 +4008,10 @@ typedef struct hashTemplate {
                           * a changed field set creates a new template). Used to
                           * attribute a holder's share to client memory. */
     sds *fields;         /* Ordered array of field names. NULL only on the
-                          * transient stack key built by
-                          * hashTemplateFindByFieldsInDict(), which names its
-                          * field set through 'query_src' instead. */
-    dict *query_src;     /* NULL on every registered template. Set only on that
-                          * same transient key: the hash dict holding the field
-                          * set being looked up, so a caller with no sorted
-                          * field array can probe the registry by membership. */
+                          * transient stack key used by
+                          * hashTemplateFindCandidateByHash(), whose caller has
+                          * no ordered names to offer and confirms the match
+                          * itself. */
     unsigned char *fields_lp; /* Lazily-built listpack of the sorted field names
                           * ([f0][f1]...[fN-1]), also the by_fields_lp key. NULL
                           * until first needed. Lets the self-contained DUMP/RESTORE
