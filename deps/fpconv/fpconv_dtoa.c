@@ -176,27 +176,44 @@ static int generate_digits(Fp *fp, Fp *upper, Fp *lower, char *digits, int *K) {
     uint64_t part2 = upper->frac & (one.frac - 1);
 
     int idx = 0, kappa = 10;
-    uint64_t *divp;
-    /* 1000000000 */
-    for (divp = tens + 10; kappa > 0; divp++) {
-        uint64_t div = *divp;
-        unsigned digit = part1 / div;
 
-        if (digit || idx) {
-            digits[idx++] = digit + '0';
-        }
+    /* 1000000000 down to 1: each step divides by a literal power of ten
+     * (instead of *divp read from the tens[] table) so the compiler can
+     * strength-reduce every division into a multiply+shift, same as it
+     * already does for the /10 and /100 in emit_digits() below. Reading
+     * the divisor through a pointer defeats that: the compiler can't prove
+     * its value at compile time, so it falls back to a real div instruction
+     * -- the single most expensive instruction in this whole file, and this
+     * loop is on the hot path for every double formatted (ZSCORE, ZRANGE
+     * WITHSCORES, INCRBYFLOAT, ...). */
+#define GEN_DIGIT_STEP(divisor) do { \
+        const uint64_t div = (divisor); \
+        unsigned digit = part1 / div; \
+        if (digit || idx) { \
+            digits[idx++] = digit + '0'; \
+        } \
+        part1 -= digit * div; \
+        kappa--; \
+        uint64_t tmp = (part1 << -one.exp) + part2; \
+        if (tmp <= delta) { \
+            *K += kappa; \
+            round_digit(digits, idx, delta, tmp, div << -one.exp, wfrac); \
+            return idx; \
+        } \
+    } while (0)
 
-        part1 -= digit * div;
-        kappa--;
+    GEN_DIGIT_STEP(1000000000U);
+    GEN_DIGIT_STEP(100000000U);
+    GEN_DIGIT_STEP(10000000U);
+    GEN_DIGIT_STEP(1000000U);
+    GEN_DIGIT_STEP(100000U);
+    GEN_DIGIT_STEP(10000U);
+    GEN_DIGIT_STEP(1000U);
+    GEN_DIGIT_STEP(100U);
+    GEN_DIGIT_STEP(10U);
+    GEN_DIGIT_STEP(1U);
 
-        uint64_t tmp = (part1 << -one.exp) + part2;
-        if (tmp <= delta) {
-            *K += kappa;
-            round_digit(digits, idx, delta, tmp, div << -one.exp, wfrac);
-
-            return idx;
-        }
-    }
+#undef GEN_DIGIT_STEP
 
     /* 10 */
     uint64_t *unit = tens + 18;
