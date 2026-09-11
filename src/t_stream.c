@@ -3227,13 +3227,60 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id) {
     cg->last_id = *id;
 }
 
+/* The cgroups_ref index maps a stream ID to the list of consumer groups that
+ * hold that ID in their PEL. It turns streamEntryIsReferenced() and
+ * streamCleanupEntryCGroupRefs() into a single O(log N) rax lookup instead of
+ * an O(C * log N_pel) scan over every consumer group, but it is paid for on
+ * every single message delivery: one rax insert plus a list node per NACK, on
+ * the XREADGROUP hot path.
+ *
+ * Those two functions are only ever reached from the reference-aware delete
+ * strategies DELREF and ACKED (XDELEX, XACKDEL, and XADD/XTRIM trimming), and
+ * the default strategy is KEEPREF. A stream that never uses one of them - the
+ * common case - gets nothing for the index and should not pay for it.
+ *
+ * So the index is built lazily, on the first reference-aware delete the stream
+ * ever sees, and kept from then on: a one-way transition, like the
+ * listpack-to-skiplist encoding switch. Build cost is O(total PEL) once, paid
+ * by a command that is already about to walk consumer group PELs anyway.
+ *
+ * The two consumers call this themselves rather than relying on their callers
+ * to do it, so that no future DELREF/ACKED call site can forget to and read a
+ * half-populated index - which would silently report a pending entry as
+ * unreferenced and delete it. One predictable branch per call is nothing next
+ * to the rax lookup that follows it. */
+static void streamCGroupsRefEnsure(stream *s) {
+    if (s->cgroups_ref || !s->cgroups) return;
+    s->cgroups_ref = raxNewEx(0, &s->alloc_size, sizeof(streamID));
+
+    /* Index every NACK currently pending in every consumer group. */
+    raxIterator ri;
+    raxStart(&ri, s->cgroups);
+    raxSeek(&ri, "^", NULL, 0);
+    while (raxNext(&ri)) {
+        streamCG *cg = ri.data;
+        raxIterator pi;
+        raxStart(&pi, cg->pel);
+        raxSeek(&pi, "^", NULL, 0);
+        while (raxNext(&pi)) {
+            streamNACK *nack = pi.data;
+            nack->cgroup_ref_node = streamLinkCGroupToEntry(s, cg, pi.key);
+        }
+        raxStop(&pi);
+    }
+    raxStop(&ri);
+}
+
 /* Link a consumer group to a stream entry in the cgroups_ref index.
- * Returns a pointer to the list node, so that it can be used for future deletion. */
+ * Returns a pointer to the list node, so that it can be used for future
+ * deletion, or NULL when this stream keeps no index. */
 listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
     list *cglist;
 
-    if (!s->cgroups_ref)
-        s->cgroups_ref = raxNewEx(0, &s->alloc_size, sizeof(streamID));
+    /* Streams that have never used a reference-aware delete strategy keep no
+     * index: the caller stores the NULL and pays nothing on delivery. See
+     * streamCGroupsRefEnsure(). */
+    if (!s->cgroups_ref) return NULL;
 
     /* Find-or-insert in a single rax walk: raxFindLink stashes the stop
      * position so raxInsertAt commits without re-walking the tree. */
@@ -3254,7 +3301,7 @@ listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
  * This is called when a message is acknowledged or when a consumer group is deleted. */
 void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *key) {
     list *cglist;
-    if (!s->cgroups_ref) return;
+    if (!s->cgroups_ref || !na->cgroup_ref_node) return;
     if (raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
         listDelNode(cglist, na->cgroup_ref_node);
         
@@ -3269,6 +3316,9 @@ void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *ke
 /* Remove all consumer group references to a specific stream message.
  * Returns 1 if any references were removed, otherwise 0. */
 int streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
+    /* Reaching this function is itself the trigger to start indexing: see
+     * streamCGroupsRefEnsure(). */
+    streamCGroupsRefEnsure(s);
     if (!s->cgroups_ref) return 0;
     list *cglist;
     listIter li;
@@ -3313,6 +3363,9 @@ int streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
  * Returns 1 if the entry is referenced, 0 if it's fully acknowledged by all groups. */
 int streamEntryIsReferenced(stream *s, streamID *id) {
     if (!s->cgroups || !raxSize(s->cgroups)) return 0;
+    /* Reaching this function is itself the trigger to start indexing: see
+     * streamCGroupsRefEnsure(). */
+    streamCGroupsRefEnsure(s);
     if (!s->min_cgroup_last_id_valid) {
         /* If the cached minimum last_id is invalid, we need to recalculate it
          * by iterating through all consumer groups to find the minimum last_id */

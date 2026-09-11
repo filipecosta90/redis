@@ -42,7 +42,9 @@ typedef struct stream {
     uint64_t entries_added; /* All time count of elements added. */
     size_t alloc_size;      /* Total allocated memory (in bytes) by this stream. */
     rax *cgroups;           /* Consumer groups dictionary: name -> streamCG */
-    rax *cgroups_ref;       /* Index mapping message IDs to their consumer groups. */
+    rax *cgroups_ref;       /* Index mapping message IDs to their consumer groups.
+                               NULL until this stream first uses a DELREF/ACKED
+                               delete strategy; see streamCGroupsRefEnsure(). */
     streamID min_cgroup_last_id;  /* The minimum ID of consume group. */
     unsigned int min_cgroup_last_id_valid: 1;
     uint64_t idmp_duration; /* IDMP duration in seconds. */
@@ -142,7 +144,8 @@ struct streamNACK {
     uint64_t delivery_count;    /* Number of times this message was delivered.*/
     streamConsumer *consumer;   /* The consumer this message was delivered to
                                    in the last delivery. */
-    listNode *cgroup_ref_node; /* Reference to this NACK in the cgroups_ref list. */
+    listNode *cgroup_ref_node; /* Reference to this NACK in the cgroups_ref list,
+                                  NULL when the stream keeps no cgroups_ref. */
     streamID id;                /* Stream ID for this pending entry. */
     struct streamNACK *pel_prev; /* Previous NACK in time-ordered doubly-linked list. */
     struct streamNACK *pel_next; /* Next NACK in time-ordered doubly-linked list. */

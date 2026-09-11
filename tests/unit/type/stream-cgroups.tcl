@@ -790,6 +790,43 @@ start_server {
         assert_equal 0 [r XLEN mystream] 
     }
 
+    test {cgroups_ref index is built lazily on the first reference-aware delete} {
+        r DEL mystream
+        for {set j 0} {$j < 5} {incr j} {
+            r XADD mystream $j-1 item $j
+        }
+        r XGROUP CREATE mystream g1 0
+        r XGROUP CREATE mystream g2 0
+
+        # Every delivery below happens while the stream keeps no cgroups_ref
+        # index, so these NACKs exist before the index does.
+        r XREADGROUP GROUP g1 c1 STREAMS mystream >
+        r XREADGROUP GROUP g2 c1 STREAMS mystream >
+        assert_equal 5 [lindex [r XPENDING mystream g1] 0]
+        assert_equal 5 [lindex [r XPENDING mystream g2] 0]
+
+        # First reference-aware delete on this stream: the index has to be
+        # built from the already-pending NACKs, otherwise every one of these
+        # entries looks unreferenced and gets deleted while still pending.
+        assert_equal {2 2 2 2 2} [r XDELEX mystream ACKED IDS 5 0-1 1-1 2-1 3-1 4-1]
+        assert_equal 5 [r XLEN mystream]
+
+        # DELREF must find and drop the references both groups took earlier.
+        assert_equal {1 1} [r XDELEX mystream DELREF IDS 2 0-1 1-1]
+        assert_equal 3 [r XLEN mystream]
+        assert_equal 3 [lindex [r XPENDING mystream g1] 0]
+        assert_equal 3 [lindex [r XPENDING mystream g2] 0]
+
+        # With the index now live, later deliveries and acks keep it in sync.
+        r XADD mystream 5-1 item 5
+        r XREADGROUP GROUP g1 c1 STREAMS mystream >
+        r XACK mystream g1 5-1
+        assert_equal {2} [r XDELEX mystream ACKED IDS 1 5-1] ;# g2 has not read it
+        r XREADGROUP GROUP g2 c1 STREAMS mystream >
+        r XACK mystream g2 5-1
+        assert_equal {1} [r XDELEX mystream ACKED IDS 1 5-1]
+    }
+
     test {XGROUP DESTROY correctly manage min_cgroup_last_id cache} {
         r DEL mystream
         # Add some entries
