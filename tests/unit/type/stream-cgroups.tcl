@@ -4874,3 +4874,42 @@ start_server {tags {"stream external:skip needs:debug"}} {
         assert_equal [dict get $ginfo lag] 97
     }
 }
+
+start_server {tags {"stream external:skip"}} {
+    # The cgroups_ref index maps a stream ID to the consumer groups holding it in
+    # their PEL. Its rax is charged to the stream (raxNewEx(0, &s->alloc_size,
+    # ...)), but the per-ID `list` and the per-NACK `listNode` are plain
+    # allocations. Before the fix they were never added to s->alloc_size, so
+    # MEMORY USAGE reported roughly half of what a deep PEL actually costs.
+    #
+    # Draining 1000 entries into one group allocates 1000 NACKs, 1000 index
+    # lists and 1000 list nodes. Measured on jemalloc/64-bit: MEMORY USAGE grows
+    # ~167 KB with the fix and ~95 KB without it (the missing 72 B/entry is the
+    # list header plus its node). The 130 KB floor sits well clear of both, so
+    # it tolerates slab-class jitter and still fails on the unaccounted build.
+    if {[string match {*jemalloc*} [s mem_allocator]] && [s arch_bits] == 64} {
+        test {MEMORY USAGE - stream cgroups_ref index lists are accounted} {
+            r DEL mystream
+            for {set i 0} {$i < 1000} {incr i} { r XADD mystream * f v }
+            r XGROUP CREATE mystream mygroup 0
+            set before [r MEMORY USAGE mystream]
+            r XREADGROUP GROUP mygroup c COUNT 1000 STREAMS mystream >
+            assert_equal 1000 [llength [r XPENDING mystream mygroup - + 1000]]
+            set grown [expr {[r MEMORY USAGE mystream] - $before}]
+            assert {$grown > 130000}
+
+            # And it must come back down. This is the half that catches an
+            # asymmetric fix: charging on link without uncharging on unlink
+            # would leave the ~136 KB above permanently on the stream (or, if
+            # the two were unbalanced the other way, wrap the unsigned counter).
+            # The few hundred bytes that legitimately remain are the consumer
+            # created by XREADGROUP and its (now empty) PEL rax, which ACK does
+            # not free.
+            set ids {}
+            foreach e [r XPENDING mystream mygroup - + 1000] { lappend ids [lindex $e 0] }
+            r XACK mystream mygroup {*}$ids
+            assert_equal 0 [lindex [r XPENDING mystream mygroup] 0]
+            assert {[r MEMORY USAGE mystream] - $before < 2000}
+        }
+    }
+}

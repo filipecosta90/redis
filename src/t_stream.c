@@ -36,6 +36,7 @@
 #define STREAM_LISTPACK_MAX_SIZE (1<<30)
 
 void streamFreeCGGeneric(void *cg, void *s);
+static void streamCGroupsRefListReleaseGeneric(void *cglist, void *strm);
 void streamFreeNACK(stream *s, streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamCG *group, streamConsumer *consumer, long long maxsize, size_t emitted_before);
 int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq, int *seq_given);
@@ -109,7 +110,7 @@ void freeStream(stream *s) {
     if (s->cgroups)
         raxFreeWithCbAndContext(s->cgroups, streamFreeCGGeneric, s);
     if (s->cgroups_ref)
-        raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
+        raxFreeWithCbAndContext(s->cgroups_ref, streamCGroupsRefListReleaseGeneric, s);
     /* Free IDMP producers rax tree */
     if (s->idmp_producers)
         raxFreeWithCbAndContext(s->idmp_producers, streamFreeIdmpProducerGeneric, s);
@@ -3227,6 +3228,29 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id) {
     cg->last_id = *id;
 }
 
+/* Release a cgroups_ref value list, uncharging it from the stream.
+ *
+ * The index's rax nodes are charged to the stream by raxNewEx() below, but the
+ * per-ID list and its per-consumer-group nodes are plain allocations. Charge
+ * them too, otherwise MEMORY USAGE reports a fraction of what the index costs:
+ * at a single consumer group the list plus one node per pending entry is the
+ * larger half of it. */
+static void streamCGroupsRefListRelease(stream *s, list *cglist) {
+    listIter li;
+    listNode *ln;
+
+    listRewind(cglist, &li);
+    while ((ln = listNext(&li)))
+        s->alloc_size -= zmalloc_usable_size(ln);
+    s->alloc_size -= zmalloc_usable_size(cglist);
+    listRelease(cglist);
+}
+
+/* Generic (rax free-callback) version of streamCGroupsRefListRelease. */
+static void streamCGroupsRefListReleaseGeneric(void *cglist, void *strm) {
+    streamCGroupsRefListRelease((stream *)strm, (list *)cglist);
+}
+
 /* Link a consumer group to a stream entry in the cgroups_ref index.
  * Returns a pointer to the list node, so that it can be used for future deletion. */
 listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
@@ -3241,12 +3265,14 @@ listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
     if (!raxFindLink(s->cgroups_ref, key, sizeof(streamID),
                      (void**)&cglist, &link)) {
         cglist = listCreate();
+        s->alloc_size += zmalloc_usable_size(cglist);
         serverAssert(raxInsertAt(s->cgroups_ref, key, sizeof(streamID),
                                  cglist, NULL, &link));
     }
     
     /* Add the consumer group to the list and return the list node */
     listAddNodeTail(cglist, cg);
+    s->alloc_size += zmalloc_usable_size(listLast(cglist));
     return listLast(cglist);
 }
 
@@ -3256,12 +3282,13 @@ void streamUnlinkEntryFromCGroupRef(stream *s, streamNACK *na, unsigned char *ke
     list *cglist;
     if (!s->cgroups_ref) return;
     if (raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
+        s->alloc_size -= zmalloc_usable_size(na->cgroup_ref_node);
         listDelNode(cglist, na->cgroup_ref_node);
         
         /* If the list is now empty, remove it from the index. */
         if (listLength(cglist) == 0) {
             raxRemove(s->cgroups_ref, key, sizeof(streamID), NULL);
-            listRelease(cglist);
+            streamCGroupsRefListRelease(s, cglist);
         }
     }
 }
@@ -3299,7 +3326,7 @@ int streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
     }
 
     raxRemove(s->cgroups_ref, buf, sizeof(streamID), NULL);
-    listRelease(cglist);
+    streamCGroupsRefListRelease(s, cglist);
     return 1;
 }
 
