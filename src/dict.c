@@ -769,6 +769,43 @@ int dictDelete(dict *ht, const void *key) {
     return dictGenericDelete(ht,key,0) ? DICT_OK : DICT_ERR;
 }
 
+/* Remove a stored key by identity using a hash computed when the key was
+ * created. This avoids rehashing or comparing a potentially large key when
+ * the caller already owns the exact stored-key pointer. */
+int dictDeleteByHashAndPtr(dict *d, const void *stored_key, uint64_t hash) {
+    dictEntry *he, *prevHe;
+    unsigned long idx;
+    int table;
+
+    if (dictSize(d) == 0) return DICT_ERR;
+
+    idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+    _dictRehashStepIfNeeded(d, idx);
+
+    for (table = 0; table <= 1; table++) {
+        idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
+        if (table == 0 && (long)idx < d->rehashidx) continue;
+        he = d->ht_table[table][idx];
+        prevHe = NULL;
+        while (he) {
+            if (stored_key == dictGetKey(he)) {
+                if (prevHe)
+                    dictSetNext(prevHe, dictGetNext(he));
+                else
+                    d->ht_table[table][idx] = dictGetNext(he);
+                dictFreeUnlinkedEntry(d, he);
+                d->ht_used[table]--;
+                _dictShrinkIfNeeded(d);
+                return DICT_OK;
+            }
+            prevHe = he;
+            he = dictGetNext(he);
+        }
+        if (!dictIsRehashing(d)) break;
+    }
+    return DICT_ERR;
+}
+
 /* Remove an element from the table, but without actually releasing
  * the key, value and dictionary entry. The dictionary entry is returned
  * if the element was found (and unlinked from the table), and the user

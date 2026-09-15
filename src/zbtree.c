@@ -77,13 +77,14 @@ typedef struct zbtInner {
  * Element allocation
  *----------------------------------------------------------------------------*/
 
-/* moff is bounded by the header plus the widest score plus the largest sds
- * header, so a single byte is always enough to hold it. */
-static_assert(offsetof(zbtElem, data) + 8 + sizeof(struct sdshdr64) <= UINT8_MAX,
+/* moff is bounded by the header plus the widest score, an optional cached
+ * member hash, and the largest sds header, so a single byte is enough. */
+static_assert(offsetof(zbtElem, data) + 8 + sizeof(uint64_t) +
+                  sizeof(struct sdshdr64) <= UINT8_MAX,
               "zbtElem member offset must fit in a byte");
 
 static size_t zbtScoreEncSize(uint8_t enc) {
-    switch (enc) {
+    switch (enc & ZBT_SCORE_MASK) {
     case ZBT_SCORE_I8:  return 1;
     case ZBT_SCORE_I16: return 2;
     case ZBT_SCORE_I24: return 3;
@@ -161,17 +162,19 @@ zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
         zbtScoreEncode(score, &enc, sbuf);
     }
     size_t score_sz = zbtScoreEncSize(enc);
+    int cache_hash = len >= ZBT_CACHE_HASH_MIN_LEN;
+    size_t hash_sz = cache_hash ? sizeof(uint64_t) : 0;
     char sds_type = sdsReqType(len);
     size_t sds_hdr_len = sdsHdrSize(sds_type);
     /* offsetof(), not sizeof(): the struct is padded out to its pointer
      * alignment, and that tail padding must not push the score bytes out. */
-    size_t hdr = offsetof(zbtElem, data) + score_sz;
+    size_t hdr = offsetof(zbtElem, data) + score_sz + hash_sz;
     size_t sds_buf_size = sds_hdr_len + len + 1;
     size_t total = hdr + sds_buf_size;
 
     zbtElem *e = zmalloc_usable(total, usable);
     e->leaf = NULL;   /* set when the element is placed in a leaf */
-    e->enc = enc;
+    e->enc = enc | (cache_hash ? ZBT_ELEM_CACHED_HASH : 0);
     memcpy(e->data, sbuf, score_sz);
     size_t sds_offset = hdr + sds_hdr_len;
     zbtSetOffset(e, (uint8_t)sds_offset);
@@ -179,6 +182,10 @@ zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
     char *dst = (char *)e + hdr;
     sds emb = sdsnewplacement(dst, sds_buf_size, sds_type, buf, len);
     serverAssert(emb == (sds)((char *)e + sds_offset));
+    if (cache_hash) {
+        uint64_t hash = dictSdsHash(emb);
+        memcpy(e->data + score_sz, &hash, sizeof(hash));
+    }
     return e;
 }
 
@@ -1073,7 +1080,7 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     if (zbtLeafHolds(lf, idx, newscore, ele, up)) {
         zbtElem *ne = e;
         if (same_width) {
-            e->enc = newenc;
+            e->enc = (e->enc & ZBT_ELEM_CACHED_HASH) | newenc;
             memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
         } else {
             size_t new_usable;
@@ -1104,7 +1111,7 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
         zbtUpdateToRoot(t, (zbtNode *)lf);
 
     if (same_width) {
-        e->enc = newenc;
+        e->enc = (e->enc & ZBT_ELEM_CACHED_HASH) | newenc;
         memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
         zbtInsertElem(t, e, old_usable);
         return e;
@@ -1558,7 +1565,10 @@ static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
-            dictDelete(d, zbtGetEle(el));
+            if (zbtHasCachedHash(el))
+                serverAssert(dictDeleteByHashAndPtr(d, el, zbtGetCachedHash(el)) == DICT_OK);
+            else
+                serverAssert(dictDelete(d, zbtGetEle(el)) == DICT_OK);
             size_t usable;
             zfree_usable(el, &usable);
             t->alloc_size -= usable;
@@ -2064,6 +2074,36 @@ int zbtreeTest(int argc, char **argv, int flags) {
     }
     test_cond("Bulk build + range delete", 1);
 
+    /* --- Cached hashes for large-member range deletion --- */
+    {
+        dict *d = dictCreate(&zsetDictType);
+        zbtree *bt = zbtCreate();
+        char longbuf[ZBT_CACHE_HASH_MIN_LEN];
+        memset(longbuf, 'x', sizeof(longbuf));
+        sds large = sdsnewlen(longbuf, sizeof(longbuf));
+        sds small = sdsnew("small");
+        zbtElem *large_elem = zbtInsert(bt, 1, large);
+        zbtElem *small_elem = zbtInsert(bt, 2, small);
+
+        serverAssert(zbtHasCachedHash(large_elem));
+        serverAssert(zbtGetCachedHash(large_elem) == dictSdsHash(large));
+        serverAssert(!zbtHasCachedHash(small_elem));
+        serverAssert(dictAdd(d, large_elem, NULL) == DICT_OK);
+        serverAssert(dictAdd(d, small_elem, NULL) == DICT_OK);
+
+        serverAssert(zbtDeleteRangeByRank(bt, 1, 1, d) == 1);
+        serverAssert(dictFind(d, large) == NULL);
+        serverAssert(dictFind(d, small) != NULL);
+        serverAssert(zbtDeleteRangeByRank(bt, 1, 1, d) == 1);
+        serverAssert(dictSize(d) == 0 && bt->length == 0);
+
+        sdsfree(large);
+        sdsfree(small);
+        dictRelease(d);
+        zbtFree(bt);
+    }
+    test_cond("Large members use cached hashes for range deletion", 1);
+
     /* --- Random-window range deletion, checking occupancy --- */
     {
         const int M = 20000;
@@ -2306,7 +2346,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
             sds s = sdsnew(cases[i].name);
             elems[i] = zbtInsert(bt, cases[i].score, s);
             sdsfree(s);
-            serverAssert(elems[i]->enc == cases[i].enc);
+            serverAssert((elems[i]->enc & ZBT_SCORE_MASK) == cases[i].enc);
             double got = zbtGetScore(elems[i]);
             if (cases[i].enc == ZBT_SCORE_DBL && cases[i].score == 0) {
                 serverAssert(got == 0 && signbit(got));
@@ -2320,9 +2360,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
 
         /* Width changes in both directions. */
         elems[1] = zbtUpdateScore(bt, elems[1], 128);           /* 127 I8 -> 128 I16 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
+        serverAssert((elems[1]->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
         elems[1] = zbtUpdateScore(bt, elems[1], 127);           /* back I16 -> I8 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
+        serverAssert((elems[1]->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
 
         zbtElem *one;
         {
@@ -2331,9 +2371,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
             sdsfree(s);
         }
         one = zbtUpdateScore(bt, one, 1.5);                     /* 1 I8 -> 1.5 DBL */
-        serverAssert(one->enc == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
+        serverAssert((one->enc & ZBT_SCORE_MASK) == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
         one = zbtUpdateScore(bt, one, 1);                       /* 1.5 DBL -> 1 I8 */
-        serverAssert(one->enc == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
+        serverAssert((one->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
 
         zbtElem *big;
         {
@@ -2341,11 +2381,11 @@ int zbtreeTest(int argc, char **argv, int flags) {
             big = zbtInsert(bt, 2147483647.0, s);
             sdsfree(s);
         }
-        serverAssert(big->enc == ZBT_SCORE_I32);
+        serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I32);
         big = zbtUpdateScore(bt, big, (double)(1LL << 47));     /* I32 -> DBL via 2^47 */
-        serverAssert(big->enc == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
+        serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
         big = zbtUpdateScore(bt, big, 2147483648.0);            /* DBL -> I48 */
-        serverAssert(big->enc == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
+        serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
 
         zbtDebugVerify(bt);
         zfree(elems);

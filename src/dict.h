@@ -264,6 +264,7 @@ void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n);
 dictEntry *dictAddOrFind(dict *d, void *key __stored_key);
 int dictReplace(dict *d, void *key __stored_key, void *val);
 int dictDelete(dict *d, const void *key);
+int dictDeleteByHashAndPtr(dict *d, const void *stored_key, uint64_t hash);
 dictEntry *dictUnlink(dict *d, const void *key);
 void dictFreeUnlinkedEntry(dict *d, dictEntry *he);
 dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index);

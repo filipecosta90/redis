@@ -1809,6 +1809,9 @@ struct sharedObjectsStruct {
 #define ZBT_SCORE_I32 3
 #define ZBT_SCORE_I48 4
 #define ZBT_SCORE_DBL 5
+#define ZBT_SCORE_MASK 0x07
+#define ZBT_ELEM_CACHED_HASH 0x80
+#define ZBT_CACHE_HASH_MIN_LEN 128
 
 struct zbtLeaf;     /* B+ tree leaf; private to zbtree.c */
 
@@ -1848,7 +1851,7 @@ static inline void zbtSetOffset(zbtElem *e, uint8_t off) {
  * host-endian memcpy cannot drop the low bytes on big-endian hosts. */
 static inline double zbtGetScore(const zbtElem *e) {
     const unsigned char *p = (const unsigned char *)e->data;
-    switch (e->enc) {
+    switch (e->enc & ZBT_SCORE_MASK) {
     case ZBT_SCORE_I8:
         return (double)(int8_t)p[0];
     case ZBT_SCORE_I16: {
@@ -1884,6 +1887,27 @@ static inline double zbtGetScore(const zbtElem *e) {
 /* Recover the embedded member SDS from an element. */
 static inline sds zbtGetEle(const zbtElem *e) {
     return (sds)((char *)e + zbtGetOffset(e));
+}
+
+static inline int zbtHasCachedHash(const zbtElem *e) {
+    return (e->enc & ZBT_ELEM_CACHED_HASH) != 0;
+}
+
+static inline size_t zbtScoreSize(const zbtElem *e) {
+    switch (e->enc & ZBT_SCORE_MASK) {
+    case ZBT_SCORE_I8:  return 1;
+    case ZBT_SCORE_I16: return 2;
+    case ZBT_SCORE_I24: return 3;
+    case ZBT_SCORE_I32: return 4;
+    case ZBT_SCORE_I48: return 6;
+    default:            return 8;
+    }
+}
+
+static inline uint64_t zbtGetCachedHash(const zbtElem *e) {
+    uint64_t hash;
+    memcpy(&hash, e->data + zbtScoreSize(e), sizeof(hash));
+    return hash;
 }
 
 /* B+ tree node is opaque outside zbtree.c. */

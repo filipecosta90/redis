@@ -2662,7 +2662,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     znode = dictGetKey(de);
                     double newscore = zbtGetScore(znode);
                     zunionInterAggregate(&newscore, score, aggregate);
-                    serverAssert(znode->enc == ZBT_SCORE_DBL);
+                    serverAssert((znode->enc & ZBT_SCORE_MASK) == ZBT_SCORE_DBL);
                     memcpy(znode->data, &newscore, sizeof(newscore));
                 }
             }
