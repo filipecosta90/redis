@@ -1810,15 +1810,25 @@ struct sharedObjectsStruct {
 #define ZBT_SCORE_I48 4
 #define ZBT_SCORE_DBL 5
 
+struct zbtLeaf;     /* B+ tree leaf; private to zbtree.c */
+
 /* A single sorted-set element. The member SDS is embedded in the same
  * allocation right after this header, mirroring the old skiplist node layout
  * so the dict can store zbtElem* as keys.
  *
- * Layout: [enc][moff][score bytes][sds header][member bytes]. moff is the
- * offset from the element start to the embedded member data. It has to be
+ * Layout: [leaf][enc][moff][score bytes][sds header][member bytes]. moff is
+ * the offset from the element start to the embedded member data. It has to be
  * stored because both the score encoding width and the sds header size vary,
- * so the member data does not sit at a fixed distance from the element start. */
+ * so the member data does not sit at a fixed distance from the element start.
+ *
+ * 'leaf' is the leaf currently holding the element. Callers that reach an
+ * element through the dict (ZRANK, ZREM, a score update) know what it is but
+ * not where it sits, and re-deriving that with a root-to-leaf search costs a
+ * bisection over sep[] per level, each probe dereferencing a separator in its
+ * own allocation. The back-pointer turns those into an upward walk instead.
+ * zbtree.c owns the field and re-stamps it whenever an element moves. */
 typedef struct zbtElem {
+    struct zbtLeaf *leaf;
     uint8_t enc;    /* ZBT_SCORE_* encoding tag */
     uint8_t moff;   /* offset from element start to member data */
     char data[];    /* [score bytes][sds header][member bytes] */
