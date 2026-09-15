@@ -3103,13 +3103,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
-            znode = zbtCreateElem(score, sdsele, sdslen(sdsele), 0, NULL);
+            znode = zbtCreateElemWithHash(score, sdsele, sdslen(sdsele), 0, NULL, NULL);
             sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
-            if (dictAdd(zs->dict, znode, NULL) != DICT_OK) {
+            uint64_t hash = zbtElemHash(znode);
+            dictEntryLink bucket, link;
+            link = dictFindLinkByHash(zs->dict, zbtGetEle(znode), hash, &bucket);
+            if (link != NULL) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 zbtFreeElem(znode);
                 goto zseterr;
             }
+            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
             elems[loaded++] = znode;
             continue;
 

@@ -1910,6 +1910,14 @@ static inline uint64_t zbtGetCachedHash(const zbtElem *e) {
     return hash;
 }
 
+/* Member hash used by the companion dict. Prefer the packed cache when the
+ * member is long enough that siphash was stored at create time. */
+static inline uint64_t zbtElemHash(const zbtElem *e) {
+    if (zbtHasCachedHash(e)) return zbtGetCachedHash(e);
+    sds ele = zbtGetEle(e);
+    return dictGenHashFunction(ele, sdslen(ele));
+}
+
 /* B+ tree node is opaque outside zbtree.c. */
 typedef struct zbtNode zbtNode;
 
@@ -3912,12 +3920,15 @@ zbtree *zbtCreate(void);
 void zbtFree(zbtree *t);
 size_t zbtAllocSize(const zbtree *t);
 zbtElem *zbtCreateElem(double score, const char *buf, size_t len, int wide, size_t *usable);
+zbtElem *zbtCreateElemWithHash(double score, const char *buf, size_t len, int wide,
+                               size_t *usable, const uint64_t *known_hash);
 zbtElem *zbtDupElem(const zbtElem *elem, size_t *usable);
 void zbtFreeElem(zbtElem *e);
 void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n);
 void zbtBuildFromSortedWithSize(zbtree *t, zbtElem **elems, unsigned long n,
                                 size_t elems_alloc_size);
 zbtElem *zbtInsert(zbtree *t, double score, sds ele);
+zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash);
 void zbtDeleteElem(zbtree *t, zbtElem *e);
 zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore);
 int zbtCompare(double score, sds ele, const zbtElem *e);

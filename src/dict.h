@@ -261,16 +261,22 @@ int dictAdd(dict *d, void *key __stored_key, void *val);
 dictEntry *dictAddRaw(dict *d, void *key __stored_key, dictEntry **existing);
 dictEntry *dictAddNonExisting(dict *d, void *key __stored_key);
 void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n);
+typedef uint64_t (*dictStoredHashFunction)(const void *stored_key);
+void dictAddNonExistingBatchHashed(dict *d, void **keys __stored_key, size_t n,
+                                   dictStoredHashFunction hashStored);
 dictEntry *dictAddOrFind(dict *d, void *key __stored_key);
 int dictReplace(dict *d, void *key __stored_key, void *val);
 int dictDelete(dict *d, const void *key);
+int dictDeleteByHash(dict *d, const void *key, uint64_t hash);
 int dictDeleteByHashAndPtr(dict *d, const void *stored_key, uint64_t hash);
 dictEntry *dictUnlink(dict *d, const void *key);
+dictEntry *dictUnlinkByHash(dict *d, const void *key, uint64_t hash);
 void dictFreeUnlinkedEntry(dict *d, dictEntry *he);
 dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index);
 void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink llink, int table_index);
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
+dictEntry *dictFindByHash(dict *d, const void *key, uint64_t hash);
 dictEntry *dictFindByHashAndPtr(dict *d, const void *oldptr, const uint64_t hash);
 int dictShrinkIfNeeded(dict *d);
 void dictShrinkIfNeededAndComplete(dict *d);
@@ -310,6 +316,7 @@ void dictCombineStats(dictStats *from, dictStats *into);
 void dictFreeStats(dictStats *stats);
 
 dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
+dictEntryLink dictFindLinkByHash(dict *d, const void *key, uint64_t hash, dictEntryLink *bucket);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 

@@ -150,8 +150,8 @@ static void zbtScoreEncode(double d, uint8_t *enc, unsigned char *buf) {
  * the score is stored as a raw double so a later in-place write of any
  * double (ZUNIONSTORE aggregation) cannot overflow the allocation. When
  * 'usable' is not NULL it receives the usable size of the allocation. */
-zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
-                       int wide, size_t *usable)
+zbtElem *zbtCreateElemWithHash(double score, const char *buf, size_t len,
+                               int wide, size_t *usable, const uint64_t *known_hash)
 {
     uint8_t enc;
     unsigned char sbuf[8];
@@ -183,10 +183,16 @@ zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
     sds emb = sdsnewplacement(dst, sds_buf_size, sds_type, buf, len);
     serverAssert(emb == (sds)((char *)e + sds_offset));
     if (cache_hash) {
-        uint64_t hash = dictSdsHash(emb);
+        uint64_t hash = known_hash ? *known_hash : dictSdsHash(emb);
         memcpy(e->data + score_sz, &hash, sizeof(hash));
     }
     return e;
+}
+
+zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
+                       int wide, size_t *usable)
+{
+    return zbtCreateElemWithHash(score, buf, len, wide, usable, NULL);
 }
 
 /* Duplicate the complete packed representation. This preserves the source
@@ -721,11 +727,15 @@ static void zbtInsertElem(zbtree *t, zbtElem *e, size_t usable) {
     }
 }
 
-zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
+zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash) {
     size_t usable;
-    zbtElem *e = zbtCreateElem(score, ele, sdslen(ele), 0, &usable);
+    zbtElem *e = zbtCreateElemWithHash(score, ele, sdslen(ele), 0, &usable, known_hash);
     zbtInsertElem(t, e, usable);
     return e;
+}
+
+zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
+    return zbtInsertWithHash(t, score, ele, NULL);
 }
 
 /* Build a packed, balanced tree over 'elems[0..n)' in O(n). The elements must
@@ -2088,6 +2098,11 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(zbtHasCachedHash(large_elem));
         serverAssert(zbtGetCachedHash(large_elem) == dictSdsHash(large));
         serverAssert(!zbtHasCachedHash(small_elem));
+        uint64_t known = dictSdsHash(large);
+        zbtElem *again = zbtCreateElemWithHash(3, large, sdslen(large), 0, NULL, &known);
+        serverAssert(zbtHasCachedHash(again));
+        serverAssert(zbtGetCachedHash(again) == known);
+        zbtFreeElem(again);
         serverAssert(dictAdd(d, large_elem, NULL) == DICT_OK);
         serverAssert(dictAdd(d, small_elem, NULL) == DICT_OK);
 

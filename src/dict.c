@@ -75,7 +75,9 @@ static int _dictInit(dict *d, dictType *type);
 static dictEntryLink dictGetNextLink(dictEntry *de);
 static void dictSetNext(dictEntry *de, dictEntry *next);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
+static dictEntryLink dictFindLinkHashed(dict *d, const void *key, uint64_t hash, dictEntryLink *bucket);
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket);
+static dictEntry *dictGenericDeleteHashed(dict *d, const void *key, uint64_t hash, int nofree);
 dictEntryLink dictFindLinkForInsert(dict *d, const void *key, dictEntry **existing);
 static dictEntry *dictInsertKeyAtLink(dict *d, void *key __stored_key, dictEntryLink link);
 
@@ -624,7 +626,16 @@ dictEntry *dictAddNonExisting(dict *d, void *key __stored_key) {
  * Prefetches upcoming keys and destination buckets, and expands the table
  * once so it does not resize mid-batch. */
 #define DICT_ADD_BATCH_PREFETCH 8 /* Power of two: ring index is a mask. */
-void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n) {
+static uint64_t dictHashStoredOrKey(dict *d, void *key __stored_key,
+                                    dictStoredHashFunction hashStored)
+{
+    if (hashStored) return hashStored(key);
+    return dictGetHash(d, dictStoredKey2Key(d, key));
+}
+
+void dictAddNonExistingBatchHashed(dict *d, void **keys __stored_key, size_t n,
+                                   dictStoredHashFunction hashStored)
+{
     uint64_t hashes[DICT_ADD_BATCH_PREFETCH], hash;
     size_t i, primed;
     int htidx;
@@ -646,7 +657,7 @@ void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n) {
 
     primed = n < DICT_ADD_BATCH_PREFETCH ? n : DICT_ADD_BATCH_PREFETCH;
     for (i = 0; i < primed; i++) {
-        hashes[i] = dictGetHash(d, dictStoredKey2Key(d, keys[i]));
+        hashes[i] = dictHashStoredOrKey(d, keys[i], hashStored);
         idx = hashes[i] & DICTHT_SIZE_MASK(d->ht_size_exp[htidx]);
         redis_prefetch_write(&d->ht_table[htidx][idx]);
     }
@@ -665,12 +676,16 @@ void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n) {
 
         /* Hash the next window and prefetch its bucket. */
         if (i + DICT_ADD_BATCH_PREFETCH < n) {
-            hash = dictGetHash(d, dictStoredKey2Key(d, keys[i + DICT_ADD_BATCH_PREFETCH]));
+            hash = dictHashStoredOrKey(d, keys[i + DICT_ADD_BATCH_PREFETCH], hashStored);
             hashes[(i + DICT_ADD_BATCH_PREFETCH) & (DICT_ADD_BATCH_PREFETCH - 1)] = hash;
             idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[htidx]);
             redis_prefetch_write(&d->ht_table[htidx][idx]);
         }
     }
+}
+
+void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n) {
+    dictAddNonExistingBatchHashed(d, keys, n, NULL);
 }
 
 /* Add or Overwrite:
@@ -718,16 +733,15 @@ dictEntry *dictAddOrFind(dict *d, void *key __stored_key) {
 /* Search and remove an element. This is a helper function for
  * dictDelete() and dictUnlink(), please check the top comment
  * of those functions. */
-static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
+static dictEntry *dictGenericDeleteHashed(dict *d, const void *key, uint64_t h, int nofree) {
     dictCmpCache cmpCache = {0};
-    uint64_t h, idx;
+    uint64_t idx;
     dictEntry *he, *prevHe;
     int table;
 
     /* dict is empty */
     if (dictSize(d) == 0) return NULL;
 
-    h = dictGetHash(d, key);
     idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
 
     /* Rehash the hash table if needed */
@@ -763,10 +777,18 @@ static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
     return NULL; /* not found */
 }
 
+static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
+    return dictGenericDeleteHashed(d, key, dictGetHash(d, key), nofree);
+}
+
 /* Remove an element, returning DICT_OK on success or DICT_ERR if the
  * element was not found. */
 int dictDelete(dict *ht, const void *key) {
     return dictGenericDelete(ht,key,0) ? DICT_OK : DICT_ERR;
+}
+
+int dictDeleteByHash(dict *d, const void *key, uint64_t hash) {
+    return dictGenericDeleteHashed(d, key, hash, 0) ? DICT_OK : DICT_ERR;
 }
 
 /* Remove a stored key by identity using a hash computed when the key was
@@ -829,6 +851,10 @@ int dictDeleteByHashAndPtr(dict *d, const void *stored_key, uint64_t hash) {
  */
 dictEntry *dictUnlink(dict *d, const void *key) {
     return dictGenericDelete(d,key,1);
+}
+
+dictEntry *dictUnlinkByHash(dict *d, const void *key, uint64_t hash) {
+    return dictGenericDeleteHashed(d, key, hash, 1);
 }
 
 /* You need to call this function to really free the entry after a call
@@ -900,7 +926,7 @@ void dictRelease(dict *d)
  * 
  * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
  */
-static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
+static dictEntryLink dictFindLinkHashed(dict *d, const void *key, uint64_t hash, dictEntryLink *bucket) {
     dictCmpCache cmpCache = {0};
     dictEntryLink link;
     uint64_t idx;
@@ -913,7 +939,6 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
         if (dictSize(d) == 0) return NULL; 
     }
 
-    const uint64_t hash = dictGetHash(d, key);
     idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
     keyCmpFunc cmpFunc = dictGetCmpFunc(d);
 
@@ -939,9 +964,19 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
     return NULL;
 }
 
+static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
+    return dictFindLinkHashed(d, key, dictGetHash(d, key), bucket);
+}
+
 dictEntry *dictFind(dict *d, const void *key)
 {
     dictEntryLink link = dictFindLink(d, key, NULL);
+    return (link) ? *link : NULL;
+}
+
+dictEntry *dictFindByHash(dict *d, const void *key, uint64_t hash)
+{
+    dictEntryLink link = dictFindLinkByHash(d, key, hash, NULL);
     return (link) ? *link : NULL;
 }
 
@@ -1003,6 +1038,17 @@ dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket) {
         return NULL;
     
     return dictFindLinkInternal(d, key, bucket);
+}
+
+/* Like dictFindLink(), but uses a caller-supplied hash of 'key' so the key
+ * bytes are not hashed again. Unlike dictFindByHashAndPtr(), the key is still
+ * compared. */
+dictEntryLink dictFindLinkByHash(dict *d, const void *key, uint64_t hash, dictEntryLink *bucket) {
+    if (bucket) *bucket = NULL;
+    if (unlikely(dictSize(d) == 0))
+        return NULL;
+
+    return dictFindLinkHashed(d, key, hash, bucket);
 }
 
 /* Set the key with link 
@@ -2669,6 +2715,54 @@ int dictTest(int argc, char **argv, int flags) {
         for (long i = 0; i < seed + n; i++) {
             char *probe = stringFromLongLong(i);
             assert(dictFind(d, probe) != NULL);
+            zfree(probe);
+        }
+        zfree(keys);
+        dictRelease(d);
+    }
+
+    TEST("precomputed-hash find/link/unlink and hashed batch insert") {
+        dictType dt = BenchmarkDictType;
+        dt.no_value = 1;
+        dict *d = dictCreate(&dt);
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+
+        char *a = stringFromLongLong(1);
+        char *b = stringFromLongLong(2);
+        char *c = stringFromLongLong(3);
+        uint64_t ha = hashCallback(a);
+        uint64_t hb = hashCallback(b);
+        uint64_t hc = hashCallback(c);
+
+        assert(dictAdd(d, a, NULL) == DICT_OK);
+        assert(dictAdd(d, b, NULL) == DICT_OK);
+
+        dictEntryLink bucket = NULL;
+        assert(dictFindByHash(d, a, ha) != NULL);
+        assert(dictFindByHash(d, c, hc) == NULL);
+        assert(dictFindLinkByHash(d, b, hb, &bucket) != NULL);
+        assert(bucket != NULL);
+        assert(dictFindLinkByHash(d, c, hc, &bucket) == NULL);
+        assert(bucket != NULL);
+        dictSetKeyAtLink(d, c, &bucket, 1);
+        assert(dictFindByHash(d, c, hc) != NULL);
+
+        dictEntry *de = dictUnlinkByHash(d, a, ha);
+        assert(de != NULL);
+        dictFreeUnlinkedEntry(d, de);
+        assert(dictFindByHash(d, a, ha) == NULL);
+        assert(dictDeleteByHash(d, b, hb) == DICT_OK);
+        assert(dictDeleteByHash(d, c, hc) == DICT_OK);
+
+        long n = 100;
+        void **keys = zmalloc(sizeof(void *) * n);
+        for (long i = 0; i < n; i++) keys[i] = stringFromLongLong(1000 + i);
+        dictAddNonExistingBatchHashed(d, keys, n, hashCallback);
+        assert((long)dictSize(d) == n);
+        for (long i = 0; i < n; i++) {
+            char *probe = stringFromLongLong(1000 + i);
+            uint64_t h = hashCallback(probe);
+            assert(dictFindByHash(d, probe, h) != NULL);
             zfree(probe);
         }
         zfree(keys);
