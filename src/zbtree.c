@@ -981,33 +981,129 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
         zbtUpdateToRoot(t, (zbtNode *)lf);
 }
 
+/* Whether the re-scored member at slot 'idx' of 'lf' still sorts inside it.
+ * The member does not change and its key only moves one way, so only the end
+ * of the leaf that 'up' selects can be crossed and one comparison settles it.
+ *
+ * That comparison is made against the leaf's own extreme rather than the
+ * neighbour leaf's, which answers "stays" for everything short of the very
+ * last slot on that side and reaches the element through a pointer the caller
+ * already scanned past. Consulting the neighbour instead is exact, but it has
+ * to walk into a second leaf for its count and its end slot - three dependent
+ * misses where this has one, on a check that a score update far outside the
+ * leaf pays for nothing. The neighbour is only asked when the moving element
+ * is itself the extreme and the leaf has no answer. Being one slot short of
+ * exact costs an occasional needless slow path, never a wrong placement. */
+static int zbtLeafHolds(zbtLeaf *lf, int idx, double score, sds ele, int up) {
+    int last = (int)lf->n.count - 1;
+    if (up) {
+        if (idx < last) return zbtCompare(score, ele, lf->elems[last]) < 0;
+        zbtLeaf *n = lf->next;
+        return n == NULL || zbtCompare(score, ele, n->elems[0]) < 0;
+    }
+    if (idx > 0) return zbtCompare(score, ele, lf->elems[0]) > 0;
+    zbtLeaf *p = lf->prev;
+    return p == NULL || zbtCompare(score, ele, p->elems[p->n.count - 1]) > 0;
+}
+
+/* Move the element occupying slot 'idx' of 'lf' to the slot its new key
+ * (score,ele) calls for, storing 'e' there ('e' is the element itself, or its
+ * relocated copy). The caller has established that the key stays in this leaf.
+ *
+ * The rest of the leaf is untouched and still sorted, and 'up' says which way
+ * the one moved key went, so the destination is bisected on that side alone:
+ * one comparison when the element keeps its slot, at most
+ * log2(ZBT_LEAF_MAX) + 1 when it does not. Returns the new slot. */
+static int zbtLeafMoveSlot(zbtLeaf *lf, int idx, zbtElem *e, double score,
+                           sds ele, int up)
+{
+    int last = (int)lf->n.count - 1;
+
+    if (up && idx < last && zbtCompare(score, ele, lf->elems[idx + 1]) > 0) {
+        /* Largest slot in (idx, last] the key still sorts after. */
+        int lo = idx + 1, hi = last;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >> 1;
+            if (zbtCompare(score, ele, lf->elems[mid]) > 0) lo = mid;
+            else hi = mid - 1;
+        }
+        memmove(&lf->elems[idx], &lf->elems[idx + 1],
+                (lo - idx) * sizeof(zbtElem *));
+        lf->elems[lo] = e;
+        return lo;
+    }
+    if (!up && idx > 0 && zbtCompare(score, ele, lf->elems[idx - 1]) < 0) {
+        /* Smallest slot in [0, idx) the key sorts before. */
+        int lo = 0, hi = idx - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (zbtCompare(score, ele, lf->elems[mid]) < 0) hi = mid;
+            else lo = mid + 1;
+        }
+        memmove(&lf->elems[lo + 1], &lf->elems[lo],
+                (idx - lo) * sizeof(zbtElem *));
+        lf->elems[lo] = e;
+        return lo;
+    }
+    lf->elems[idx] = e;
+    return idx;
+}
+
 /* Move an existing element to reflect a new score. Returns the (possibly
  * reallocated) element: a width change allocates a new object, and the
  * caller must rewire the ZSET dict key when the pointer changes. */
 zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
-    /* Detach, rewrite the score, reinsert. The dict maps member -> elem and
-     * the member is unchanged, so only the tree position (and possibly the
-     * allocation) changes. */
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = e->leaf;
     int idx = zbtLeafFindPtr(lf, e);
     serverAssert(idx >= 0);
 
+    uint8_t newenc;
+    unsigned char newbuf[8];
+    zbtScoreEncode(newscore, &newenc, newbuf);
+    size_t old_usable = zmalloc_usable_size(e);
+    int same_width = zbtScoreEncSize(newenc) == zbtScoreEncSize(e->enc);
+    int up = newscore > zbtGetScore(e);
+
+    /* Fast path: the element does not leave the leaf it already names. A
+     * score bump that stays inside one leaf's key window - what ZINCRBY on a
+     * leaderboard does over and over - then costs a reshuffle of a packed
+     * pointer array, with no root-to-leaf descent to find the new home, no
+     * occupancy change, and so no rebalance or split. */
+    if (zbtLeafHolds(lf, idx, newscore, ele, up)) {
+        zbtElem *ne = e;
+        if (same_width) {
+            e->enc = newenc;
+            memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
+        } else {
+            size_t new_usable;
+            ne = zbtCreateElem(newscore, ele, sdslen(ele), 0, &new_usable);
+            ne->leaf = lf;
+            zfree_with_size(e, old_usable);
+            t->alloc_size = t->alloc_size - old_usable + new_usable;
+            ele = zbtGetEle(ne);
+        }
+        int at = zbtLeafMoveSlot(lf, idx, ne, newscore, ele, up);
+        /* Only the leaf minimum is visible to the ancestors, and only sep[]
+         * can have changed: the element count did not. */
+        if (idx == 0 || at == 0) zbtUpdateToRoot(t, (zbtNode *)lf);
+        return ne;
+    }
+
+    /* Slow path: detach, rewrite the score, reinsert. The dict maps member ->
+     * elem and the member is unchanged, so only the tree position (and
+     * possibly the allocation) changes. */
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
     lf->n.count--;
     t->length--;
-    size_t old_usable = zmalloc_usable_size(e);
     t->alloc_size -= old_usable;
     if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
         zbtRebalanceLeaf(t, lf);
     else
         zbtUpdateToRoot(t, (zbtNode *)lf);
 
-    uint8_t newenc;
-    unsigned char newbuf[8];
-    zbtScoreEncode(newscore, &newenc, newbuf);
-    if (zbtScoreEncSize(newenc) == zbtScoreEncSize(e->enc)) {
+    if (same_width) {
         e->enc = newenc;
         memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
         zbtInsertElem(t, e, old_usable);
@@ -1432,28 +1528,33 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
  * Range deletion (also removes the members from the ZSET dict)
  *----------------------------------------------------------------------------*/
 
-/* Delete every element whose 1-based rank falls in [first, last] (inclusive),
+/* Delete 'want' consecutive elements starting at slot 'idx' of leaf 'lf',
  * removing each member from the companion dict 'd' as well.
  *
  * Instead of locating and rebalancing once per element (O(K log N)), this
- * removes a whole leaf slice per structural pass: at most one O(log N) rank
- * lookup and one rebalance per touched leaf, giving O(K + (K/leaf) * log N). */
-static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
-                                        unsigned long last, dict *d) {
+ * removes a whole leaf slice per structural pass: one rebalance per touched
+ * leaf. The slice that follows is not looked up by rank either - the first
+ * survivor past the current slice is picked up before the removal and names
+ * its own leaf afterwards. Rebalancing relocates elements between leaves but
+ * never frees them, and re-stamps the back-pointer of every one it moves, so
+ * that hand-off stays valid across the merge that may consume 'lf' itself.
+ * The whole deletion is therefore O(K + K/leaf) with a single descent, done
+ * by the caller, for the starting position. */
+static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
+                                     unsigned long want, dict *d) {
     unsigned long removed = 0;
-    if (last > t->length) last = t->length;
 
-    while (first <= last) {
-        zbtIter it;
-        zbtElem *e = zbtElemByRank(t, first, &it);
-        if (!e) break;
-        zbtLeaf *lf = (zbtLeaf *)it.leaf;
-        int idx = it.idx;
-
+    while (want > 0) {
         /* Delete the contiguous in-range slice contained in this leaf. */
         int avail = (int)lf->n.count - idx;
-        long want = (long)(last - first + 1);
-        int take = (want < avail) ? (int)want : avail;
+        int take = ((unsigned long)avail > want) ? (int)want : avail;
+
+        /* The element that takes over the position we are deleting from. */
+        zbtElem *next = NULL;
+        if ((unsigned long)take < want) {
+            if (idx + take < (int)lf->n.count) next = lf->elems[idx + take];
+            else if (lf->next) next = lf->next->elems[0];
+        }
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
@@ -1467,38 +1568,60 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
         lf->n.count -= take;
         t->length -= take;
         removed += take;
-        /* We removed 'take' elements starting at rank 'first'; the next
-         * survivor now occupies rank 'first', so keep 'first' and shrink the
-         * remaining window from the top. */
-        last -= take;
+        want -= take;
 
         if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
             zbtRebalanceLeaf(t, lf);
         else
             zbtUpdateToRoot(t, (zbtNode *)lf);
+
+        if (next == NULL) break;
+        lf = next->leaf;
+        idx = zbtLeafFindPtr(lf, next);
+        serverAssert(idx >= 0);
     }
     return removed;
 }
 
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
+/* Delete every element whose 1-based rank falls in [first, last] (inclusive). */
+static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
+                                        unsigned long last, dict *d) {
+    if (last > t->length) last = t->length;
+    if (first > last) return 0;
+
+    zbtIter it;
+    if (zbtElemByRank(t, first, &it) == NULL) return 0;
+    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, last - first + 1, d);
+}
+
+/* Delete the elements between two boundaries of the sorted order. The
+ * boundary descent already landed on the first element to remove, so it is
+ * handed over directly instead of being looked up again by rank. */
+static unsigned long zbtDeleteBoundaryRange(zbtree *t,
+                                            zbtBeforeFn before_lo, void *lo_arg,
+                                            zbtBeforeFn before_hi, void *hi_arg,
+                                            dict *d) {
     if (t->length == 0) return 0;
+    zbtBoundary lo, hi;
+    zbtFindBoundary(t, before_lo, lo_arg, &lo);
+    zbtFindBoundary(t, before_hi, hi_arg, &hi);
+    if (lo.count >= hi.count) return 0;
+
+    zbtIter it;
+    if (zbtBoundaryNext(&lo, &it) == NULL) return 0;
+    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, hi.count - lo.count, d);
+}
+
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
     double minv = range->min, maxv = range->max;
-    unsigned long before = range->minex ?
-        zbtCountBefore(t, beforeScoreLe, &minv) :
-        zbtCountBefore(t, beforeScoreLt, &minv);
-    unsigned long upto = range->maxex ?
-        zbtCountBefore(t, beforeScoreLt, &maxv) :
-        zbtCountBefore(t, beforeScoreLe, &maxv);
-    if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteBoundaryRange(t,
+        range->minex ? beforeScoreLe : beforeScoreLt, &minv,
+        range->maxex ? beforeScoreLt : beforeScoreLe, &maxv, d);
 }
 
 unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d) {
-    if (t->length == 0) return 0;
-    unsigned long before = zbtCountBefore(t, beforeNotGteMin, range);
-    unsigned long upto = zbtCountBefore(t, beforeLteMax, range);
-    if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteBoundaryRange(t, beforeNotGteMin, range,
+                                  beforeLteMax, range, d);
 }
 
 /* Delete elements whose 1-based rank is in [start, end] (inclusive). */
@@ -1520,7 +1643,9 @@ void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe) {
     serverAssert(idx >= 0);
     lf->elems[idx] = newe;
     newe->leaf = lf;
-    zbtUpdateToRoot(t, (zbtNode *)lf);
+    /* Ancestors only ever reference a leaf through its minimum, so nothing
+     * above can be holding 'olde' unless it sat in slot 0. */
+    if (idx == 0) zbtUpdateToRoot(t, (zbtNode *)lf);
 }
 
 static zbtNode *zbtDefragNode(zbtNode *n, void *(*fn)(void *)) {
@@ -2226,6 +2351,57 @@ int zbtreeTest(int argc, char **argv, int flags) {
         zfree(elems);
         zbtFree(bt);
         test_cond("Compact score encoding width boundaries", 1);
+    }
+
+    /* --- Score updates, in-leaf and leaf-crossing --- */
+    {
+        const int M = 5000;
+        zbtElem **el = zmalloc(sizeof(zbtElem *) * M);
+        zbtree *bt = zbtCreate();
+        /* Spread the scores so a small delta keeps the element in its leaf
+         * and a large one has somewhere else to land. */
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "up:%08d", i);
+            sds s = sdsnew(buf);
+            el[i] = zbtInsert(bt, (double)i * 16, s);
+            sdsfree(s);
+        }
+        zbtDebugVerify(bt);
+
+        unsigned long seed = 987654321;
+        for (int round = 0; round < 20000; round++) {
+            seed = seed * 1103515245 + 12345;
+            int i = (int)((seed >> 16) % M);
+            seed = seed * 1103515245 + 12345;
+            long span = (long)((seed >> 16) % 4001) - 2000;
+            /* Mostly nudges that stay inside one leaf, with occasional jumps
+             * across the tree, and fractions to change the score width. */
+            double want = zbtGetScore(el[i]) + (double)(round % 8 ? span % 24 : span * 37);
+            if (round % 7 == 0) want += 0.5;
+
+            el[i] = zbtUpdateScore(bt, el[i], want);
+            serverAssert(zbtGetScore(el[i]) == want);
+            serverAssert(zbtRankByElem(bt, el[i]) ==
+                         zbtGetRank(bt, want, zbtGetEle(el[i])));
+            if (round % 512 == 0) zbtDebugVerify(bt);
+        }
+        zbtDebugVerify(bt);
+        serverAssert(bt->length == (unsigned long)M);
+
+        /* Ranks are dense and the iteration order matches them. */
+        zbtIter it;
+        unsigned long rank = 0;
+        for (zbtElem *e = zbtFirst(bt, &it); e; e = zbtIterNext(&it)) {
+            rank++;
+            serverAssert(zbtRankByElem(bt, e) == rank);
+            serverAssert(zbtElemByRank(bt, rank, NULL) == e);
+        }
+        serverAssert(rank == (unsigned long)M);
+
+        zfree(el);
+        zbtFree(bt);
+        test_cond("Score update keeps order, ranks and structure", 1);
     }
 
     /* Range endpoint lookups, against a linear reference. Both directions of
