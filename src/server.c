@@ -4057,8 +4057,36 @@ static void propagatePendingCommands(long totalDuration) {
  * currently with respect to replication and post jobs, but in the future there might
  * be other considerations. So we basically want the `postUnitOperations` to trigger
  * after the entire chain finished. */
+/* Whether any of the four things postExecutionUnitOperationsEx() does has
+ * something to do. Each callee already checks its own condition and returns
+ * early, so this is a hoist of those checks to a single branch: the empty
+ * path -- every plain read, and every sub-command of a MULTI or a script --
+ * stops here instead of paying four out-of-line calls to discover there is
+ * nothing queued.
+ *
+ * It MUST stay an OR of every condition checked inside the callees; dropping
+ * a term does not slow anything down, it silently skips real pending work.
+ * The producers of each piece of state are, respectively:
+ *   RM_AddPostNotificationJob() / RM_AddPostNotificationJobForKey(),
+ *   alsoPropagate() (incl. alsoPropagateForced(), which is how lazy expire
+ *   and eviction propagate their DEL/UNLINK), RM_Yield(), and anything that
+ *   advances server.master_repl_offset (see replicaOutputBuffersNeedFlush(),
+ *   which is a threshold and not an emptiness test). */
+static inline int hasPendingExecutionUnitWork(void) {
+    return moduleHasPostExecUnitJobs() ||
+           server.also_propagate.numops ||
+           server.busy_module_yield_flags ||
+           replicaOutputBuffersNeedFlush();
+}
+
 void postExecutionUnitOperationsEx(long duration) {
     if (server.execution_nesting)
+        return;
+
+    /* No branch hint here: most of the 8+ callers outside afterCommand()
+     * (expire.c, evict.c, db.c, cluster*.c, module.c) call this right after
+     * queuing a propagation, so the condition is typically true for them. */
+    if (!hasPendingExecutionUnitWork())
         return;
 
     firePostExecutionUnitJobs();
@@ -4495,28 +4523,51 @@ void afterCommand(client *c) {
 }
 
 static void afterCommandEx(client *c, long duration, int ops_before) {
-    /* Nested call (script / RM_Call): stamp only UNKNOWN ops this call
-     * queued so leftover does not land on an outer command's UNKNOWN.
-     * Skip when AOF is off: leftover is only consumed by feedAppendOnlyFile. */
-    if (server.aof_state != AOF_OFF &&
-        server.execution_nesting &&
-        server.also_propagate.numops > ops_before)
-    {
-        assignLeftoverDurationToUnknownOps(ops_before, duration);
+    /* Nothing below has anything to do unless one of these is pending, and on
+     * the common path none of them is: this runs after every command at every
+     * nesting level, so also once per MULTI sub-command and once per
+     * redis.call() in a script. Skipping the block saves the calls, not just
+     * their bodies -- most of this text is never touched on a plain read.
+     *
+     * The first two terms cover the work done here directly (pending tracking
+     * invalidations, queued push messages); hasPendingExecutionUnitWork()
+     * covers everything postExecutionUnitOperationsEx() would do, and its
+     * also_propagate.numops term also covers the leftover-duration stamping
+     * below, which needs numops > ops_before >= 0. */
+    int pending = unlikely(trackingHasPendingKeyInvalidations() ||
+                           listLength(server.pending_push_messages) ||
+                           hasPendingExecutionUnitWork());
+    if (pending) {
+        /* Nested call (script / RM_Call): stamp only UNKNOWN ops this call
+         * queued so leftover does not land on an outer command's UNKNOWN.
+         * Skip when AOF is off: leftover is only consumed by feedAppendOnlyFile. */
+        if (server.aof_state != AOF_OFF &&
+            server.execution_nesting &&
+            server.also_propagate.numops > ops_before)
+        {
+            assignLeftoverDurationToUnknownOps(ops_before, duration);
+        }
+
+        /* Should be done before trackingHandlePendingKeyInvalidations so that we
+         * reply to client before invalidating cache (makes more sense) */
+        postExecutionUnitOperationsEx(duration);
+
+        /* Flush pending tracking invalidations. */
+        trackingHandlePendingKeyInvalidations();
     }
 
-    /* Should be done before trackingHandlePendingKeyInvalidations so that we
-     * reply to client before invalidating cache (makes more sense) */
-    postExecutionUnitOperationsEx(duration);
-
-    /* Flush pending tracking invalidations. */
-    trackingHandlePendingKeyInvalidations();
-
+    /* Not deferrable work: must run for every command while slot stats are on.
+     * Kept between the invalidation flush and the push-message join, exactly
+     * where it was: listJoin() does not touch net_output_bytes_curr_cmd, but
+     * nothing here needs that to be true. */
     clusterSlotStatsAddNetworkBytesOutForUserClient(c);
 
     /* Flush other pending push messages. only when we are not in nested call.
-     * So the messages are not interleaved with transaction response. */
-    if (!server.execution_nesting)
+     * So the messages are not interleaved with transaction response.
+     * 'pending' is re-used rather than re-tested: the block above can itself
+     * queue push messages (sendTrackingMessage() on a CLIENT_PUSHING current
+     * client), while if it did not run the list was empty and still is. */
+    if (pending && !server.execution_nesting)
         listJoin(c->reply, server.pending_push_messages);
 
     /* Run debug assertions if any are enabled */

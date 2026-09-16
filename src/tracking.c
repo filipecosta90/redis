@@ -430,6 +430,15 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
     raxRemove(TrackingTable,(unsigned char*)key,keylen,NULL);
 }
 
+/* Whether any key invalidation is waiting to be sent to tracking clients.
+ * Read through this accessor so callers do not need to know how
+ * server.tracking_pending_keys is represented. Note this deliberately does
+ * not test server.execution_nesting: trackingHandlePendingKeyInvalidations()
+ * keeps that check itself, so a nested call must still reach it. */
+int trackingHasPendingKeyInvalidations(void) {
+    return listLength(server.tracking_pending_keys) != 0;
+}
+
 void trackingHandlePendingKeyInvalidations(void) {
     if (!listLength(server.tracking_pending_keys)) return;
 

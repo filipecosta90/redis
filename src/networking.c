@@ -5618,14 +5618,25 @@ void flushSlavesOutputBuffers(void) {
  * during the loop feeds the replica as data is produced, so the buffer stays
  * small and the replica keeps up. */
 #define REPL_FLUSH_THRESHOLD (1024*1024)
-void flushSlavesOutputBuffersIfNeeded(void) {
+
+/* Whether flushSlavesOutputBuffersIfNeeded() would flush anything right now.
+ * Unlike the other post-execution-unit conditions this one is a size
+ * threshold, not queue emptiness: server.master_repl_offset can advance
+ * without any of them being set (a replication PING from replicationCron(),
+ * a GETACK, the sub-replica relay of the master stream). It is therefore an
+ * explicit term of the postExecutionUnitOperations() gate rather than
+ * something that gate can infer. Keep the condition here only, so caller and
+ * callee cannot drift apart. */
+int replicaOutputBuffersNeedFlush(void) {
     /* Only with io threads off. When on, replicas are written from a separate 
      * thread in parallel, so they keep up on their own even under load. */
-    if (server.io_threads_num <= 1 && listLength(server.slaves) &&
-        server.master_repl_offset - server.repl_last_flush_offset > REPL_FLUSH_THRESHOLD)
-    {
+    return server.io_threads_num <= 1 && listLength(server.slaves) &&
+           server.master_repl_offset - server.repl_last_flush_offset > REPL_FLUSH_THRESHOLD;
+}
+
+void flushSlavesOutputBuffersIfNeeded(void) {
+    if (replicaOutputBuffersNeedFlush())
         flushSlavesOutputBuffers();
-    }
 }
 
 /* Compute current paused actions and its end time, aggregated for

@@ -9529,6 +9529,14 @@ static void executePostExecUnitJob(RedisModulePostExecUnitJob *job) {
     zfree(job);
 }
 
+/* Whether any post-execution-unit job is queued. Read through this accessor
+ * so modulePostExecUnitJobs stays private to module.c; it exists to let
+ * postExecutionUnitOperations() skip the whole drain when there is nothing to
+ * drain. */
+int moduleHasPostExecUnitJobs(void) {
+    return listLength(modulePostExecUnitJobs) != 0;
+}
+
 void firePostExecutionUnitJobs(void) {
     /* Avoid propagation of commands.
      * In that way, postExecutionUnitOperations will prevent
