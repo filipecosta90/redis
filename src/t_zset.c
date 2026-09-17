@@ -50,6 +50,14 @@
 
 const void *zslGetNodeElementForDict(const void *node);
 
+/* The member sds is embedded in the node, but after the node's
+ * variable-length level array, so for a tall node it can sit on a later
+ * cache line than the node header the bucket walk already touched. Point
+ * the prefetcher's key-compare phase at it. */
+static void *zsetDictPrefetchEntryKey(const dictEntry *de) {
+    return (void *)zslGetNodeElementForDict(dictGetKey(de));
+}
+
 /* dictType for zset's dict (maps sds to zskiplistNode*) */
 dictType zsetDictType = {
     dictSdsHash,        /* hash function */
@@ -61,6 +69,7 @@ dictType zsetDictType = {
     NULL,               /* allow to expand */
     .no_value = 1,      /* no values stored (only nodes) */
     .keyFromStoredKey = zslGetNodeElementForDict,  /* extract embedded sds from node */
+    .prefetchEntryKey = zsetDictPrefetchEntryKey,
 };
 
 /*-----------------------------------------------------------------------------

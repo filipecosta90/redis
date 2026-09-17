@@ -47,7 +47,7 @@ typedef struct dictPrefetchLookup {
 
 /* dictPrefetcher drives a batch of dictPrefetchLookup objects through the
  * prefetch FSM, yielding to the next in-flight lookup each time a prefetch
- * is issued — so one lookup's memory stall overlaps another's work. The
+ * is issued -- so one lookup's memory stall overlaps another's work. The
  * state machine itself is fully dict-pure: any key/value payload prefetching
  * is delegated to the dictType->prefetchEntryKey / prefetchEntryValue
  * callbacks of each key's dict. The same prefetcher is used by both the
@@ -295,14 +295,14 @@ static void dictPrefetcherRun(dictPrefetcher *p) {
  *               dicts[k] = d;
  *           }
  *           dictPrefetchKeys(dicts, keys, n);
- *           // Now process these n keys — dict bucket / entry / key payload
+ *           // Now process these n keys -- dict bucket / entry / key payload
  *           // (and value payload, if dictType->prefetchEntryValue is set)
  *           // are warm in cache.
  *       }
  *   }
  * ----------------------------------------------------------------------- */
 void dictPrefetchKeys(dict **dicts, void **keys, size_t nkeys) {
-    /* Single-key prefetch has no benefit — nothing to interleave with.
+    /* Single-key prefetch has no benefit -- nothing to interleave with.
      * Callers passing nkeys==1 (e.g. tail of a multi-key batch) should
      * fall through to a direct lookup. */
     if (nkeys <= 1) return;
@@ -400,7 +400,7 @@ void resetCommandsBatch(void) {
 }
 
 /* Prefetching in very small batches tends to be ineffective because the technique
- * relies on a small gap—typically a few CPU cycles—between issuing the prefetch
+ * relies on a small gap--typically a few CPU cycles--between issuing the prefetch
  * and performing the actual memory access. If the batch is too small, this delay
  * cannot be effectively inserted, and the prefetching yields little to no benefit.
  *
@@ -432,10 +432,11 @@ int determinePrefetchCount(int len) {
  * above just prefetched them), so resolving each key here is cheap, and the
  * N inner lookups then overlap with each other instead of serialising.
  *
- * Only single-field reads of an OBJ_ENCODING_HT hash qualify: a listpack
- * hash has no inner dict, and a multi-field command would need more slots
- * than the batch has. Rehashing is paused around the lookup so this stays a
- * read — the command itself will do the real lookup a moment later. */
+ * Only single-member reads of a collection that keeps a dict qualify --
+ * HGET on OBJ_ENCODING_HT and ZSCORE on OBJ_ENCODING_SKIPLIST. A listpack
+ * hash or zset has no inner dict, and a multi-member command would need
+ * more slots than the batch has. Rehashing is paused around the lookup so this stays a
+ * read -- the command itself will do the real lookup a moment later. */
 static void prefetchNestedFields(void) {
     dict *dicts[DICT_PREFETCH_MAX_SIZE];
     void *keys[DICT_PREFETCH_MAX_SIZE];
@@ -447,10 +448,11 @@ static void prefetchNestedFields(void) {
              pcmd != NULL && n < DICT_PREFETCH_MAX_SIZE;
              pcmd = pcmd->next)
         {
-            /* Only commands this batch actually took, and only the HGET shape:
-             * HGET <key> <field>, one key, argv[2] is the field. */
+            /* Only commands this batch actually took, and only the
+             * <cmd> <key> <member> shape, where argv[2] is the member. */
             if (!(pcmd->flags & PENDING_CMD_KEYS_PREFETCHED)) break;
-            if (!pcmd->cmd || pcmd->cmd->proc != hgetCommand) continue;
+            if (!pcmd->cmd) continue;
+            if (pcmd->cmd->proc != hgetCommand && pcmd->cmd->proc != zscoreCommand) continue;
             if (pcmd->argc != 3 || pcmd->keys_result.numkeys != 1) continue;
 
             dict *keyspace = kvstoreGetDict(c->db->keys, pcmd->slot > 0 ? pcmd->slot : 0);
@@ -462,15 +464,20 @@ static void prefetchNestedFields(void) {
             if (!de) continue;
 
             kvobj *kv = dictGetKey(de);
-            if (kv->type != OBJ_HASH || kv->encoding != OBJ_ENCODING_HT) continue;
+            dict *inner = NULL;
+            if (kv->type == OBJ_HASH && kv->encoding == OBJ_ENCODING_HT)
+                inner = kv->ptr;
+            else if (kv->type == OBJ_ZSET && kv->encoding == OBJ_ENCODING_SKIPLIST)
+                inner = ((zset *)kv->ptr)->dict;
+            if (!inner) continue;
 
-            dicts[n] = kv->ptr;
+            dicts[n] = inner;
             keys[n] = pcmd->argv[2]->ptr;
             n++;
         }
     }
 
-    /* dictPrefetchKeys() already ignores a batch of one — nothing to overlap. */
+    /* dictPrefetchKeys() already ignores a batch of one -- nothing to overlap. */
     dictPrefetchKeys(dicts, keys, n);
 }
 
@@ -515,7 +522,7 @@ void prefetchCommands(void) {
      * Prefetching is beneficial only if there are more than one key. */
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
-        /* Prefetch keys from the main dict — value-side prefetch (if any)
+        /* Prefetch keys from the main dict -- value-side prefetch (if any)
          * is driven by dbDictType->prefetchEntryValue. */
         dictPrefetcherReset(&batch->prefetcher, batch->keys_dicts, batch->keys, batch->key_count);
         dictPrefetcherRun(&batch->prefetcher);
