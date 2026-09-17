@@ -421,6 +421,59 @@ int determinePrefetchCount(int len) {
  * 2. Prefetch the io_deferred_objects for all clients.
  * 3. Prefetch the keys and values for all commands in the current batch from
  *    the main dictionaries. */
+/* A single HGET on a hashtable-encoded hash misses memory twice, and the
+ * second miss cannot start until the first one lands: once in the main
+ * keyspace dict, and again in the hash's own dict. The batch prefetch above
+ * only covers the first of those, so with N pipelined HGETs against a hash
+ * that does not fit in cache, the inner-dict misses are still paid one at a
+ * time.
+ *
+ * Issue them as a second batch. The outer keys are warm by now (the run
+ * above just prefetched them), so resolving each key here is cheap, and the
+ * N inner lookups then overlap with each other instead of serialising.
+ *
+ * Only single-field reads of an OBJ_ENCODING_HT hash qualify: a listpack
+ * hash has no inner dict, and a multi-field command would need more slots
+ * than the batch has. Rehashing is paused around the lookup so this stays a
+ * read — the command itself will do the real lookup a moment later. */
+static void prefetchNestedFields(void) {
+    dict *dicts[DICT_PREFETCH_MAX_SIZE];
+    void *keys[DICT_PREFETCH_MAX_SIZE];
+    size_t n = 0;
+
+    for (size_t i = 0; i < batch->client_count && n < DICT_PREFETCH_MAX_SIZE; i++) {
+        client *c = batch->clients[i];
+        for (pendingCommand *pcmd = c->pending_cmds.head;
+             pcmd != NULL && n < DICT_PREFETCH_MAX_SIZE;
+             pcmd = pcmd->next)
+        {
+            /* Only commands this batch actually took, and only the HGET shape:
+             * HGET <key> <field>, one key, argv[2] is the field. */
+            if (!(pcmd->flags & PENDING_CMD_KEYS_PREFETCHED)) break;
+            if (!pcmd->cmd || pcmd->cmd->proc != hgetCommand) continue;
+            if (pcmd->argc != 3 || pcmd->keys_result.numkeys != 1) continue;
+
+            dict *keyspace = kvstoreGetDict(c->db->keys, pcmd->slot > 0 ? pcmd->slot : 0);
+            if (!keyspace || dictSize(keyspace) == 0) continue;
+
+            dictPauseRehashing(keyspace);
+            dictEntry *de = dictFind(keyspace, pcmd->argv[1]->ptr);
+            dictResumeRehashing(keyspace);
+            if (!de) continue;
+
+            kvobj *kv = dictGetKey(de);
+            if (kv->type != OBJ_HASH || kv->encoding != OBJ_ENCODING_HT) continue;
+
+            dicts[n] = kv->ptr;
+            keys[n] = pcmd->argv[2]->ptr;
+            n++;
+        }
+    }
+
+    /* dictPrefetchKeys() already ignores a batch of one — nothing to overlap. */
+    dictPrefetchKeys(dicts, keys, n);
+}
+
 void prefetchCommands(void) {
     if (!batch || server.loading) return;
 
@@ -466,6 +519,9 @@ void prefetchCommands(void) {
          * is driven by dbDictType->prefetchEntryValue. */
         dictPrefetcherReset(&batch->prefetcher, batch->keys_dicts, batch->keys, batch->key_count);
         dictPrefetcherRun(&batch->prefetcher);
+
+        /* Then the nested dicts of the collections those keys point at. */
+        prefetchNestedFields();
     }
 }
 
