@@ -161,6 +161,15 @@ int sortCompare(const void *s1, const void *s2) {
                     cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
                 }
             }
+            /* The weights compared equal (or both of them were missing): fall
+             * back to comparing the elements themselves, so that the result
+             * does not depend on the order the sorting vector happened to be
+             * built in. That order comes from a hash table for set and sorted
+             * set inputs, so without this the reply varies between server
+             * restarts and between a master and its replica. Same reason the
+             * numeric comparison above breaks its ties. */
+            if (cmp == 0)
+                cmp = compareStringObjects(so1->obj,so2->obj);
         } else {
             /* Compare elements directly. */
             if (server.sort_store) {
