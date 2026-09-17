@@ -51,7 +51,7 @@
 #define absv(n) ((n) < 0 ? -(n) : (n))
 #define minv(a, b) ((a) < (b) ? (a) : (b))
 
-static uint64_t tens[] = { 10000000000000000000U,
+static const uint64_t tens[] = { 10000000000000000000U,
                            1000000000000000000U,
                            100000000000000000U,
                            10000000000000000U,
@@ -176,8 +176,23 @@ static int generate_digits(Fp *fp, Fp *upper, Fp *lower, char *digits, int *K) {
     uint64_t part2 = upper->frac & (one.frac - 1);
 
     int idx = 0, kappa = 10;
-    uint64_t *divp;
+    const uint64_t *divp;
     /* 1000000000 */
+    /* Unrolling this loop lets the compiler see a literal divisor at every
+     * step and strength-reduce the division into a multiply+shift, the way it
+     * already does for the /10 and /100 in emit_digits() below. Left rolled it
+     * reads the divisor out of tens[] through a pointer, cannot prove its
+     * value, and emits a real division per step -- and this runs for every
+     * non-integral double that gets formatted (integral ones are sent to an
+     * integer formatter before they reach here). Both halves are needed: the
+     * table must be const for the unrolled loads to fold, and the unroll only
+     * pays at -O2, which is why this directory's Makefile sets OPT= -O2. At
+     * -Os gcc declines the multiply-high expansion on code-size grounds and
+     * this form emits ten real divisions -- still faster than the rolled loop
+     * here, but most of the win is gone, so do not lower that flag. */
+#if defined(__GNUC__)
+#pragma GCC unroll 10
+#endif
     for (divp = tens + 10; kappa > 0; divp++) {
         uint64_t div = *divp;
         unsigned digit = part1 / div;
@@ -199,7 +214,7 @@ static int generate_digits(Fp *fp, Fp *upper, Fp *lower, char *digits, int *K) {
     }
 
     /* 10 */
-    uint64_t *unit = tens + 18;
+    const uint64_t *unit = tens + 18;
 
     while (true) {
         part2 *= 10;

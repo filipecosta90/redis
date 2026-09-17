@@ -6,6 +6,7 @@ should be provided by the operating system.
 * **linenoise** is a readline replacement. It is developed by the same authors of Redis but is managed as a separated project and updated as needed.
 * **lua** is Lua 5.1 with minor changes for security and additional libraries.
 * **hdr_histogram** Used for per-command latency tracking histograms.
+* **fpconv** is a subset of https://github.com/night-shift/fpconv, used to format doubles (`d2string()`, `addReplyDouble()`). It carries local modifications — see the section below.
 
 How to upgrade the above dependencies
 ===
@@ -104,3 +105,25 @@ We use a customized version based on master branch commit e4448cf6d1cd08fff51981
 2. Copy updated files from newer version onto files in /hdr_histogram.
 3. Apply the changes from 1 above to the updated files.
 
+Fpconv
+---
+
+`deps/fpconv` is a subset of the C implementation at
+https://github.com/night-shift/fpconv, imported once and since modified locally.
+It is not tracked upstream, so **a re-import must re-apply these changes**:
+
+1. Headers renamed to `fpconv_dtoa.h` / `fpconv_powers.h` and reformatted at import.
+2. `generate_digits()`'s digit loop is annotated with `#pragma GCC unroll 10` and
+   its `tens[]` table is `const`, so the compiler sees a literal divisor at each
+   step and strength-reduces the division into a multiply+shift instead of
+   emitting a hardware divide per digit.
+3. `Makefile` builds at `OPT= -O2` rather than `-Os`, because at `-Os` gcc
+   declines the multiply-high expansion that item 2 exists to enable. Items 2
+   and 3 are load-bearing together; lowering the flag gives most of the win back.
+
+Upstream commit `8607e5ab6f06` ("fix possible buffer overflow with large
+negative numbers") is **not** applied here: every Redis caller passes a buffer of
+`MAX_D2STRING_CHARS` (128) or larger, so the condition it guards is not reachable
+from Redis. Note that `fpconv_dtoa()`'s prototype documents `char dest[24]` while
+the function can return 25 for large negative integer-valued doubles — do not take
+that `24` literally in new code.
