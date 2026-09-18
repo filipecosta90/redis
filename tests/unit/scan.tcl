@@ -486,6 +486,50 @@ proc test_scan {type} {
         }
     }
 
+    test "{$type} ZSCAN borrowed nodes with large binary members and queued deletion" {
+        r del mykey
+        set expected {}
+        set elements {}
+        for {set j 0} {$j < 512} {incr j} {
+            set member "member:$j:[string repeat x 300]\x00tail"
+            lappend elements [expr {$j / 7.0}] $member
+        }
+        r zadd mykey {*}$elements
+        assert_encoding skiplist mykey
+        foreach {score member} $elements {
+            dict set expected $member [r zscore mykey $member]
+        }
+
+        # Exercise stack and heap vector storage and MATCH filtering.
+        foreach count {1 256 1000} {
+            set cursor 0
+            set found {}
+            while 1 {
+                lassign [r zscan mykey $cursor COUNT $count MATCH member:*] cursor pairs
+                foreach {member score} $pairs {
+                    assert_equal [dict get $expected $member] $score
+                    dict set found $member $score
+                }
+                if {$cursor == 0} break
+            }
+            assert_equal [dict size $expected] [dict size $found]
+        }
+
+        # The output buffer must own the bytes after the command returns,
+        # even if a later command deletes every borrowed node before reading.
+        set rd [redis_deferring_client]
+        $rd zscan mykey 0 COUNT 10000
+        $rd del mykey
+        lassign [$rd read] cursor pairs
+        assert_equal 0 $cursor
+        assert_equal [dict size $expected] [dict size $pairs]
+        foreach {member score} $pairs {
+            assert_equal [dict get $expected $member] $score
+        }
+        assert_equal 1 [$rd read]
+        $rd close
+    }
+
     test "{$type} SCAN regression test for issue #4906" {
         for {set k 0} {$k < 100} {incr k} {
             r del set
