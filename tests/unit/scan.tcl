@@ -425,6 +425,33 @@ proc test_scan {type} {
         assert {$first_score != 0}
     }
 
+    test "{$type} ZSCAN large binary replies survive queued deletion" {
+        r del mykey
+        set expected {}
+        set elements {}
+        for {set j 0} {$j < 512} {incr j} {
+            set member "member:$j:[string repeat x 300]\x00tail"
+            dict set expected $member $j
+            lappend elements $j $member
+        }
+        r zadd mykey {*}$elements
+        assert_encoding skiplist mykey
+
+        # Exceed the stack vector's capacity and delete the nodes before
+        # reading the reply. The output buffer must own the returned bytes.
+        set rd [redis_deferring_client]
+        $rd zscan mykey 0 COUNT 1000
+        $rd del mykey
+        lassign [$rd read] cursor pairs
+        assert_equal 0 $cursor
+        assert_equal [dict size $expected] [dict size $pairs]
+        foreach {member score} $pairs {
+            assert_equal [dict get $expected $member] $score
+        }
+        assert_equal 1 [$rd read]
+        $rd close
+    }
+
     test "{$type} SCAN regression test for issue #4906" {
         for {set k 0} {$k < 100} {incr k} {
             r del set
