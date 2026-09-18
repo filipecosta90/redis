@@ -425,6 +425,38 @@ proc test_scan {type} {
         assert {$first_score != 0}
     }
 
+    foreach enc {listpack skiplist} {
+        test "{$type} ZSCAN scores use the same formatting as ZSCORE ($enc)" {
+            r del mykey
+            r zadd mykey 3.3 a 1 b 1.25 c -0.1 d 1e100 e 9.8813129168249309e-323 f
+            if {$enc eq {skiplist}} {
+                # Push the set past zset-max-listpack-entries.
+                set elements {}
+                for {set j 0} {$j < 200} {incr j} {
+                    lappend elements $j filler:$j
+                }
+                r zadd mykey {*}$elements
+            }
+            assert_encoding $enc mykey
+
+            set cur 0
+            set res {}
+            while 1 {
+                set reply [r zscan mykey $cur COUNT 50]
+                set cur [lindex $reply 0]
+                lappend res {*}[lindex $reply 1]
+                if {$cur == 0} break
+            }
+            assert_equal [expr {2 * [r zcard mykey]}] [llength $res]
+            foreach {member score} $res {
+                assert_equal [r zscore mykey $member] $score
+            }
+            # Shortest round-trip form, identical for both encodings.
+            assert_equal 3.3 [dict get $res a]
+            assert_equal 1 [dict get $res b]
+        }
+    }
+
     test "{$type} SCAN regression test for issue #4906" {
         for {set k 0} {$k < 100} {incr k} {
             r del set
