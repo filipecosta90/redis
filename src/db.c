@@ -1671,9 +1671,28 @@ typedef struct {
     int pattern_len;
     int use_pattern;
     unsigned long emitted;
+    int streaming;
+    void *cursor_reply;
+    void *replylen;
+    struct {
+        const unsigned char *ele;
+        size_t len;
+        double score;
+    } buffered[32];
 } zsetBtreeScanData;
 
-/* Add one B+ tree ZSCAN result after applying the optional MATCH pattern. */
+static void zsetBtreeScanAddReply(client *c, const unsigned char *ele,
+                                size_t len, double score)
+{
+    addReplyBulkCBuffer(c, ele, len);
+    char buf[MAX_D2STRING_CHARS];
+    int scorelen = d2string(buf, sizeof(buf), score);
+    addReplyBulkCBuffer(c, buf, scorelen);
+}
+
+/* Buffer small replies so their headers need no deferred reply nodes. The
+ * borrowed members remain valid throughout this read-only command. Larger
+ * replies switch to streaming, keeping temporary storage bounded. */
 static void zsetBtreeScanReply(void *privdata, const unsigned char *ele,
                                size_t len, double score)
 {
@@ -1682,10 +1701,23 @@ static void zsetBtreeScanReply(void *privdata, const unsigned char *ele,
         !stringmatchlen(data->pattern, data->pattern_len,
                         (char *)ele, len, 0))
         return;
-    addReplyBulkCBuffer(data->c, ele, len);
-    char buf[MAX_D2STRING_CHARS];
-    int scorelen = d2string(buf, sizeof(buf), score);
-    addReplyBulkCBuffer(data->c, buf, scorelen);
+    size_t capacity = sizeof(data->buffered) / sizeof(data->buffered[0]);
+    if (!data->streaming && data->emitted / 2 < capacity) {
+        size_t i = data->emitted / 2;
+        data->buffered[i].ele = ele;
+        data->buffered[i].len = len;
+        data->buffered[i].score = score;
+    } else {
+        if (!data->streaming) {
+            data->streaming = 1;
+            data->cursor_reply = addReplyDeferredLen(data->c);
+            data->replylen = addReplyDeferredLen(data->c);
+            for (size_t i = 0; i < capacity; i++)
+                zsetBtreeScanAddReply(data->c, data->buffered[i].ele,
+                                     data->buffered[i].len, data->buffered[i].score);
+        }
+        zsetBtreeScanAddReply(data->c, ele, len, score);
+    }
     data->emitted += 2;
 }
 
@@ -2040,16 +2072,24 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
         vecRelease(&keys);
         addReplyArrayLen(c, 2);
-        void *cursor_reply = addReplyDeferredLen(c);
-        void *replylen = addReplyDeferredLen(c);
-        zsetBtreeScanData data = {c, pat, patlen, use_pattern, 0};
+        zsetBtreeScanData data = {
+            .c = c, .pattern = pat, .pattern_len = patlen, .use_pattern = use_pattern
+        };
         uint64_t next = zbtreeScan(o->ptr, cursor, count,
                                    zsetBtreeScanReply, &data);
         char cursor_buf[LONG_STR_SIZE];
         int cursor_len = ull2string(cursor_buf, sizeof(cursor_buf), next);
-        setDeferredReplyBulkSds(c, cursor_reply,
-                                sdsnewlen(cursor_buf, cursor_len));
-        setDeferredArrayLen(c, replylen, data.emitted);
+        if (data.streaming) {
+            setDeferredReplyBulkSds(c, data.cursor_reply,
+                                    sdsnewlen(cursor_buf, cursor_len));
+            setDeferredArrayLen(c, data.replylen, data.emitted);
+        } else {
+            addReplyBulkCBuffer(c, cursor_buf, cursor_len);
+            addReplyArrayLen(c, data.emitted);
+            for (size_t i = 0; i < data.emitted / 2; i++)
+                zsetBtreeScanAddReply(c, data.buffered[i].ele,
+                                     data.buffered[i].len, data.buffered[i].score);
+        }
         return;
     } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) &&
                o->encoding == OBJ_ENCODING_LISTPACK)
