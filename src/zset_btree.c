@@ -176,17 +176,10 @@
 #define ZBT_EXTERNAL_RECORD_BYTES \
     (ZBT_EXTERNAL_POINTER_OFFSET + sizeof(void *))
 
-/* One ZSCAN cursor position covers this many buckets. This keeps the complete
- * 32 bit table revision while allowing 2^34 buckets to be visited (still far
- * beyond any realistic table size). Kept at 4 rather than the original 8: the
- * per-bucket-group cost is dominated by zbtIndexScanSlot()'s per-occupied-slot
- * leaf scan, and at this benchmark's ~49% table fill a group of 4 buckets
- * (~15.7 occupied slots) already comfortably exceeds the default COUNT=10, so
- * halving the group size roughly halves the number of those expensive scans
- * per call without changing SCAN's cursor-decode correctness (group is a
- * compile-time-uniform divisor, used identically by every encode and decode
- * within a running binary) or its completeness/duplicate-tolerance contract. */
-#define ZBT_SCAN_BUCKETS_PER_STEP 4
+/* One ZSCAN cursor position covers this many buckets. Keep the complete
+ * 32-bit table revision while allowing more buckets than any realistic table.
+ * Smaller groups reduce how far a scan can exceed the requested COUNT. */
+#define ZBT_SCAN_BUCKETS_PER_STEP 2
 
 /* Released score leaf IDs form a list in the leaf table. Allocations are
  * aligned, so the low bit distinguishes a list link from a live pointer. */
@@ -3967,7 +3960,7 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     return emitted;
 }
 
-/* The low half of the cursor is a group of eight buckets plus one; the high
+/* The low half of the cursor is a bucket-group index plus one; the high
  * half identifies the current table. A resize keeps the old table in place, so
  * the cursor remains valid while leaves are copied. Installing the new table
  * changes its revision and makes the next call restart. This can return
