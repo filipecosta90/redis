@@ -2047,8 +2047,10 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
                                    zsetBtreeScanReply, &data);
         char cursor_buf[LONG_STR_SIZE];
         int cursor_len = ull2string(cursor_buf, sizeof(cursor_buf), next);
-        setDeferredReplyBulkSds(c, cursor_reply,
-                                sdsnewlen(cursor_buf, cursor_len));
+        char cursor_reply_buf[LONG_STR_SIZE + 8];
+        int reply_len = snprintf(cursor_reply_buf, sizeof(cursor_reply_buf),
+                                 "$%d\r\n%s\r\n", cursor_len, cursor_buf);
+        setDeferredReply(c, cursor_reply, cursor_reply_buf, reply_len);
         setDeferredArrayLen(c, replylen, data.emitted);
         return;
     } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) &&
