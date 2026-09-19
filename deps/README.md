@@ -6,6 +6,14 @@ should be provided by the operating system.
 * **linenoise** is a readline replacement. It is developed by the same authors of Redis but is managed as a separated project and updated as needed.
 * **lua** is Lua 5.1 with minor changes for security and additional libraries.
 * **hdr_histogram** Used for per-command latency tracking histograms.
+* **fpconv** is the grisu2 double-to-string converter behind `d2string()`. Imported once
+  from https://github.com/night-shift/fpconv (2022-10-15) and not re-synced since;
+  upstream has been dormant since 2023-12-14. Our copy carries one local change: the
+  plain-integer branch of `emit_digits()` also bounds the emitted length, so
+  `fpconv_dtoa()` honours the 24-byte buffer its prototype documents. Upstream fixed the
+  same defect differently in 8607e5ab6f06 (lower the trailing-zero budget for negatives);
+  that variant also changes output for values that already fitted, so it was not taken
+  verbatim. Re-sync with care and keep the bound.
 
 How to upgrade the above dependencies
 ===

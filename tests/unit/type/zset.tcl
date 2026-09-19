@@ -2743,6 +2743,47 @@ start_server {tags {"zset"}} {
         r zscore zz dblmax
     } {1.7976931348623157e+308}
 
+    test {zset score formatting stays within fpconv's documented 24-byte bound} {
+        # fpconv_dtoa() documents char dest[24], but its plain-integer branch bounded
+        # only the trailing-zero count, not the emitted length, and ignored the '-'
+        # it had already written. Large negative integer-valued doubles emitted 25
+        # bytes; their positive counterparts emitted 24. Pin both sides so a
+        # regression shows up as a reply diff, not as a silent overflow in some
+        # future caller that trusts the prototype.
+        foreach enc {listpack skiplist} {
+            if {$enc eq "listpack"} {
+                r config set zset-max-listpack-entries 128
+            } else {
+                r config set zset-max-listpack-entries 0
+            }
+            r del zfmt
+            # 25 bytes before the fix -> scientific notation after it.
+            r zadd zfmt -1.5111572745182865e23 neg_overflow
+            # The positive of the very same value is 24 bytes and must not change.
+            r zadd zfmt 1.5111572745182865e23 pos_same
+            # 24 bytes with a '-': inside the bound, and must keep the plain form.
+            # (Upstream's variant of this fix rewrites this one too; ours does not.)
+            r zadd zfmt -9.999999999999999e22 neg_fits
+            assert_encoding $enc zfmt
+
+            assert_equal {-1.5111572745182865e+23} [r zscore zfmt neg_overflow]
+            assert_equal {151115727451828650000000} [r zscore zfmt pos_same]
+            assert_equal {-99999999999999990000000} [r zscore zfmt neg_fits]
+
+            foreach m {neg_overflow pos_same neg_fits} {
+                assert {[string length [r zscore zfmt $m]] <= 24}
+            }
+
+            # The reply must survive an RDB round-trip byte for byte.
+            set before [r zrange zfmt 0 -1 withscores]
+            set digest [debug_digest]
+            r debug reload
+            assert_equal $before [r zrange zfmt 0 -1 withscores]
+            assert_equal $digest [debug_digest]
+        }
+        r config set zset-max-listpack-entries 128
+    } {OK} {needs:debug}
+
     test {zunionInterDiffGenericCommand acts on SET and ZSET} {
         r del set_small{t} set_big{t} zset_small{t} zset_big{t} zset_dest{t}
 

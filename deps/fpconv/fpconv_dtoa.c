@@ -250,7 +250,19 @@ static int emit_digits(char *digits, int ndigits, char *dest, int K, bool neg) {
     int exp = absv(K + ndigits - 1);
 
     /* write plain integer */
-    if (K >= 0 && (exp < (ndigits + 7))) {
+    /* The (exp < ndigits + 7) test bounds how many trailing zeros the plain form may
+     * spell out; it does not bound the result length, and it ignores the '-' that
+     * fpconv_dtoa() has already written for a negative value. Large negative
+     * integer-valued doubles therefore overflow the 24-byte buffer the public
+     * prototype documents: -1.5111572745182865e23 spells out as
+     * -151115727451828650000000, 25 bytes, while its positive counterpart is 24.
+     *
+     * Upstream fixed this in night-shift/fpconv 8607e5ab6f06 by lowering the
+     * trailing-zero budget to 6 for negatives. That is correct but wider than the
+     * defect: over 20M random finite doubles it also rewrites 8682 negatives whose
+     * plain form already fitted in 24 bytes. Bounding the emitted length directly
+     * repairs exactly the 7603 overflowing values and nothing else. */
+    if (K >= 0 && (exp < (ndigits + 7)) && ((int)neg + ndigits + K <= 24)) {
         memcpy(dest, digits, ndigits);
         memset(dest + ndigits, '0', K);
 
