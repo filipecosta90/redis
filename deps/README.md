@@ -9,6 +9,14 @@ should be provided by the operating system.
 * **CRoaring** is the C implementation of Roaring bitmaps used by native Redis
   bitmap encodings. Redis vendors the C headers and source from upstream and
   builds it only through the Redis dependency Makefile.
+* **fpconv** is the grisu2 double-to-string converter behind `d2string()`. Imported once
+  from https://github.com/night-shift/fpconv (2022-10-15) and not re-synced since;
+  upstream has been dormant since 2023-12-14. Our copy carries one local change: the
+  plain-integer branch of `emit_digits()` also bounds the emitted length, so
+  `fpconv_dtoa()` honours the 24-byte buffer its prototype documents. Upstream fixed the
+  same defect differently in 8607e5ab6f06 (lower the trailing-zero budget for negatives);
+  that variant also changes output for values that already fitted, so it was not taken
+  verbatim. Re-sync with care and keep the bound.
 
 How to upgrade the above dependencies
 ===

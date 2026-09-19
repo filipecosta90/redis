@@ -38,6 +38,9 @@
 #ifndef FPCONV_DTOA_H
 #define FPCONV_DTOA_H
 
+/* Writes at most 24 bytes into dest and returns the number written. The result is
+ * NOT null-terminated. Callers must supply at least 24 bytes; Redis callers pass
+ * MAX_D2STRING_CHARS (128) or larger. */
 int fpconv_dtoa(double fp, char dest[24]);
 
 #endif
