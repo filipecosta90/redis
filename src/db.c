@@ -2040,16 +2040,18 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
         vecRelease(&keys);
         addReplyArrayLen(c, 2);
-        void *cursor_reply = addReplyDeferredLen(c);
-        void *replylen = addReplyDeferredLen(c);
+        void *headers = addReplyDeferredLen(c);
         zsetBtreeScanData data = {c, pat, patlen, use_pattern, 0};
         uint64_t next = zbtreeScan(o->ptr, cursor, count,
                                    zsetBtreeScanReply, &data);
         char cursor_buf[LONG_STR_SIZE];
         int cursor_len = ull2string(cursor_buf, sizeof(cursor_buf), next);
-        setDeferredReplyBulkSds(c, cursor_reply,
-                                sdsnewlen(cursor_buf, cursor_len));
-        setDeferredArrayLen(c, replylen, data.emitted);
+        /* Fill both headers together so they share one deferred reply node. */
+        char header_buf[2 * LONG_STR_SIZE + 16];
+        int header_len = snprintf(header_buf, sizeof(header_buf),
+                                  "$%d\r\n%s\r\n*%lu\r\n",
+                                  cursor_len, cursor_buf, data.emitted);
+        setDeferredReply(c, headers, header_buf, header_len);
         return;
     } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) &&
                o->encoding == OBJ_ENCODING_LISTPACK)
