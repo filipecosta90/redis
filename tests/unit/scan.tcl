@@ -349,6 +349,88 @@ proc test_scan {type} {
     }
 
     if {$type eq {standalone}} {
+        test {B+ tree ZSCAN replies preserve framing and suppression} {
+            foreach proto {2 3} {
+                r hello $proto
+                foreach size {1 31 32 33 129} {
+                    r del zset
+                    for {set j 0} {$j < 129} {incr j} {
+                        r zadd zset 1.25 member:$j
+                    }
+                    for {set j $size} {$j < 129} {incr j} {
+                        r zrem zset member:$j
+                    }
+                    assert_encoding btree zset
+                    r readraw 1
+                    assert_equal {*2} [r zscan zset 0 count 10000]
+                    assert_equal {$1} [r read]
+                    assert_equal 0 [r read]
+                    set header [r read]
+                    assert_equal {*} [string index $header 0]
+                    set fields [string range $header 1 end]
+                    assert {$fields % 2 == 0}
+                    set seen {}
+                    for {set j 0} {$j < $fields / 2} {incr j} {
+                        assert_match {$*} [r read]
+                        dict set seen [r read] 1
+                        assert_equal {$4} [r read]
+                        assert_equal 1.25 [r read]
+                    }
+                    assert_equal $size [dict size $seen]
+                    r readraw 0
+                    assert_equal {0 {}} [r zscan zset 0 count 10000 match absent:*]
+                    assert_equal PONG [r ping]
+                    set rd [redis_deferring_client]
+                    $rd hello $proto
+                    $rd read
+                    $rd client reply off
+                    $rd zscan zset 0 count 10000
+                    $rd client reply on
+                    assert_equal OK [$rd read]
+                    $rd client reply skip
+                    $rd zscan zset 0 count 10000
+                    $rd ping
+                    assert_equal PONG [$rd read]
+                    $rd close
+                }
+            }
+            r hello 2
+            set _ {}
+        } {} {resp3}
+
+        test {B+ tree ZSCAN headers preserve queued reply order} {
+            r del zset
+            for {set j 0} {$j < 129} {incr j} {
+                r zadd zset 1.25 member:$j
+            }
+            assert_encoding btree zset
+            foreach proto {2 3} {
+                r hello $proto
+                foreach size {0 1024 65536} {
+                    set preceding [string repeat x $size]
+                    r set preceding $preceding
+                    r multi
+                    r getrange preceding 0 -1
+                    r zscan zset 0 count 10000 match absent:*
+                    r zscan zset 0 count 10000
+                    r ping
+                    set replies [r exec]
+                    assert_equal $preceding [lindex $replies 0]
+                    assert_equal {0 {}} [lindex $replies 1]
+                    assert_equal 0 [lindex $replies 2 0]
+                    set seen {}
+                    foreach {member score} [lindex $replies 2 1] {
+                        assert_equal 1.25 $score
+                        dict set seen $member 1
+                    }
+                    assert_equal 129 [dict size $seen]
+                    assert_equal PONG [lindex $replies 3]
+                }
+            }
+            r hello 2
+            set _ {}
+        } {} {resp3}
+
         test {B+ tree ZSCAN keeps scores as bulk strings in RESP3} {
             r del zset
             set elements {}

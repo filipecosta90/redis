@@ -2047,9 +2047,10 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
                                    zsetBtreeScanReply, &data);
         char cursor_buf[LONG_STR_SIZE];
         int cursor_len = ull2string(cursor_buf, sizeof(cursor_buf), next);
+        /* Fill the array first to let the cursor reuse the next reply block. */
+        setDeferredArrayLen(c, replylen, data.emitted);
         setDeferredReplyBulkSds(c, cursor_reply,
                                 sdsnewlen(cursor_buf, cursor_len));
-        setDeferredArrayLen(c, replylen, data.emitted);
         return;
     } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) &&
                o->encoding == OBJ_ENCODING_LISTPACK)
