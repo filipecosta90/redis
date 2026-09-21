@@ -78,7 +78,16 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
             }
             if (patternLen == 1)
                 return 1; /* match */
+            int literal = !nocase && pattern[1] != '?' &&
+                          pattern[1] != '[' && pattern[1] != '\\';
             while(stringLen) {
+                /* A literal after '*' can only match at its next occurrence. */
+                if (literal && string[0] != pattern[1]) {
+                    const char *next = memchr(string, pattern[1], stringLen);
+                    if (next == NULL) break;
+                    stringLen -= next - string;
+                    string = next;
+                }
                 if (stringmatchlen_impl(pattern+1, patternLen-1,
                             string, stringLen, nocase, skipLongerMatches, nesting+1))
                     return 1; /* match */
@@ -1849,11 +1858,47 @@ static void test_reclaimFilePageCache(void) {
 }
 #endif
 
+static void test_stringmatch_star(void) {
+    const struct {
+        const char *pattern, *string;
+        int nocase, match;
+    } cases[] = {
+        {"sortset*1*", "sortset-201", 0, 1},
+        {"sortset*1*", "sortset-202", 0, 0},
+        {"*:tail", "user:profile:tail", 0, 1},
+        {"*:tail", "user:profile:head", 0, 0},
+        {"*ab", "aab", 0, 1},
+        {"*a*b", "aaaacb", 0, 1},
+        {"*a*b", "aaaacc", 0, 0},
+        {"**ab", "xxab", 0, 1},
+        {"*?b", "xxab", 0, 1},
+        {"*[ab]c", "xxbc", 0, 1},
+        {"*[^ab]c", "xxdc", 0, 1},
+        {"*\\?", "xx?", 0, 1},
+        {"*\\*", "xx*", 0, 1},
+        {"*Ab", "xxab", 1, 1},
+        {"*Ab", "xxab", 0, 0},
+        {"prefix:*", "prefix:value", 0, 1},
+        {"*", "x", 0, 1},
+        {"*", "", 0, 0}, /* Preserve the existing empty-string behavior. */
+        {"", "", 0, 1},
+        {"*a", "", 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+        assert(stringmatch(cases[i].pattern, cases[i].string, cases[i].nocase) == cases[i].match);
+    }
+    assert(stringmatchlen("*\0b", 3, "x\0a\0b", 5, 0) == 1);
+    assert(stringmatchlen("*\0b", 3, "x\0a", 3, 0) == 0);
+    assert(stringmatchlen("*\xff", 2, "x\x80\xff", 3, 0) == 1);
+    assert(stringmatchlen("*\xff", 2, "x\x80", 2, 0) == 0);
+}
+
 int utilTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
     UNUSED(flags);
 
+    test_stringmatch_star();
     test_string2ll();
     test_string2l();
     test_string2d();
