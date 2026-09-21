@@ -177,16 +177,32 @@
     (ZBT_EXTERNAL_POINTER_OFFSET + sizeof(void *))
 
 /* One ZSCAN cursor position covers this many buckets. This keeps the complete
- * 32 bit table revision while allowing 2^34 buckets to be visited (still far
- * beyond any realistic table size). Kept at 4 rather than the original 8: the
- * per-bucket-group cost is dominated by zbtIndexScanSlot()'s per-occupied-slot
- * leaf scan, and at this benchmark's ~49% table fill a group of 4 buckets
- * (~15.7 occupied slots) already comfortably exceeds the default COUNT=10, so
- * halving the group size roughly halves the number of those expensive scans
- * per call without changing SCAN's cursor-decode correctness (group is a
- * compile-time-uniform divisor, used identically by every encode and decode
- * within a running binary) or its completeness/duplicate-tolerance contract. */
-#define ZBT_SCAN_BUCKETS_PER_STEP 4
+ * 32 bit table revision while allowing 2^32 buckets to be visited (still far
+ * beyond any realistic table size).
+ *
+ * This is the page-size knob, because zbtreeScan() can only re-check
+ * 'emitted < count' where the cursor can be saved, i.e. on a group boundary:
+ * one group is this many buckets times ZBT_INDEX_BUCKET_ITEMS slots, and the
+ * group is always finished before returning. A larger group therefore
+ * overshoots COUNT by more. Measured members per reply on a 200K member zset
+ * at the default COUNT=10, which is the shape a full ZSCAN traversal actually
+ * walks with: 8 buckets returned 48.8 and 4 returned 24.4, against 10.8 for
+ * the dict-backed encoding. (An earlier revision of this comment justified 4
+ * from a ~49% table fill giving "~15.7 occupied slots"; the real fill is ~76%,
+ * hence the measured 24.4.) Such an overshoot is permitted -- COUNT is a hint
+ * -- but it inflates each reply and its latency, and it makes any benchmark
+ * reading requests/sec rather than members/sec incomparable against another
+ * encoding.
+ *
+ * At 1 the group is a single bucket, so COUNT is honoured to within one
+ * bucket: 6.1 members per reply at COUNT=1 and 13.4 at COUNT=10 (the loop
+ * tests the count after a group, so it takes two ~6 member buckets to pass
+ * 10), and COUNT=1000 is unchanged at 1000.1. Per-member server cost does not
+ * pay for it -- the per-occupied-slot leaf scan in zbtIndexScanSlot() is the
+ * same work either way, only regrouped -- and full-walk completeness is
+ * unaffected: a bucket is still always scanned to completion before the
+ * cursor advances, which is what the SCAN guarantee rests on. */
+#define ZBT_SCAN_BUCKETS_PER_STEP 1
 
 /* Released score leaf IDs form a list in the leaf table. Allocations are
  * aligned, so the low bit distinguishes a list link from a live pointer. */
