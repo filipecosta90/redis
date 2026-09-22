@@ -62,6 +62,9 @@ struct luaCtx {
     dict *lua_scripts;         /* A dictionary of SHA1 -> Lua scripts */
     list *lua_scripts_lru_list; /* A list of SHA1, first in first out LRU eviction. */
     unsigned long long lua_scripts_mem;  /* Cached scripts' memory + oh */
+    int err_handler_ref; /* luaL_ref() handle of __redis__err__handler. Fetching
+                            it by integer avoids interning the 21-byte global
+                            name on every EVAL/EVALSHA. */
 } lctx;
 
 /* Debugger shared state is stored inside this global structure. */
@@ -232,6 +235,11 @@ void scriptingInit(int setup) {
                                 "end\n";
         luaL_loadbuffer(lua,errh_func,strlen(errh_func),"@err_handler_def");
         lua_pcall(lua,0,0,0);
+        /* Cache a registry reference to the handler. Globals are read-only for
+         * user scripts, so the binding cannot change after this point. */
+        lua_getglobal(lua,"__redis__err__handler");
+        serverAssert(lua_isfunction(lua,-1));
+        lctx.err_handler_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
     }
 
     /* Create the (non connected) client that we use to execute Redis commands
@@ -470,7 +478,10 @@ sds luaCreateFunction(client *c, robj *body, int evalsha) {
 
     serverAssert(lua_isfunction(lctx.lua, -1));
 
-    lua_setfield(lctx.lua, LUA_REGISTRYINDEX, funcname);
+    /* Anchor the compiled function in the registry under an integer key. This
+     * pops it off the stack and, unlike a "f_<sha1>" string key, costs no
+     * string hashing or interning when it is fetched back on each call. */
+    int lua_ref = luaL_ref(lctx.lua, LUA_REGISTRYINDEX);
 
     /* We also save a SHA1 -> Original script map in a dictionary
      * so that we can replicate / write in the AOF all the
@@ -478,6 +489,7 @@ sds luaCreateFunction(client *c, robj *body, int evalsha) {
     luaScript *l = zcalloc(sizeof(luaScript));
     l->body = body;
     l->flags = script_flags;
+    l->lua_ref = lua_ref;
     sds sha = sdsnewlen(funcname+2,40);
     l->node = luaScriptsLRUAdd(c, sha, evalsha);
     int retval = dictAdd(lctx.lua_scripts,sha,l);
@@ -497,19 +509,13 @@ sds luaCreateFunction(client *c, robj *body, int evalsha) {
  * This will delete the lua function from the lua interpreter and delete
  * the lua function from server. */
 void luaDeleteFunction(client *c, sds sha) {
-    /* Delete the script from lua interpreter. */
-    char funcname[43];
-    funcname[0] = 'f';
-    funcname[1] = '_';
-    memcpy(funcname+2, sha, 40);
-    funcname[42] = '\0';
-    lua_pushnil(lctx.lua);
-    lua_setfield(lctx.lua, LUA_REGISTRYINDEX, funcname);
-
     /* Delete the script from server. */
     dictEntry *de = dictUnlink(lctx.lua_scripts, sha);
     serverAssertWithInfo(c ? c : lctx.lua_client, NULL, de);
     luaScript *l = dictGetVal(de);
+
+    /* Drop the interpreter's reference so the function can be collected. */
+    luaL_unref(lctx.lua, LUA_REGISTRYINDEX, l->lua_ref);
     /* We only delete `EVAL` scripts, which must exist in the LRU list. */
     serverAssert(l->node);
     listDelNode(lctx.lua_scripts_lru_list, l->node);
@@ -572,13 +578,19 @@ void evalGenericCommand(client *c, int evalsha) {
     } else
         evalCalcFunctionName(evalsha, c->argv[1]->ptr, funcname);
 
-    /* Push the pcall error handler function on the stack. */
-    lua_getglobal(lua, "__redis__err__handler");
+    /* Push the pcall error handler function on the stack. Fetched by the
+     * integer registry ref taken at init, so no global name is interned. */
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, lctx.err_handler_ref);
 
-    /* Try to lookup the Lua function */
-    lua_getfield(lua, LUA_REGISTRYINDEX, funcname);
-    if (lua_isnil(lua,-1)) {
-        lua_pop(lua,1); /* remove the nil from the stack */
+    /* Try to lookup the script. The script dictionary and the interpreter's
+     * registry are populated and cleared together (luaCreateFunction() /
+     * luaDeleteFunction()), so a missing dictionary entry is exactly the old
+     * "registry slot is nil" condition. */
+    char *lua_cur_script = funcname + 2;
+    dictEntry *de = c->cur_script;
+    if (!de)
+        de = dictFind(lctx.lua_scripts, lua_cur_script);
+    if (de == NULL) {
         /* Function not defined... let's define it if we have the
          * body of the function. If this is an EVALSHA call we can just
          * return an error. */
@@ -593,16 +605,17 @@ void evalGenericCommand(client *c, int evalsha) {
              * itself when it returns NULL. */
             return;
         }
-        /* Now the following is guaranteed to return non nil */
-        lua_getfield(lua, LUA_REGISTRYINDEX, funcname);
-        serverAssert(!lua_isnil(lua,-1));
-    }
-
-    char *lua_cur_script = funcname + 2;
-    dictEntry *de = c->cur_script;
-    if (!de)
+        /* Now the following is guaranteed to be found */
         de = dictFind(lctx.lua_scripts, lua_cur_script);
+        serverAssert(de != NULL);
+    }
     luaScript *l = dictGetVal(de);
+
+    /* Push the function itself, again by integer ref rather than by the
+     * "f_<sha1>" string key, which had to be hashed and interned per call. */
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, l->lua_ref);
+    serverAssert(lua_isfunction(lua,-1));
+
     int ro = c->cmd->proc == evalRoCommand || c->cmd->proc == evalShaRoCommand;
 
     scriptRunCtx rctx;

@@ -4498,6 +4498,9 @@ typedef struct luaScript {
     uint64_t flags;
     robj *body;
     listNode *node;  /* list node in lua_scripts_lru_list list. */
+    int lua_ref;     /* luaL_ref() handle of the compiled function in the Lua
+                        registry. Looking the function up by this integer skips
+                        interning the "f_<sha1>" key string on every call. */
 } luaScript;
 /* Cache of recently used small arguments to avoid malloc calls. */
 #define LUA_CMD_OBJCACHE_SIZE 32
