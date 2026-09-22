@@ -519,13 +519,13 @@ int string2ll(const char *s, size_t slen, long long *value) {
         return 0;
     }
 
-    /* Parse all the other digits, checking for overflow at every step. */
+    /* Up to 19 decimal digits fit in an unsigned long long. */
     while (plen < slen && p[0] >= '0' && p[0] <= '9') {
-        if (v > (ULLONG_MAX / 10)) /* Overflow. */
+        if (slen - negative >= 20 && v > (ULLONG_MAX / 10)) /* Overflow. */
             return 0;
         v *= 10;
 
-        if (v > (ULLONG_MAX - (p[0]-'0'))) /* Overflow. */
+        if (slen - negative >= 20 && v > (ULLONG_MAX - (p[0]-'0'))) /* Overflow. */
             return 0;
         v += p[0]-'0';
 
@@ -1590,6 +1590,34 @@ static void test_string2ll(void) {
 
     redis_strlcpy(buf,"9223372036854775808",sizeof(buf)); /* overflow */
     assert(string2ll(buf,strlen(buf),&v) == 0);
+
+    /* Exercise the length boundary for accumulator overflow checks. */
+    const char *valid[] = {"999999999999999999", "1000000000000000000",
+                          "-999999999999999999", "-1000000000000000000"};
+    const long long expected[] = {999999999999999999LL, 1000000000000000000LL,
+                                 -999999999999999999LL, -1000000000000000000LL};
+    for (size_t i = 0; i < sizeof(valid)/sizeof(valid[0]); i++) {
+        assert(string2ll(valid[i],strlen(valid[i]),&v) == 1);
+        assert(v == expected[i]);
+        assert(string2ll(valid[i],strlen(valid[i]),NULL) == 1);
+    }
+
+    const char *invalid[] = {"9999999999999999999", "10000000000000000000",
+                            "18446744073709551615", "18446744073709551616",
+                            "99999999999999999999", "100000000000000000000",
+                            "-9999999999999999999", "-10000000000000000000",
+                            "-18446744073709551616", "123456789012345678x",
+                            "1234567890123456789x", "-123456789012345678x"};
+    for (size_t i = 0; i < sizeof(invalid)/sizeof(invalid[0]); i++) {
+        v = 42;
+        assert(string2ll(invalid[i],strlen(invalid[i]),&v) == 0);
+        assert(v == 42);
+        assert(string2ll(invalid[i],strlen(invalid[i]),NULL) == 0);
+    }
+
+    /* The explicit length still includes embedded NULs and non-ASCII bytes. */
+    assert(string2ll("123\0" "45",6,&v) == 0);
+    assert(string2ll("123\xff" "45",6,&v) == 0);
 }
 
 static void test_string2l(void) {
