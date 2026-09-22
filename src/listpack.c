@@ -161,8 +161,9 @@ int lpStringToInt64(const char *s, unsigned long slen, int64_t *value) {
     int negative = 0;
     uint64_t v;
 
-    /* Abort if length indicates this cannot possibly be an int */
-    if (slen == 0 || slen >= LONG_STR_SIZE)
+    /* A signed 64-bit value has at most 19 digits, plus an optional minus. */
+    if (slen == 0 || slen >= LONG_STR_SIZE ||
+        (slen == LONG_STR_SIZE-1 && s[0] != '-'))
         return 0;
 
     /* Special case: first and only digit is 0. */
@@ -188,13 +189,9 @@ int lpStringToInt64(const char *s, unsigned long slen, int64_t *value) {
         return 0;
     }
 
+    /* At most 19 digits remain, so the unsigned accumulator cannot overflow. */
     while (plen < slen && p[0] >= '0' && p[0] <= '9') {
-        if (v > (UINT64_MAX / 10)) /* Overflow. */
-            return 0;
         v *= 10;
-
-        if (v > (UINT64_MAX - (p[0]-'0'))) /* Overflow. */
-            return 0;
         v += p[0]-'0';
 
         p++; plen++;
@@ -2317,6 +2314,34 @@ int listpackTest(int argc, char *argv[], int flags) {
     int64_t vlen;
     unsigned char intbuf[LP_INTBUF_SIZE];
     int accurate = (flags & REDIS_TEST_ACCURATE);
+
+    TEST("Integer parsing length and signed boundaries") {
+        const char *valid[] = {"0", "1", "-1", "999999999999999999",
+                               "1000000000000000000", "9223372036854775807",
+                               "-9223372036854775808"};
+        const int64_t expected[] = {0, 1, -1, INT64_C(999999999999999999),
+                                   INT64_C(1000000000000000000), INT64_MAX, INT64_MIN};
+        for (size_t j = 0; j < sizeof(valid)/sizeof(valid[0]); j++) {
+            int64_t value = 42;
+            assert(lpStringToInt64(valid[j], strlen(valid[j]), &value));
+            assert(value == expected[j]);
+            assert(lpStringToInt64(valid[j], strlen(valid[j]), NULL));
+        }
+        const char *invalid[] = {"", "-", "+1", "-0", "01",
+                                "9223372036854775808", "-9223372036854775809",
+                                "10000000000000000000", "18446744073709551615",
+                                "18446744073709551616", "99999999999999999999",
+                                "-10000000000000000000", "100000000000000000000",
+                                "1234567890123456789x", "-123456789012345678x"};
+        for (size_t j = 0; j < sizeof(invalid)/sizeof(invalid[0]); j++) {
+            int64_t value = 42;
+            assert(!lpStringToInt64(invalid[j], strlen(invalid[j]), &value));
+            assert(value == 42);
+            assert(!lpStringToInt64(invalid[j], strlen(invalid[j]), NULL));
+        }
+        assert(!lpStringToInt64("123\0" "45", 6, NULL));
+        assert(!lpStringToInt64("123\xff" "45", 6, NULL));
+    }
 
     TEST("Create int list") {
         lp = createIntList();
