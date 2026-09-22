@@ -1749,8 +1749,13 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
             return;
 
     } else if (o->type == OBJ_ZSET) {
-        char buf[MAX_LONG_DOUBLE_CHARS];
-        int len = ld2string(buf, sizeof(buf), znode->score, LD_STR_AUTO);
+        /* Format the score the same way every other sorted-set reply path does
+         * (addReplyDouble() -> d2string()). The score is a double, so widening
+         * it to a long double for "%.17Lg" cost glibc's floating-point printf
+         * on every element and made ZSCAN disagree with both ZRANGE WITHSCORES
+         * and its own listpack branch, which returns the stored string. */
+        char buf[MAX_D2STRING_CHARS];
+        int len = d2string(buf, sizeof(buf), znode->score);
         key = sdsdup(keyStr);
         val = sdsnewlen(buf, len);
     } else {
