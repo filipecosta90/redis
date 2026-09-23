@@ -76,6 +76,8 @@ static dictEntryLink dictGetNextLink(dictEntry *de);
 static void dictSetNext(dictEntry *de, dictEntry *next);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket);
+static dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
+                                                  dictEntryLink *bucket);
 dictEntryLink dictFindLinkForInsert(dict *d, const void *key, dictEntry **existing);
 static dictEntry *dictInsertKeyAtLink(dict *d, void *key __stored_key, dictEntryLink link);
 
@@ -764,6 +766,17 @@ void dictRelease(dict *d)
  * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
  */
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
+    /* Avoid hashing a key we will not look up anyway. */
+    if (!bucket && dictSize(d) == 0) return NULL;
+
+    return dictFindLinkInternalWithHash(d, key, dictGetHash(d, key), bucket);
+}
+
+/* Same as dictFindLinkInternal(), but takes the key's hash from the caller
+ * instead of computing it. Only valid when `hash` is what dictGetHash(d, key)
+ * would have returned. */
+static dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
+                                                  dictEntryLink *bucket) {
     dictCmpCache cmpCache = {0};
     dictEntryLink link;
     uint64_t idx;
@@ -776,7 +789,6 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
         if (dictSize(d) == 0) return NULL; 
     }
 
-    const uint64_t hash = dictGetHash(d, key);
     idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
     keyCmpFunc cmpFunc = dictGetCmpFunc(d);
 
@@ -805,6 +817,17 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
 dictEntry *dictFind(dict *d, const void *key)
 {
     dictEntryLink link = dictFindLink(d, key, NULL);
+    return (link) ? *link : NULL;
+}
+
+/* Like dictFind(), but reuses a hash the caller already computed for `key`.
+ *
+ * `hash` MUST equal dictGetHash(d, key). This is useful when the same key is
+ * looked up in several dicts that share a hash function (e.g. the per-input
+ * probes of ZINTER), so the key is hashed once instead of once per dict. */
+dictEntry *dictFindWithHash(dict *d, const void *key, uint64_t hash)
+{
+    dictEntryLink link = dictFindLinkInternalWithHash(d, key, hash, NULL);
     return (link) ? *link : NULL;
 }
 

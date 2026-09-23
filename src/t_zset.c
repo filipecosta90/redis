@@ -2347,6 +2347,9 @@ typedef struct {
 #define OPVAL_DIRTY_SDS 1
 #define OPVAL_DIRTY_LL 2
 #define OPVAL_VALID_LL 4
+/* Set once "hash" holds the zsetDictType hash of "ele". Cleared by zuiNext(),
+ * which memsets the whole struct, so the cache can never outlive its member. */
+#define OPVAL_VALID_HASH 8
 
 /* Store value retrieved from the iterator. */
 typedef struct {
@@ -2357,6 +2360,7 @@ typedef struct {
     unsigned int elen;
     long long ell;
     double score;
+    uint64_t hash;      /* Cached hash of "ele"; valid iff OPVAL_VALID_HASH. */
 } zsetopval;
 
 typedef union _iterset iterset;
@@ -2620,7 +2624,16 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
             dictEntry *de;
-            if ((de = dictFind(zs->dict,val->ele)) != NULL) {
+            /* Every zset dict is created with zsetDictType, so the hash of a
+             * given member is the same in all of them. ZINTER probes the same
+             * member in up to setnum-1 dicts, so hash it once and reuse it
+             * instead of paying a SipHash per input set. */
+            debugServerAssert(zs->dict->type == &zsetDictType);
+            if (!(val->flags & OPVAL_VALID_HASH)) {
+                val->hash = dictGetHash(zs->dict,val->ele);
+                val->flags |= OPVAL_VALID_HASH;
+            }
+            if ((de = dictFindWithHash(zs->dict,val->ele,val->hash)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
                 *score = znode->score;
                 return 1;
