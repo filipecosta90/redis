@@ -2351,17 +2351,28 @@ typedef struct {
  * which memsets the whole struct, so the cache can never outlive its member. */
 #define OPVAL_VALID_HASH 8
 
-/* Store value retrieved from the iterator. */
+/* Store value retrieved from the iterator.
+ *
+ * zuiNext() memsets this struct once per candidate, so its size sits on the hot
+ * path of every ZUNION/ZINTER/ZDIFF. Adding "hash" naively at the end grew it
+ * from 80 to 88 bytes and cost 33% of ZINTERCARD's server CPU, all of it inside
+ * zuiNext(). Keeping "elen" beside "flags" reuses the two 4-byte padding holes
+ * the natural order would leave, so "hash" is free. Reorder rather than append
+ * if another field is ever needed here. */
 typedef struct {
     int flags;
+    unsigned int elen;
     unsigned char _buf[32]; /* Private buffer. */
     sds ele;
     unsigned char *estr;
-    unsigned int elen;
     long long ell;
     double score;
     uint64_t hash;      /* Cached hash of "ele"; valid iff OPVAL_VALID_HASH. */
 } zsetopval;
+
+#if SIZE_MAX == 0xFFFFFFFFFFFFFFFFULL
+static_assert(sizeof(zsetopval) <= 80, "zsetopval grew; see the memset note above");
+#endif
 
 typedef union _iterset iterset;
 typedef union _iterzset iterzset;
