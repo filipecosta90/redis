@@ -2358,11 +2358,10 @@ typedef struct {
  * from 80 to 88 bytes and cost 33% of ZINTERCARD's server CPU, all of it inside
  * zuiNext(). Keeping "elen" beside "flags" reuses the two 4-byte padding holes
  * the natural order would leave, so "hash" is free. Reorder rather than append
- * if another field is ever needed here. */
+ * if another field is ever needed here, and keep the static_assert honest. */
 typedef struct {
     int flags;
     unsigned int elen;
-    unsigned char _buf[32]; /* Private buffer. */
     sds ele;
     unsigned char *estr;
     long long ell;
@@ -2371,7 +2370,7 @@ typedef struct {
 } zsetopval;
 
 #if SIZE_MAX == 0xFFFFFFFFFFFFFFFFULL
-static_assert(sizeof(zsetopval) <= 80, "zsetopval grew; see the memset note above");
+static_assert(sizeof(zsetopval) <= 48, "zsetopval grew; see the memset note above");
 #endif
 
 typedef union _iterset iterset;
@@ -2592,19 +2591,6 @@ sds zuiNewSdsFromValue(zsetopval *val) {
     } else {
         return sdsfromlonglong(val->ell);
     }
-}
-
-int zuiBufferFromValue(zsetopval *val) {
-    if (val->estr == NULL) {
-        if (val->ele != NULL) {
-            val->elen = sdslen(val->ele);
-            val->estr = (unsigned char*)val->ele;
-        } else {
-            val->elen = ll2string((char*)val->_buf,sizeof(val->_buf),val->ell);
-            val->estr = val->_buf;
-        }
-    }
-    return 1;
 }
 
 /* Find value pointed to by val in the source pointer to by op. When found,
