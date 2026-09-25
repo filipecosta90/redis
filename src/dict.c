@@ -1547,6 +1547,13 @@ void dictScanDefragBucket(dict *d,dictScanFunction *fn,
     plink = bucketref;
     while (de) {
         next = dictGetNext(de);
+
+        /* Warm the next entry in this bucket's chain while fn() works on the
+         * current one. The chain is separately allocated, so without this the
+         * walk serialises: each entry's load cannot start until the previous
+         * one has arrived. fn() is the prefetch distance. */
+        if (next) __builtin_prefetch(next, 0, 1);
+
         fn(privdata, de, plink);
 
         if (!next) break; /* if last element, break */
