@@ -2593,8 +2593,14 @@ int zuiBufferFromValue(zsetopval *val) {
 }
 
 /* Find value pointed to by val in the source pointer to by op. When found,
- * return 1 and store its score in target. Return 0 otherwise. */
-int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
+ * return 1 and store its score in target. Return 0 otherwise.
+ *
+ * "hash"/"hash_valid" are the caller's cache for the hash of val->ele, shared
+ * across the probes of one member: the member is hashed on the first sorted-set
+ * input that needs it and the hash is reused for the remaining ones. The caller
+ * must clear *hash_valid whenever it moves to a new member. Passing NULL for
+ * both disables the cache. */
+int zuiFind(zsetopsrc *op, zsetopval *val, double *score, uint64_t *hash, int *hash_valid) {
     if (op->subject == NULL)
         return 0;
 
@@ -2620,7 +2626,14 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
             dictEntry *de;
-            if ((de = dictFind(zs->dict,val->ele)) != NULL) {
+            /* Every sorted set's dict is created with zsetDictType, so a member
+             * hashes the same in all of them. ZINTER/ZINTERCARD/ZDIFF probe one
+             * member in up to setnum-1 of them, so hash it once and reuse the
+             * hash for the rest instead of paying one hash per input key. */
+            debugServerAssert(zs->dict->type == &zsetDictType);
+            if ((de = hash_valid ?
+                    dictFindCachedHash(zs->dict,val->ele,hash,hash_valid) :
+                    dictFind(zs->dict,val->ele)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
                 *score = znode->score;
                 return 1;
@@ -2732,6 +2745,8 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     while (zuiNext(&src[0],&zval)) {
         double value;
         int exists = 0;
+        uint64_t elehash;
+        int elehash_valid = 0;  /* Reset per member: zval.ele just changed. */
 
         for (j = 1; j < setnum; j++) {
             /* It is not safe to access the zset we are
@@ -2740,7 +2755,7 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
              * check for a duplicate set in the zsetChooseDiffAlgorithm
              * function, but we're leaving it for future-proofing. */
             if (src[j].subject == src[0].subject ||
-                zuiFind(&src[j],&zval,&value)) {
+                zuiFind(&src[j],&zval,&value,&elehash,&elehash_valid)) {
                 exists = 1;
                 break;
             }
@@ -3030,6 +3045,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiInitIterator(&src[0]);
             while (zuiNext(&src[0],&zval)) {
                 double score, value;
+                uint64_t elehash;
+                int elehash_valid = 0;  /* Reset per member: zval.ele just changed. */
 
                 score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
@@ -3040,7 +3057,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     if (src[j].subject == src[0].subject) {
                         value = zuiWeightedScore(zval.score, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
-                    } else if (zuiFind(&src[j],&zval,&value)) {
+                    } else if (zuiFind(&src[j],&zval,&value,
+                                       &elehash,&elehash_valid)) {
                         value = zuiWeightedScore(value, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
                     } else {

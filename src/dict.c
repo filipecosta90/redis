@@ -76,6 +76,9 @@ static dictEntryLink dictGetNextLink(dictEntry *de);
 static void dictSetNext(dictEntry *de, dictEntry *next);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket);
+static inline __attribute__((always_inline))
+dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
+                                           dictEntryLink *bucket);
 dictEntryLink dictFindLinkForInsert(dict *d, const void *key, dictEntry **existing);
 static dictEntry *dictInsertKeyAtLink(dict *d, void *key __stored_key, dictEntryLink link);
 
@@ -764,19 +767,31 @@ void dictRelease(dict *d)
  * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
  */
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
+    /* Never hash a key for a lookup that cannot hit anything. */
+    if (!bucket && dictSize(d) == 0) return NULL;
+
+    return dictFindLinkInternalWithHash(d, key, dictGetHash(d, key), bucket);
+}
+
+/* Same as dictFindLinkInternal(), but takes the key's hash from the caller.
+ *
+ * `hash` MUST be what dictGetHash(d, key) would have returned. Callers are
+ * responsible for the "empty dict and no bucket wanted" early return, so that
+ * they can skip hashing entirely in that case.
+ *
+ * Always inlined: both callers get their own specialized copy, so factoring
+ * this body out of dictFindLinkInternal() costs the existing dictFind() /
+ * dictFindLink() callers nothing. */
+static inline __attribute__((always_inline))
+dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
+                                           dictEntryLink *bucket) {
     dictCmpCache cmpCache = {0};
     dictEntryLink link;
     uint64_t idx;
     int table;
-    
-    if (bucket) {
-        *bucket = NULL;
-    } else {
-        /* If dict is empty and no need to find bucket, return NULL */
-        if (dictSize(d) == 0) return NULL; 
-    }
 
-    const uint64_t hash = dictGetHash(d, key);
+    if (bucket) *bucket = NULL;
+
     idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
     keyCmpFunc cmpFunc = dictGetCmpFunc(d);
 
@@ -805,6 +820,31 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
 dictEntry *dictFind(dict *d, const void *key)
 {
     dictEntryLink link = dictFindLink(d, key, NULL);
+    return (link) ? *link : NULL;
+}
+
+/* Like dictFind(), but keeps the key's hash in *hash so that looking the same
+ * key up in several dicts hashes it only once.
+ *
+ * On entry *hash_valid tells whether *hash already holds the hash of `key`;
+ * it is set once the hash has been computed. The caller must reset
+ * *hash_valid to 0 whenever `key` changes, and may only share the cache
+ * between dicts that hash keys the same way (same hashFunction).
+ *
+ * Used by the ZINTER/ZINTERCARD/ZDIFF probe loop, which looks one member up
+ * in up to setnum-1 sorted-set dicts that all use zsetDictType. */
+dictEntry *dictFindCachedHash(dict *d, const void *key, uint64_t *hash, int *hash_valid)
+{
+    /* Same early return as dictFindLink(): an empty dict cannot hold the key,
+     * and we must not pay for a hash we would throw away. */
+    if (unlikely(dictSize(d) == 0)) return NULL;
+
+    if (!*hash_valid) {
+        *hash = dictGetHash(d, key);
+        *hash_valid = 1;
+    }
+
+    dictEntryLink link = dictFindLinkInternalWithHash(d, key, *hash, NULL);
     return (link) ? *link : NULL;
 }
 
