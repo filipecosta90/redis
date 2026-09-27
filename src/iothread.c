@@ -25,6 +25,7 @@ static list *mainThreadProcessingClients[IO_THREADS_MAX_NUM]; /* Clients in proc
 static list *mainThreadPendingClients[IO_THREADS_MAX_NUM]; /* Pending clients from IO threads */
 static pthread_mutex_t mainThreadPendingClientsMutexes[IO_THREADS_MAX_NUM]; /* Mutex for pending clients */
 static eventNotifier* mainThreadPendingClientsNotifiers[IO_THREADS_MAX_NUM]; /* Notifier for pending clients */
+static int mainThreadNewPushes[IO_THREADS_MAX_NUM]; /* Pushes queued since last notification */
 
 /* Send the clients to the main thread for processing when the number of clients
  * in pending list reaches IO_THREAD_MAX_PENDING_CLIENTS, or check_size is 0. */
@@ -221,6 +222,8 @@ void unbindClientFromIOThreadEventLoop(client *c) {
 void keepClientInMainThread(client *c) {
     if (c->tid == IOTHREAD_MAIN_THREAD_ID) return;
     serverAssert(c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+    /* Fetch the pushes queued for the IO thread before leaving it. */
+    fetchClientPushesFromIOThread(c);
     /* IO thread no longer manage it. */
     server.io_threads_clients_num[c->tid]--;
     /* Unbind connection of client from io thread event loop. */
@@ -282,17 +285,18 @@ void fetchClientFromIOThread(client *c) {
  * data race to be processed in IO threads.
  *
  * - Close ASAP, we must free the client in main thread.
- * - Pubsub, monitor, blocked, tracking clients, main thread may
- *   directly write them a reply when conditions are met.
+ * - Pubsub, monitor, blocked clients, main thread may directly write them
+ *   a reply when conditions are met. Tracking clients can stay in IO threads:
+ *   their IO thread appends the invalidations, see queueClientPushes().
  * - Script command with debug may operate connection directly.
  * - Master/Replica are only handled by IO thread when RDB replication is
  *   completed. Note we need to check them after checking for other flags
  *   that may overlap with CLIENT_MASTER/SLAVE - CLOSE_ASAP, MONITOR,
- *   (UN)BLOCKED, TRACKING. */
+ *   (UN)BLOCKED. */
 int isClientMustHandledByMainThread(client *c) {
     if (c->flags & (CLIENT_CLOSE_ASAP |
                     CLIENT_PUBSUB | CLIENT_MONITOR | CLIENT_BLOCKED |
-                    CLIENT_UNBLOCKED | CLIENT_TRACKING | CLIENT_LUA_DEBUG |
+                    CLIENT_UNBLOCKED | CLIENT_LUA_DEBUG |
                     CLIENT_LUA_DEBUG_SYNC | CLIENT_ASM_MIGRATING |
                     CLIENT_ASM_IMPORTING))
     {
@@ -639,6 +643,10 @@ int processClientsFromIOThread(IOThread *t) {
         /* Let main thread to run it, set running thread id first. */
         c->running_tid = IOTHREAD_MAIN_THREAD_ID;
 
+        /* The pushes queued while the client was in the IO thread come before
+         * the reply to the command it brings. */
+        fetchClientPushesFromIOThread(c);
+
         /* Free objects queued by IO thread for deferred freeing. */
         freeClientIODeferredObjects(c, 0);
         tryUnlinkClientFromPendingRefReply(c, 0);
@@ -649,6 +657,14 @@ int processClientsFromIOThread(IOThread *t) {
 
         /* The client is asked to close in IO thread. */
         if (c->io_flags & CLIENT_IO_CLOSE_ASAP) {
+            if (c->io_flags & CLIENT_IO_OBUF_LIMIT_REACHED) {
+                sds client = catClientInfoString(sdsempty(),c);
+                serverLog(LL_WARNING,
+                          "Client %s closed for overcoming of output buffer limits.",
+                          client);
+                sdsfree(client);
+                server.stat_client_outbuf_limit_disconnections++;
+            }
             freeClient(c);
             continue;
         }
@@ -844,6 +860,119 @@ int processClientsFromMainThread(IOThread *t) {
     return processed;
 }
 
+/* Queue the push message 'proto' for 'c', that runs in an IO thread (or is on
+ * its way between the threads): the IO thread appends it to the client output
+ * buffers without being paused, see processPushesFromMainThread(). 'flags' are
+ * client flags to set when the client is back in the main thread. Called by
+ * the main thread, or by a module thread holding the GIL. */
+void queueClientPushes(client *c, const char *proto, size_t len, uint64_t flags) {
+    serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
+                 c->running_tid != IOTHREAD_MAIN_THREAD_ID);
+    IOThread *t = &IOThreads[c->tid];
+    pthread_mutex_lock(&t->pushes_mutex);
+    if (len) {
+        if (c->io_pushes) c->io_pushes = sdscatlen(c->io_pushes, proto, len);
+        else c->io_pushes = sdsnewlen(proto, len);
+    }
+    c->io_pushes_flags |= flags;
+    if (!c->io_pushes_node) {
+        listAddNodeTail(t->push_clients, c);
+        c->io_pushes_node = listLast(t->push_clients);
+    }
+    atomicSetWithSync(t->has_pushes, 1);
+    pthread_mutex_unlock(&t->pushes_mutex);
+    c->io_pushes_queued = 1;
+    mainThreadNewPushes[c->tid] = 1;
+}
+
+/* The client 'c' of an IO thread is now in the main thread: append the pushes
+ * the IO thread did not append yet, and set the queued flags. */
+void fetchClientPushesFromIOThread(client *c) {
+    if (likely(!c->io_pushes_queued)) return;
+    serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
+                 c->running_tid == IOTHREAD_MAIN_THREAD_ID);
+    IOThread *t = &IOThreads[c->tid];
+    pthread_mutex_lock(&t->pushes_mutex);
+    sds pushes = c->io_pushes;
+    uint64_t flags = c->io_pushes_flags;
+    c->io_pushes = NULL;
+    c->io_pushes_flags = 0;
+    if (c->io_pushes_node) {
+        listDelNode(t->push_clients, c->io_pushes_node);
+        c->io_pushes_node = NULL;
+    }
+    pthread_mutex_unlock(&t->pushes_mutex);
+    c->io_pushes_queued = 0;
+
+    c->flags |= flags;
+    if (pushes) {
+        uint64_t old_flags = c->flags;
+        c->flags |= CLIENT_PUSHING;
+        addReplyProto(c, pushes, sdslen(pushes));
+        if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
+        sdsfree(pushes);
+    }
+}
+
+/* Wake up the IO threads with pushes queued since the last call, unless they
+ * are running: they check for pushes before sleeping. Called in beforeSleep. */
+void notifyIOThreadsOfPushes(void) {
+    for (int i = 1; i < server.io_threads_num; i++) {
+        if (!mainThreadNewPushes[i]) continue;
+        mainThreadNewPushes[i] = 0;
+        int running = 0;
+        atomicGetWithSync(IOThreads[i].running, running);
+        if (!running) triggerEventNotifier(IOThreads[i].pending_clients_notifier);
+    }
+}
+
+/* Append the pushes queued by the main thread to the clients in the event loop
+ * of this IO thread, and write them. A client on its way between the threads
+ * keeps its pushes: the main thread fetches them if it gets the client, else
+ * we append them once the client is back in our event loop. */
+static void processPushesFromMainThread(IOThread *t) {
+    int has_pushes = 0;
+    atomicGetWithSync(t->has_pushes, has_pushes);
+    if (!has_pushes) return;
+
+    int in_transit = 0;
+    listIter li;
+    listNode *ln;
+    pthread_mutex_lock(&t->pushes_mutex);
+    atomicSetWithSync(t->has_pushes, 0);
+    listRewind(t->push_clients, &li);
+    while ((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        if (!c->io_thread_client_list_node) {
+            in_transit = 1;
+            continue;
+        }
+        sds pushes = c->io_pushes;
+        c->io_pushes = NULL;
+        listDelNode(t->push_clients, ln);
+        c->io_pushes_node = NULL;
+        if (pushes) {
+            /* If the output buffer limits are reached, the client is on its
+             * way to the main thread: no more writes for it here. */
+            if (!appendClientPushesInIOThread(c, pushes, sdslen(pushes)))
+                listAddNodeTail(t->pushed_clients, c);
+            sdsfree(pushes);
+        }
+    }
+    if (in_transit) atomicSetWithSync(t->has_pushes, 1);
+    pthread_mutex_unlock(&t->pushes_mutex);
+
+    listRewind(t->pushed_clients, &li);
+    while ((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        if (connHasWriteHandler(c->conn)) continue;
+        writeToClient(c, 0);
+        if (!(c->io_flags & CLIENT_IO_CLOSE_ASAP) && clientHasPendingReplies(c))
+            connSetWriteHandler(c->conn, sendReplyToClient);
+    }
+    listEmpty(t->pushed_clients);
+}
+
 void IOThreadBeforeSleep(struct aeEventLoop *el) {
     IOThread *t = el->privdata[0];
 
@@ -858,7 +987,9 @@ void IOThreadBeforeSleep(struct aeEventLoop *el) {
 
     /* Process clients from main thread, since the main thread may deliver clients
      * without notification during IO thread processing events. */
-    if (processClientsFromMainThread(t) > 0) {
+    int processed = processClientsFromMainThread(t);
+    processPushesFromMainThread(t);
+    if (processed > 0) {
         /* If there are clients that are processed, we should not sleep since main
          * thread may want to continue deliverring clients without notification, so
          * IO thread can process them ASAP, and the main thread can avoid unnecessary
@@ -870,6 +1001,7 @@ void IOThreadBeforeSleep(struct aeEventLoop *el) {
         /* Try to process clients from main thread again, since before we set
          * running to 0, the main thread may deliver clients to this io thread. */
         processClientsFromMainThread(t);
+        processPushesFromMainThread(t);
     }
     aeSetDontWait(t->el, dont_sleep);
 
@@ -1010,6 +1142,9 @@ void initThreadedIO(void) {
         t->pending_clients_to_main_thread = listCreate();
         t->clients = listCreate();
         t->compression_clients = listCreate();
+        t->push_clients = listCreate();
+        t->pushed_clients = listCreate();
+        atomicSetWithSync(t->has_pushes, 0);
         t->cronloops = 0;
         atomicSetWithSync(t->paused, IO_THREAD_UNPAUSED);
         atomicSetWithSync(t->running, 0);
@@ -1021,6 +1156,7 @@ void initThreadedIO(void) {
         pthread_mutexattr_settype(attr, PTHREAD_MUTEX_ADAPTIVE_NP);
         #endif
         pthread_mutex_init(&t->pending_clients_mutex, attr);
+        pthread_mutex_init(&t->pushes_mutex, attr);
 
         t->pending_clients_notifier = createEventNotifier();
         if (aeCreateFileEvent(t->el, getReadEventFd(t->pending_clients_notifier),

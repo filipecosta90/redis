@@ -1065,3 +1065,100 @@ start_server [list overrides [list "dir" $server_path "aclfile" "tracking.acl"] 
         $tc close
     }
 }
+
+start_server {tags {"tracking network external:skip"} overrides {io-threads 4}} {
+    test {Tracking clients stay in IO threads and get invalidations} {
+        set rd [redis_deferring_client]
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on
+        $rd read
+        $rd GET key1
+        $rd read
+        assert_equal 0 [get_io_thread_clients 0]
+
+        r SET key1 1
+        assert_equal {invalidate key1} [$rd read]
+
+        $rd CLIENT TRACKING off
+        $rd read
+        $rd CLIENT TRACKING on BCAST PREFIX a:
+        $rd read
+        assert_equal 0 [get_io_thread_clients 0]
+        r MSET a:1 1 a:2 2 b:1 1
+        set keys [lsort [lindex [$rd read] 1]]
+        assert_equal {a:1 a:2} $keys
+
+        r FLUSHALL
+        assert_equal {invalidate {}} [$rd read]
+        $rd close
+    }
+
+    test {Tracking redirection to a RESP3 client in an IO thread} {
+        set rd_redir [redis_deferring_client]
+        $rd_redir HELLO 3
+        $rd_redir read
+        $rd_redir CLIENT ID
+        set redir_id [$rd_redir read]
+
+        set rd [redis_deferring_client]
+        $rd CLIENT TRACKING on REDIRECT $redir_id
+        $rd read
+        $rd GET key1
+        $rd read
+        assert_equal 0 [get_io_thread_clients 0]
+
+        r SET key1 2
+        assert_equal {invalidate key1} [$rd_redir read]
+
+        # The redirection client is gone: the tracking client, that runs in
+        # an IO thread, gets the broken redirection flag.
+        $rd_redir close
+        wait_for_condition 100 10 {
+            [r CLIENT LIST ID $redir_id] eq {}
+        } else {
+            fail "The redirection client is still connected"
+        }
+        $rd GET key1
+        $rd read
+        r SET key1 3
+        $rd CLIENT TRACKINGINFO
+        set flags [dict get [$rd read] flags]
+        assert_equal {on broken_redirect} $flags
+        $rd close
+    }
+
+    test {Tracking client in an IO thread is closed for output buffer limits} {
+        r CONFIG SET client-output-buffer-limit {normal 100k 0 0}
+        set before [s client_output_buffer_limit_disconnections]
+
+        set rd [redis_deferring_client]
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on BCAST PREFIX big:
+        $rd read
+        assert_equal 0 [get_io_thread_clients 0]
+
+        # The client does not read: the invalidations of long key names fill
+        # the socket buffers and then its output buffers.
+        set prefix "big:[string repeat x 10000]"
+        for {set j 0} {$j < 20} {incr j} {
+            set args {}
+            for {set k 0} {$k < 100} {incr k} {
+                lappend args $prefix:$j:$k 1
+            }
+            r MSET {*}$args
+        }
+        wait_for_condition 100 50 {
+            [s client_output_buffer_limit_disconnections] > $before
+        } else {
+            fail "The tracking client was not closed for output buffer limits"
+        }
+        assert_equal [s connected_clients] 1
+        verify_log_message 0 "*for overcoming of output buffer limits*" 0
+
+        r CONFIG SET client-output-buffer-limit {normal 0 0 0}
+        r FLUSHALL
+        $rd close
+    }
+}

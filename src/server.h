@@ -493,6 +493,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_IO_CLOSE_ASAP (1ULL<<4) /* Close this client ASAP in IO thread. */
 #define CLIENT_IO_PENDING_CRON (1ULL<<5)  /* The client is pending cron job, to be processed in main thread. */
 #define CLIENT_IO_COMPRESSION_ENABLED (1ULL<<6)  /* The client compression is enabled for this client*/
+#define CLIENT_IO_OBUF_LIMIT_REACHED (1ULL<<7) /* IO thread closes the client for output buffer limits. */
 
 /* Definitions for client read errors. These error codes are used to indicate
  * various issues that can occur while reading or parsing data from a client. */
@@ -1726,6 +1727,13 @@ typedef struct client {
     size_t stat_avg_pipeline_length_sum; /* Sum of pipeline lengths for computing average */
     size_t stat_avg_pipeline_length_cnt; /* Count of pipeline length samples */
     void *himport_fieldsets;      /* Session-local HIMPORT fieldsets */
+    /* Push messages the main thread queued for this client while it runs in
+     * an IO thread, see queueClientPushes(). Guarded by the pushes_mutex of
+     * the IO thread, except io_pushes_queued that only the main thread uses. */
+    sds io_pushes;
+    uint64_t io_pushes_flags; /* Client flags to set back in the main thread. */
+    listNode *io_pushes_node; /* list node in io thread push_clients list */
+    int io_pushes_queued;
 } client;
 
 typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
@@ -1744,6 +1752,10 @@ typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
     redisAtomic long long io_reads_processed;   /* Number of read events processed */
     redisAtomic long long io_writes_processed;  /* Number of write events processed */
     list *compression_clients;                  /* Clients that write/read compressed data */
+    pthread_mutex_t pushes_mutex;               /* Mutex for push_clients and clients io_pushes. */
+    list *push_clients;                         /* Clients with push messages from main thread. */
+    list *pushed_clients;                       /* Clients to write after appending their pushes. */
+    redisAtomic int has_pushes;                 /* push_clients may not be empty. */
     size_t cronloops;
 } IOThread;
 
@@ -3476,6 +3488,8 @@ void removeClientFromMemUsageBucket(client *c, int allow_eviction);
 void unlinkClient(client *c);
 void tryUnlinkClientFromPendingRefReply(client *c, int force);
 int writeToClient(client *c, int handler_installed);
+int appendClientPushesInIOThread(client *c, const char *s, size_t len);
+int checkClientOutputBufferLimits(client *c);
 void linkClient(client *c);
 void protectClient(client *c);
 void unprotectClient(client *c);
@@ -3507,6 +3521,9 @@ void assignClientToIOThread(client *c);
 void keepClientInMainThread(client *c);
 void fetchClientFromIOThread(client *c);
 int isClientMustHandledByMainThread(client *c);
+void queueClientPushes(client *c, const char *proto, size_t len, uint64_t flags);
+void fetchClientPushesFromIOThread(client *c);
+void notifyIOThreadsOfPushes(void);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
