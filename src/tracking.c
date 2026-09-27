@@ -244,6 +244,44 @@ void trackingRememberKeys(client *tracking, client *executing) {
     getKeysFreeResult(&result);
 }
 
+/* If the client that sendTrackingMessage() writes to runs in an IO thread,
+ * queue the message for the IO thread, that appends it to the client output
+ * buffers (see queueClientPushes()), and return 1: the main thread must not
+ * touch the client, not even its flags. Otherwise return 0. */
+static int trackingQueueMessage(client *c, char *keyname, size_t keylen, int proto) {
+    client *target = c;
+    if (c->client_tracking_redirection) {
+        target = lookupClientByID(c->client_tracking_redirection);
+        if (!target) {
+            if (c->running_tid == IOTHREAD_MAIN_THREAD_ID) return 0;
+            sds msg = sdsempty();
+            if (c->resp > 2)
+                msg = sdscatfmt(msg,">2\r\n$21\r\ntracking-redir-broken\r\n:%U\r\n",
+                                (unsigned long long)c->client_tracking_redirection);
+            queueClientPushes(c,msg,sdslen(msg),CLIENT_TRACKING_BROKEN_REDIR);
+            sdsfree(msg);
+            return 1;
+        }
+    }
+    if (target->running_tid == IOTHREAD_MAIN_THREAD_ID) return 0;
+
+    /* A client in Pub/Sub mode runs in the main thread, so only a RESP3
+     * client gets the message here, see below. */
+    if (target->resp > 2) {
+        sds msg = sdsnew(">2\r\n$10\r\ninvalidate\r\n");
+        if (proto) {
+            msg = sdscatlen(msg,keyname,keylen);
+        } else {
+            msg = sdscatfmt(msg,"*1\r\n$%U\r\n",(unsigned long long)keylen);
+            msg = sdscatlen(msg,keyname,keylen);
+            msg = sdscatlen(msg,"\r\n",2);
+        }
+        queueClientPushes(target,msg,sdslen(msg),0);
+        sdsfree(msg);
+    }
+    return 1;
+}
+
 /* Given a key name, this function sends an invalidation message in the
  * proper channel (depending on RESP version: PubSub or Push message) and
  * to the proper client (in case of redirection), in the context of the
@@ -257,15 +295,15 @@ void trackingRememberKeys(client *tracking, client *executing) {
  * - Following a flush command, to send a single RESP NULL to indicate
  *   that all keys are now invalid. */
 void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
-    int paused = 0;
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
+    if (trackingQueueMessage(c,keyname,keylen,proto)) return;
 
+    uint64_t old_flags;
     int using_redirection = 0;
     if (c->client_tracking_redirection) {
         client *redir = lookupClientByID(c->client_tracking_redirection);
         if (!redir) {
-            c->flags |= CLIENT_TRACKING_BROKEN_REDIR;
+            old_flags = c->flags;
+            c->flags |= CLIENT_PUSHING | CLIENT_TRACKING_BROKEN_REDIR;
             /* We need to signal to the original connection that we
              * are unable to send invalidation messages to the redirected
              * connection, because the client no longer exist. */
@@ -277,17 +315,13 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
             if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
             return;
         }
-        if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
+        /* Only touch the client we redirect to: the tracking client may
+         * run in an IO thread. */
         c = redir;
         using_redirection = 1;
-        /* Start to touch another client data. */
-        if (c->running_tid != IOTHREAD_MAIN_THREAD_ID) {
-            pauseIOThread(c->running_tid);
-            paused = 1;
-        }
-        old_flags = c->flags;
-        c->flags |= CLIENT_PUSHING;
     }
+    old_flags = c->flags;
+    c->flags |= CLIENT_PUSHING;
 
     /* Only send such info for clients in RESP version 3 or more. However
      * if redirection is active, and the connection we redirect to is
@@ -306,7 +340,7 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
          * it since RESP2 does not support push messages in the same
          * connection. */
         if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
-        goto done;
+        return;
     }
 
     /* Send the "value" part, which is the array of keys. */
@@ -318,17 +352,6 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
     }
     updateClientMemUsageAndBucket(c);
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
-
-done:
-    if (paused) {
-        if (clientHasPendingReplies(c)) {
-            serverAssert(!(c->flags & CLIENT_PENDING_WRITE));
-            /* Actually we install write handler of client which is in IO thread
-             * event loop, it is safe since the io thread is paused */
-            connSetWriteHandler(c->conn, sendReplyToClient);
-        }
-        resumeIOThread(c->running_tid);
-    }
 }
 
 /* This function is called when a key is modified in Redis and in the case

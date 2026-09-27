@@ -229,6 +229,10 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->io_thread_client_list_node = NULL;
     c->io_thread_compression_clients_node = NULL;
+    c->io_pushes = NULL;
+    c->io_pushes_flags = 0;
+    c->io_pushes_node = NULL;
+    c->io_pushes_queued = 0;
     c->postponed_list_node = NULL;
     c->client_tracking_redirection = 0;
     c->client_tracking_prefixes = NULL;
@@ -392,9 +396,10 @@ static int tryAddPayload(client *c, char *buf, size_t *used, size_t size, uint8_
     return 1;
 }
 
-/* Adds the payload to the reply linked list.
+/* Adds the payload to the reply linked list. Returns 1 if the output buffer
+ * limits must be checked.
  * Note: some edits to this function need to be relayed to AddReplyFromClient. */
-static void _addReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
+static inline int _addReplyPayloadToListNoLimitCheck(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
     listNode *ln = listLast(reply_list);
     clientReplyBlock *tail = ln ? listNodeValue(ln) : NULL;
     /* Determine if encoded buffer is required */
@@ -411,8 +416,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
             if (tryAddPayload(c, tail->buf, &tail->used, tail->size, payload_type, (void *)payload, len)) {
                 /* For BULK_STR_REF payloads, tryAddPayload updates shared reply bytes
                  * which accounts for referenced strings. */
-                if (encoded) closeClientOnOutputBufferLimitReached(c, 1);
-                return;
+                return encoded;
             }
         } else if (!encoded) {
             /* Both tail and new payload are non-encoded, can append directly */
@@ -447,9 +451,14 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         }
         listAddNodeTail(reply_list, tail);
         c->reply_bytes += tail->size;
-
-        closeClientOnOutputBufferLimitReached(c, 1);
+        return 1;
     }
+    return 0;
+}
+
+static void _addReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
+    if (_addReplyPayloadToListNoLimitCheck(c, reply_list, payload, len, payload_type))
+        closeClientOnOutputBufferLimitReached(c, 1);
 }
 
 /* The subscribe / unsubscribe command family has a push as a reply,
@@ -579,6 +588,25 @@ void _addReplySegmentsToBufferOrList(client *c, const replySegment *seg, int nse
 void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     replySegment seg = { s, len };
     _addReplySegmentsToBufferOrList(c, &seg, 1);
+}
+
+/* Called by the IO thread running 'c' to append push messages queued by the
+ * main thread, see queueClientPushes(). The IO thread can't free the client,
+ * nor log about it: if the output buffer limits are reached, the client is
+ * handed to the main thread to be closed, and 1 is returned. */
+int appendClientPushesInIOThread(client *c, const char *s, size_t len) {
+    if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return 0;
+    size_t reply_len = _addReplyPayloadToBuffer(c, s, len, PLAIN_REPLY);
+    if (len > reply_len &&
+        _addReplyPayloadToListNoLimitCheck(c, c->reply, s + reply_len,
+                                           len - reply_len, PLAIN_REPLY) &&
+        checkClientOutputBufferLimits(c))
+    {
+        c->io_flags |= CLIENT_IO_OBUF_LIMIT_REACHED;
+        freeClientAsync(c);
+        return 1;
+    }
+    return 0;
 }
 
 /* Check if the client's pending_ref_reply_node is currently linked in the list.
@@ -2186,8 +2214,20 @@ void clearClientConnectionState(client *c) {
 void deauthenticateAndCloseClient(client *c) {
     /* The victim may be owned by an IO thread that reads c->flags concurrently:
      * all flag writes below are guarded by flags implying main-thread residency
-     * (see clearClientPubSubState); the other writes are not read by IO threads. */
-    disableTracking(c);
+     * (see clearClientPubSubState), except the tracking ones, done with the IO
+     * thread paused; the other writes are not read by IO threads. */
+    if (c->flags & CLIENT_TRACKING) {
+        int tid = c->running_tid;
+        if (tid == IOTHREAD_MAIN_THREAD_ID) {
+            disableTracking(c);
+        } else if (pthread_equal(pthread_self(), server.main_thread_id)) {
+            pauseIOThread(tid);
+            disableTracking(c);
+            resumeIOThread(tid);
+        }
+        /* Otherwise we are in a module thread, that can't pause the IO
+         * thread: freeClient() will disable tracking in the main thread. */
+    }
     /* Clear all Pub/Sub subscriptions synchronously *before* dropping the ACL
      * identity. This removes any provenance-stamped user* values right now, so a
      * subsequent synchronous ACLFreeUser() (e.g. the DELUSER that triggered this

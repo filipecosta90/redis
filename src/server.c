@@ -1981,6 +1981,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * IO thread may have replies to write, ensure they are promptly sent to
          * IO threads. */
         processed += sendPendingClientsToIOThreads();
+        notifyIOThreadsOfPushes();
 
         server.events_processed_while_blocked += processed;
         return;
@@ -2121,6 +2122,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Let io thread to handle its pending clients. */
     sendPendingClientsToIOThreads();
+
+    /* Let io threads append the push messages queued for their clients. */
+    notifyIOThreadsOfPushes();
 
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */
     monotime cron_start_time_after_write = getMonotonicUs();
