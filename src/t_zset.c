@@ -2600,7 +2600,13 @@ int zuiBufferFromValue(zsetopval *val) {
  * skiplist input that needs it and the hash is reused for the remaining ones.
  * The caller owns them as locals of its per-member loop body, so a new member
  * always starts with *cached_valid == 0. Both are required, not optional. */
-static int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
+/* NOT static, deliberately. Three review lenses asked for it and it was tried:
+ * making this static lets gcc inline it into the probe loop, and that is a
+ * measured regression on every shape -- listpack 8x100 195.3 -> 224.6 us/call,
+ * skiplist 8x500 67.7 -> 80.7, skiplist 2x500 14.9 -> 17.4. Same class of
+ * per-candidate loop-body cost that made the zsetopval field version slower.
+ * Do not "clean this up" without re-measuring those three cells. */
+int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
             uint64_t *cached_hash, int *cached_valid) {
     if (op->subject == NULL)
         return 0;
