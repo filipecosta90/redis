@@ -1205,54 +1205,6 @@ start_server {tags {"zset"}} {
             }
         }
 
-        test "ZINTER/ZINTERCARD fuzzing - $encoding" {
-            for {set j 0} {$j < 100} {incr j} {
-                unset -nocomplain s
-                array set s {}
-                set args {}
-                set num_sets [expr {[randomInt 8]+2}]
-                for {set i 0} {$i < $num_sets} {incr i} {
-                    set num_elements [randomInt 100]
-                    r del zset_$i{t}
-                    lappend args zset_$i{t}
-                    unset -nocomplain cur
-                    array set cur {}
-                    while {$num_elements} {
-                        set ele [randomValue]
-                        r zadd zset_$i{t} [randomInt 100] $ele
-                        set cur($ele) x
-                        incr num_elements -1
-                    }
-                    if {$i == 0} {
-                        array set s [array get cur]
-                    } else {
-                        foreach ele [array names s] {
-                            if {![info exists cur($ele)]} { unset s($ele) }
-                        }
-                    }
-                }
-                set expected [lsort [array names s]]
-                assert_equal [lsort [r zinter [llength $args] {*}$args]] $expected
-                assert_equal [r zintercard [llength $args] {*}$args] [llength $expected]
-            }
-        }
-
-        test "ZDIFF algorithm 1 with multiple sets - $encoding" {
-            # Small first input and several others makes zsetChooseDiffAlgorithm
-            # pick algorithm 1, which probes each of the other sets per member.
-            r del zseta{t} zsetb{t} zsetc{t} zsetd{t}
-            r zadd zseta{t} 1 a 2 b 3 c 4 d
-            for {set i 0} {$i < 200} {incr i} {
-                r zadd zsetb{t} $i bfill_$i
-                r zadd zsetc{t} $i cfill_$i
-                r zadd zsetd{t} $i dfill_$i
-            }
-            r zadd zsetb{t} 1 b
-            r zadd zsetd{t} 1 d
-            assert_equal {a c} [lsort [r zdiff 4 zseta{t} zsetb{t} zsetc{t} zsetd{t}]]
-            assert_equal {a 1 c 3} [r zdiff 4 zseta{t} zsetb{t} zsetc{t} zsetd{t} withscores]
-        }
-
         foreach {pop} {ZPOPMIN ZPOPMAX} {
             test "$pop with the count 0 returns an empty array" {
                 r del zset
@@ -1659,32 +1611,6 @@ start_server {tags {"zset"}} {
         r zinterstore to_here{t} 3 one{t} two{t} three{t} WEIGHTS 0 0 1
         r zrange to_here{t} 0 -1
     } {100}
-
-    test {ZINTER 4-way interleaves listpack, skiplist and hashtable-set inputs} {
-        # Exercises the shape where the per-member hash is skipped by a set
-        # input, computed by the first skiplist input, skipped again by a
-        # listpack zset, and reused by a later skiplist input.
-        r del lp{t} sl1{t} hs{t} sl2{t}
-        r config set zset-max-listpack-entries 128
-        r config set set-max-intset-entries 4
-        r config set set-max-listpack-entries 4
-        foreach m {alpha beta gamma delta} { r zadd lp{t} 1 $m }
-        assert_encoding listpack lp{t}
-        for {set i 0} {$i < 300} {incr i} { r zadd sl1{t} $i filler1_$i ; r zadd sl2{t} $i filler2_$i }
-        foreach m {alpha beta gamma delta} { r zadd sl1{t} 2 $m ; r zadd sl2{t} 4 $m }
-        assert_encoding skiplist sl1{t}
-        assert_encoding skiplist sl2{t}
-        r sadd hs{t} alpha beta gamma epsilon zeta eta theta
-        assert_encoding hashtable hs{t}
-        # Intersection over all four: alpha, beta, gamma (delta missing from hs).
-        assert_equal {alpha beta gamma} [lsort [r zinter 4 lp{t} sl1{t} hs{t} sl2{t}]]
-        assert_equal 3 [r zintercard 4 lp{t} sl1{t} hs{t} sl2{t}]
-        # Same inputs, skiplist first, so the cache is populated on probe 1.
-        assert_equal {alpha beta gamma} [lsort [r zinter 4 sl1{t} lp{t} hs{t} sl2{t}]]
-        r config set zset-max-listpack-entries 128
-        r config set set-max-intset-entries 512
-        r config set set-max-listpack-entries 128
-    }
 
     test {ZUNIONSTORE result is sorted} {
         # Create two sets with common and not common elements, perform

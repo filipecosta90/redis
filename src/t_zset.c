@@ -2593,15 +2593,8 @@ int zuiBufferFromValue(zsetopval *val) {
 }
 
 /* Find value pointed to by val in the source pointer to by op. When found,
- * return 1 and store its score in target. Return 0 otherwise.
- *
- * "cached_hash"/"cached_valid" are the caller's one-member hash cache, shared
- * across the probes of a single member: the member is hashed on the first
- * skiplist input that needs it and the hash is reused for the remaining ones.
- * The caller owns them as locals of its per-member loop body, so a new member
- * always starts with *cached_valid == 0. Both are required, not optional. */
-int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
-            uint64_t *cached_hash, int *cached_valid) {
+ * return 1 and store its score in target. Return 0 otherwise. */
+int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
     if (op->subject == NULL)
         return 0;
 
@@ -2627,21 +2620,7 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
             dictEntry *de;
-            /* Every sorted set's dict is created with zsetDictType, so a member
-             * hashes the same in all of them. ZINTER/ZINTERCARD/ZDIFF probe one
-             * member in up to setnum-1 of them, so hash it once and reuse the
-             * hash for the rest instead of paying one hash per input key.
-             *
-             * This is safe because zuiSdsFromValue() above materializes
-             * val->ele at most once per candidate (it is a no-op once ele is
-             * set) and nothing in the probe loop mutates those bytes, so the
-             * hash cannot go stale under a member it was not computed for. */
-            debugServerAssert(zs->dict->type == &zsetDictType);
-            if (!*cached_valid) {
-                *cached_hash = dictGetHash(zs->dict,val->ele);
-                *cached_valid = 1;
-            }
-            if ((de = dictFindWithHash(zs->dict,val->ele,*cached_hash)) != NULL) {
+            if ((de = dictFind(zs->dict,val->ele)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
                 *score = znode->score;
                 return 1;
@@ -2753,12 +2732,6 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     while (zuiNext(&src[0],&zval)) {
         double value;
         int exists = 0;
-        /* One hash per candidate, reused across this member's probes.
-         * Kept out of zsetopval on purpose: zuiNext() clears that struct once
-         * per member, and growing it past 80 bytes makes gcc lower the clear
-         * from inline SSE stores to rep stos, which costs more than this saves. */
-        uint64_t cached_hash;
-        int cached_valid = 0;
 
         for (j = 1; j < setnum; j++) {
             /* It is not safe to access the zset we are
@@ -2767,7 +2740,7 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
              * check for a duplicate set in the zsetChooseDiffAlgorithm
              * function, but we're leaving it for future-proofing. */
             if (src[j].subject == src[0].subject ||
-                zuiFind(&src[j],&zval,&value,&cached_hash,&cached_valid)) {
+                zuiFind(&src[j],&zval,&value)) {
                 exists = 1;
                 break;
             }
@@ -3057,10 +3030,6 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiInitIterator(&src[0]);
             while (zuiNext(&src[0],&zval)) {
                 double score, value;
-                /* One hash per candidate -- see zdiffAlgorithm1() for why this
-                 * is a loop local rather than a zsetopval field. */
-                uint64_t cached_hash;
-                int cached_valid = 0;
 
                 score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
@@ -3071,7 +3040,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     if (src[j].subject == src[0].subject) {
                         value = zuiWeightedScore(zval.score, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
-                    } else if (zuiFind(&src[j],&zval,&value,&cached_hash,&cached_valid)) {
+                    } else if (zuiFind(&src[j],&zval,&value)) {
                         value = zuiWeightedScore(value, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
                     } else {
