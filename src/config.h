@@ -174,11 +174,20 @@
 #endif
 
 /* Force inlining where an out-of-line copy would be a measured performance
- * problem rather than just a missed optimization. */
-#if defined(__has_attribute) && __has_attribute(always_inline)
+ * problem rather than just a missed optimization. Expands to
+ * "inline __attribute__((always_inline))", so use it as
+ * "static REDIS_ALWAYS_INLINE <type> f(...)". */
+#if defined(__has_attribute)
+#if __has_attribute(always_inline)
+#define REDIS_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+#endif
+#if !defined(REDIS_ALWAYS_INLINE)
+#if defined(__GNUC__)   /* always_inline predates __has_attribute */
 #define REDIS_ALWAYS_INLINE inline __attribute__((always_inline))
 #else
 #define REDIS_ALWAYS_INLINE inline
+#endif
 #endif
 
 #if defined(__has_attribute)

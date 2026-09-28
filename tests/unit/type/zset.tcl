@@ -1660,30 +1660,55 @@ start_server {tags {"zset"}} {
         r zrange to_here{t} 0 -1
     } {100}
 
-    test {ZINTER 4-way interleaves listpack, skiplist and hashtable-set inputs} {
-        # Exercises the shape where the per-member hash is skipped by a set
-        # input, computed by the first skiplist input, skipped again by a
-        # listpack zset, and reused by a later skiplist input.
-        r del lp{t} sl1{t} hs{t} sl2{t}
+    test {ZINTER reuses a member hash across probes, skipping non-hashing inputs} {
+        # Inputs are sorted ascending by cardinality (zuiCompareByCardinality),
+        # so cardinality -- not argument order -- fixes the probe order. Sized
+        # so the smallest input is the iterated one and the probes run
+        # skiplist -> hashtable-set -> listpack -> skiplist, i.e. the hash is
+        # computed on probe 1, skipped by probes 2 and 3, and reused on probe 4.
+        set orig_zle [lindex [r config get zset-max-listpack-entries] 1]
+        set orig_zlv [lindex [r config get zset-max-listpack-value] 1]
+        set orig_sle [lindex [r config get set-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 128
-        r config set set-max-intset-entries 4
-        r config set set-max-listpack-entries 4
-        foreach m {alpha beta gamma delta} { r zadd lp{t} 1 $m }
-        assert_encoding listpack lp{t}
-        for {set i 0} {$i < 300} {incr i} { r zadd sl1{t} $i filler1_$i ; r zadd sl2{t} $i filler2_$i }
-        foreach m {alpha beta gamma delta} { r zadd sl1{t} 2 $m ; r zadd sl2{t} 4 $m }
-        assert_encoding skiplist sl1{t}
-        assert_encoding skiplist sl2{t}
-        r sadd hs{t} alpha beta gamma epsilon zeta eta theta
+        r config set zset-max-listpack-value 16
+        r config set set-max-listpack-entries 8
+        r del seed{t} sk1{t} hs{t} lp{t} sk2{t}
+
+        # src[0], iterated (4)
+        foreach m {alpha beta gamma delta} { r zadd seed{t} 1 $m }
+        # probe 1 (10): skiplist, forced by one over-long member
+        foreach m {alpha beta gamma} { r zadd sk1{t} 2 $m }
+        for {set i 0} {$i < 6} {incr i} { r zadd sk1{t} $i s1_$i }
+        r zadd sk1{t} 9 [string repeat x 32]
+        # probe 2 (20): hashtable set -- never hashes through the zset path
+        foreach m {alpha beta gamma} { r sadd hs{t} $m }
+        for {set i 0} {$i < 17} {incr i} { r sadd hs{t} h_$i }
+        # probe 3 (103): listpack zset -- zzlFind(), no dict hash
+        foreach m {alpha beta gamma} { r zadd lp{t} 3 $m }
+        for {set i 0} {$i < 100} {incr i} { r zadd lp{t} $i l_$i }
+        # probe 4 (303): skiplist again -- must reuse the cached hash
+        foreach m {alpha beta gamma} { r zadd sk2{t} 4 $m }
+        for {set i 0} {$i < 300} {incr i} { r zadd sk2{t} $i s2_$i }
+
+        assert_encoding skiplist sk1{t}
         assert_encoding hashtable hs{t}
-        # Intersection over all four: alpha, beta, gamma (delta missing from hs).
-        assert_equal {alpha beta gamma} [lsort [r zinter 4 lp{t} sl1{t} hs{t} sl2{t}]]
-        assert_equal 3 [r zintercard 4 lp{t} sl1{t} hs{t} sl2{t}]
-        # Same inputs, skiplist first, so the cache is populated on probe 1.
-        assert_equal {alpha beta gamma} [lsort [r zinter 4 sl1{t} lp{t} hs{t} sl2{t}]]
-        r config set zset-max-listpack-entries 128
-        r config set set-max-intset-entries 512
-        r config set set-max-listpack-entries 128
+        assert_encoding listpack lp{t}
+        assert_encoding skiplist sk2{t}
+        assert_equal {4 10 20 103 303} [list [r zcard seed{t}] [r zcard sk1{t}] \
+            [r scard hs{t}] [r zcard lp{t}] [r zcard sk2{t}]]
+
+        assert_equal {alpha beta gamma} [lsort [r zinter 5 seed{t} sk1{t} hs{t} lp{t} sk2{t}]]
+        assert_equal 3 [r zintercard 5 seed{t} sk1{t} hs{t} lp{t} sk2{t}]
+        # WITHSCORES exercises zuiFind()'s other output, the score it stores.
+        # Scores sum across all five inputs: 1 + 2 + 1.0 (set member) + 3 + 4.
+        assert_equal {alpha 11 beta 11 gamma 11} \
+            [r zinter 5 seed{t} sk1{t} hs{t} lp{t} sk2{t} withscores]
+        # LIMIT stops the candidate loop early; the cache must still be per-member.
+        assert_equal 2 [r zintercard 5 seed{t} sk1{t} hs{t} lp{t} sk2{t} limit 2]
+
+        r config set zset-max-listpack-entries $orig_zle
+        r config set zset-max-listpack-value $orig_zlv
+        r config set set-max-listpack-entries $orig_sle
     }
 
     test {ZUNIONSTORE result is sorted} {

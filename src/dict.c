@@ -759,14 +759,21 @@ void dictRelease(dict *d)
 
 /* Same as dictFindLinkInternal(), but takes the key's hash from the caller.
  *
- * `hash` MUST be what dictGetHash(d, key) would have returned. Callers are
- * responsible for the "empty dict and no bucket wanted" early return, so that
- * they can skip hashing entirely in that case.
+ * `hash` MUST be what dictGetHash(d, key) would have returned.
+ *
+ * Callers MUST return early when dictSize(d) == 0 and no bucket is wanted:
+ * this body indexes ht_table[table] unconditionally, which is a NULL deref on
+ * an empty dict. dictFindLinkInternal() additionally uses that to skip hashing;
+ * dictFindWithHash() cannot, since its caller has already hashed.
  *
  * REDIS_ALWAYS_INLINE is load-bearing, not decorative: with the attribute
  * removed, clang leaves an out-of-line copy at every -O level and gcc does at
  * -O0/-Os, and an out-of-line version of this body was measured to slow down
- * every dictFind() caller in the server. Do not drop it. */
+ * every dictFind() caller in the server. Do not drop it.
+ *
+ * The cost is code size, and it is confined here: dict.o .text grows ~600 bytes
+ * because this body is instantiated twice, while dictFind() and dictFindLink()
+ * themselves come out byte-identical to before the split. */
 static REDIS_ALWAYS_INLINE
 dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
                                            dictEntryLink *bucket) {
@@ -809,9 +816,9 @@ dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t ha
  * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
  */
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
-    /* No bucket wanted and nothing to find: don't pay for a hash we'd discard.
-     * (dictFindLink() already filters this; dictSetKeyAtLink() passes a bucket
-     * and must still fall through.) */
+    /* Defensive: no in-tree caller reaches this today -- dictFindLink() already
+     * returns on an empty dict and dictSetKeyAtLink() always passes a bucket --
+     * but keep it so a future caller cannot pay for a hash it would discard. */
     if (unlikely(!bucket && dictSize(d) == 0)) return NULL;
 
     return dictFindLinkInternalWithHash(d, key, dictGetHash(d, key), bucket);
@@ -825,9 +832,11 @@ dictEntry *dictFind(dict *d, const void *key)
 
 /* Like dictFind(), but takes the key's hash from the caller, so that one key
  * can be looked up in several dicts while being hashed only once. `hash` must
- * come from dictGetHash() on a dict using the same hashFunction -- a stale or
- * foreign hash would silently return the wrong entry rather than crash, so it
- * is checked under DEBUG_ASSERTIONS.
+ * come from dictGetHash() on a dict using the same hashFunction. The key is
+ * still compared, so a stale or foreign hash cannot return the wrong entry --
+ * it probes the wrong bucket and reports the key as missing, i.e. a silently
+ * wrong answer (a dropped ZINTER member) rather than a crash. That is the
+ * harder failure to notice, so it is checked under DEBUG_ASSERTIONS.
  *
  * Counterpart of dictFindByHashAndPtr(), which matches on pointer identity;
  * this one compares keys, as dictFind() does. */

@@ -2600,7 +2600,7 @@ int zuiBufferFromValue(zsetopval *val) {
  * skiplist input that needs it and the hash is reused for the remaining ones.
  * The caller owns them as locals of its per-member loop body, so a new member
  * always starts with *cached_valid == 0. Both are required, not optional. */
-int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
+static int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
             uint64_t *cached_hash, int *cached_valid) {
     if (op->subject == NULL)
         return 0;
@@ -2636,7 +2636,12 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
              * val->ele at most once per candidate (it is a no-op once ele is
              * set) and nothing in the probe loop mutates those bytes, so the
              * hash cannot go stale under a member it was not computed for. */
-            debugServerAssert(zs->dict->type == &zsetDictType);
+            /* The premise that lets the hash be shared. Compares the hash
+             * function rather than the dictType pointer, since dictTypeAddMeta()
+             * legitimately swaps d->type for a different dictType. The
+             * enforcing check is in dictFindWithHash(); this documents why. */
+            debugServerAssert(zs->dict->type->hashFunction ==
+                              zsetDictType.hashFunction);
             if (!*cached_valid) {
                 *cached_hash = dictGetHash(zs->dict,val->ele);
                 *cached_valid = 1;
@@ -2757,8 +2762,10 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
          * Kept out of zsetopval on purpose: zuiNext() clears that struct once
          * per member, and growing it past 80 bytes makes gcc lower the clear
          * from inline SSE stores to rep stos, which costs more than this saves. */
-        uint64_t cached_hash;
-        int cached_valid = 0;
+        uint64_t cached_hash;   /* Deliberately uninitialised: only read after
+                                 * zuiFind() writes it, and "= 0" grows this
+                                 * per-candidate loop body by 32 bytes. */
+        int cached_valid = 0;   /* MUST be 0 on a member's first probe. */
 
         for (j = 1; j < setnum; j++) {
             /* It is not safe to access the zset we are
@@ -3059,8 +3066,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 double score, value;
                 /* One hash per candidate -- see zdiffAlgorithm1() for why this
                  * is a loop local rather than a zsetopval field. */
-                uint64_t cached_hash;
-                int cached_valid = 0;
+                uint64_t cached_hash;   /* Uninitialised on purpose -- see
+                                         * zdiffAlgorithm1(). */
+                int cached_valid = 0;   /* MUST be 0 on a member's first probe. */
 
                 score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
