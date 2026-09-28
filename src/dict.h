@@ -267,7 +267,7 @@ void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink llink, int table_index);
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
 dictEntry *dictFindByHashAndPtr(dict *d, const void *oldptr, const uint64_t hash);
-dictEntry *dictFindCachedHash(dict *d, const void *key, uint64_t *hash, int *hash_valid);
+dictEntry *dictFindWithHash(dict *d, const void *key, uint64_t hash);
 int dictShrinkIfNeeded(dict *d);
 int dictExpandIfNeeded(dict *d);
 void *dictGetKey(const dictEntry *de);
@@ -296,7 +296,11 @@ int dictRehashMicroseconds(dict *d, uint64_t us);
 void dictSetHashFunctionSeed(uint8_t *seed);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 unsigned long dictScanDefrag(dict *d, unsigned long v, dictScanFunction *fn, dictDefragFunctions *defragfns, void *privdata);
-uint64_t dictGetHash(dict *d, const void *key);
+/* Inline so callers outside dict.c can compute a key's hash without paying a
+ * call for it -- which is what makes dictFindWithHash() worth having. */
+static inline uint64_t dictGetHash(dict *d, const void *key) {
+    return d->type->hashFunction(key);
+}
 void dictRehashingInfo(dict *d, unsigned long long *from_size, unsigned long long *to_size);
 
 size_t dictGetStatsMsg(char *buf, size_t bufsize, dictStats *stats, int full);

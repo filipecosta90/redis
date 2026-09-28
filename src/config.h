@@ -173,6 +173,14 @@
 #define unlikely(x) (x)
 #endif
 
+/* Force inlining where an out-of-line copy would be a measured performance
+ * problem rather than just a missed optimization. */
+#if defined(__has_attribute) && __has_attribute(always_inline)
+#define REDIS_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define REDIS_ALWAYS_INLINE inline
+#endif
+
 #if defined(__has_attribute)
 #if __has_attribute(no_sanitize)
 #define REDIS_NO_SANITIZE(sanitizer) __attribute__((no_sanitize(sanitizer)))
