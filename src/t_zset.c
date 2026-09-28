@@ -2600,12 +2600,10 @@ int zuiBufferFromValue(zsetopval *val) {
  * skiplist input that needs it and the hash is reused for the remaining ones.
  * The caller owns them as locals of its per-member loop body, so a new member
  * always starts with *cached_valid == 0. Both are required, not optional. */
-/* NOT static, deliberately. Three review lenses asked for it and it was tried:
- * making this static lets gcc inline it into the probe loop, and that is a
- * measured regression on every shape -- listpack 8x100 195.3 -> 224.6 us/call,
- * skiplist 8x500 67.7 -> 80.7, skiplist 2x500 14.9 -> 17.4. Same class of
- * per-candidate loop-body cost that made the zsetopval field version slower.
- * Do not "clean this up" without re-measuring those three cells. */
+/* Deliberately not static. Making it static lets gcc inline it into the probe
+ * loop, and the resulting per-candidate loop body costs more than the call it
+ * removes: listpack 8x100 195.3 -> 224.6 us/call, skiplist 8x500 67.7 -> 80.7,
+ * skiplist 2x500 14.9 -> 17.4. Re-measure those three shapes before changing. */
 int zuiFind(zsetopsrc *op, zsetopval *val, double *score,
             uint64_t *cached_hash, int *cached_valid) {
     if (op->subject == NULL)
@@ -2769,8 +2767,9 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
          * per member, and growing it past 80 bytes makes gcc lower the clear
          * from inline SSE stores to rep stos, which costs more than this saves. */
         uint64_t cached_hash;   /* Deliberately uninitialised: only read after
-                                 * zuiFind() writes it, and "= 0" grows this
-                                 * per-candidate loop body by 32 bytes. */
+                                 * zuiFind() writes it. "= 0" measurably grows
+                                 * this per-candidate loop body (32 bytes with
+                                 * gcc 13 at -O3). */
         int cached_valid = 0;   /* MUST be 0 on a member's first probe. */
 
         for (j = 1; j < setnum; j++) {

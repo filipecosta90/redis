@@ -296,8 +296,8 @@ int dictRehashMicroseconds(dict *d, uint64_t us);
 void dictSetHashFunctionSeed(uint8_t *seed);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 unsigned long dictScanDefrag(dict *d, unsigned long v, dictScanFunction *fn, dictDefragFunctions *defragfns, void *privdata);
-/* Inline so callers outside dict.c can compute a key's hash without paying a
- * call for it -- which is what makes dictFindWithHash() worth having. */
+/* Inline so callers outside dict.c do not pay a call to compute a hash they are
+ * about to pass straight back into dict.c. */
 static inline uint64_t dictGetHash(dict *d, const void *key) {
     return d->type->hashFunction(key);
 }

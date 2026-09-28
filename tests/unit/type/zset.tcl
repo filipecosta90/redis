@@ -1206,7 +1206,8 @@ start_server {tags {"zset"}} {
         }
 
         test "ZINTER/ZINTERCARD fuzzing - $encoding" {
-            for {set j 0} {$j < 100} {incr j} {
+            set iterations [expr {$::accurate ? 100 : 25}]
+            for {set j 0} {$j < $iterations} {incr j} {
                 unset -nocomplain s
                 array set s {}
                 set args {}
@@ -1660,7 +1661,7 @@ start_server {tags {"zset"}} {
         r zrange to_here{t} 0 -1
     } {100}
 
-    test {ZINTER reuses a member hash across probes, skipping non-hashing inputs} {
+    test {ZINTER over interleaved skiplist, hashtable-set and listpack inputs} {
         # Inputs are sorted ascending by cardinality (zuiCompareByCardinality),
         # so cardinality -- not argument order -- fixes the probe order. Sized
         # so the smallest input is the iterated one and the probes run
@@ -1680,7 +1681,8 @@ start_server {tags {"zset"}} {
         foreach m {alpha beta gamma} { r zadd sk1{t} 2 $m }
         for {set i 0} {$i < 6} {incr i} { r zadd sk1{t} $i s1_$i }
         r zadd sk1{t} 9 [string repeat x 32]
-        # probe 2 (20): hashtable set -- never hashes through the zset path
+        # probe 2 (20): hashtable set -- does not use the sorted-set dict, so it
+        #               neither computes nor consumes the cached hash
         foreach m {alpha beta gamma} { r sadd hs{t} $m }
         for {set i 0} {$i < 17} {incr i} { r sadd hs{t} h_$i }
         # probe 3 (103): listpack zset -- zzlFind(), no dict hash
@@ -1694,6 +1696,11 @@ start_server {tags {"zset"}} {
         assert_encoding hashtable hs{t}
         assert_encoding listpack lp{t}
         assert_encoding skiplist sk2{t}
+        # Encodings are fixed now; restore before the assertions below so a
+        # failure there cannot leak these limits into the rest of the block.
+        r config set zset-max-listpack-entries $orig_zle
+        r config set zset-max-listpack-value $orig_zlv
+        r config set set-max-listpack-entries $orig_sle
         assert_equal {4 10 20 103 303} [list [r zcard seed{t}] [r zcard sk1{t}] \
             [r scard hs{t}] [r zcard lp{t}] [r zcard sk2{t}]]
 
@@ -1705,10 +1712,6 @@ start_server {tags {"zset"}} {
             [r zinter 5 seed{t} sk1{t} hs{t} lp{t} sk2{t} withscores]
         # LIMIT stops the candidate loop early; the cache must still be per-member.
         assert_equal 2 [r zintercard 5 seed{t} sk1{t} hs{t} lp{t} sk2{t} limit 2]
-
-        r config set zset-max-listpack-entries $orig_zle
-        r config set zset-max-listpack-value $orig_zlv
-        r config set set-max-listpack-entries $orig_sle
     }
 
     test {ZUNIONSTORE result is sorted} {

@@ -768,12 +768,14 @@ void dictRelease(dict *d)
  *
  * REDIS_ALWAYS_INLINE is load-bearing, not decorative: with the attribute
  * removed, clang leaves an out-of-line copy at every -O level and gcc does at
- * -O0/-Os, and an out-of-line version of this body was measured to slow down
- * every dictFind() caller in the server. Do not drop it.
+ * -O0/-Os, which puts a call back on the dictFind()/dictFindLink() path -- an
+ * earlier iteration with this body out of line regressed the ZUNION benchmarks.
+ * Do not drop it.
  *
- * The cost is code size, and it is confined here: dict.o .text grows ~600 bytes
+ * The cost is code size, and it is confined here: dict.o .text grows ~560 bytes
  * because this body is instantiated twice, while dictFind() and dictFindLink()
- * themselves come out byte-identical to before the split. */
+ * still compile to the same instruction sequences as before the split (20 and
+ * 11 instructions; only branch displacements differ). */
 static REDIS_ALWAYS_INLINE
 dictEntryLink dictFindLinkInternalWithHash(dict *d, const void *key, uint64_t hash,
                                            dictEntryLink *bucket) {
