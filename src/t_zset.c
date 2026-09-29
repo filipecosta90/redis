@@ -1274,6 +1274,16 @@ static unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds el
     return zl;
 }
 
+/* Return 1 when the (member,score) pair at (eptr,sptr) sorts strictly after
+ * (score,ele) in sorted set order, i.e. when (score,ele) has to be placed
+ * before it. */
+static int zzlPairOrdersAfter(unsigned char *eptr, unsigned char *sptr, double score, sds ele) {
+    double s = zzlGetScore(sptr);
+
+    if (s != score) return s > score;
+    return zzlCompareElements(eptr,(unsigned char*)ele,sdslen(ele)) > 0;
+}
+
 /* Insert (element,score) pair in listpack. This function assumes the element is
  * not yet present in the list. */
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
@@ -1642,10 +1652,89 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             if (newscore) *newscore = score;
 
-            /* Remove and re-insert when score changed. */
+            /* Update the score when it changed. Deleting the pair and
+             * re-inserting it makes zzlInsert() rescan the listpack from the
+             * head, decoding a score per entry, even though the member is
+             * already sorted and a score change usually moves it by only a
+             * few positions. Walk outwards from the member's own position in
+             * the direction of the change instead, and overwrite the score in
+             * place when the member does not have to move at all. */
             if (score != curscore) {
-                zobj->ptr = zzlDelete(zobj->ptr,eptr);
-                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                unsigned char *zl = zobj->ptr;
+                unsigned char *sptr = lpNext(zl,eptr);
+                unsigned char *tptr;    /* Insert before this pair, NULL = tail. */
+                unsigned long moved = 0;
+
+                serverAssert(sptr != NULL);
+                if (score > curscore) {
+                    /* The member can only move towards the tail: the pair
+                     * before it already sorts before the old score, and so
+                     * before the larger new one. */
+                    unsigned char *neptr = eptr, *nsptr = sptr;
+
+                    zzlNext(zl,&neptr,&nsptr);
+                    while (neptr != NULL &&
+                           !zzlPairOrdersAfter(neptr,nsptr,score,ele))
+                    {
+                        zzlNext(zl,&neptr,&nsptr);
+                        moved++;
+                    }
+                    tptr = neptr;
+                } else {
+                    /* Mirror image: the member can only move towards the
+                     * head, so scan backwards over the pairs that now sort
+                     * after it. */
+                    unsigned char *peptr = eptr, *psptr = sptr;
+
+                    while (1) {
+                        unsigned char *qeptr = peptr, *qsptr = psptr;
+
+                        zzlPrev(zl,&qeptr,&qsptr);
+                        if (qeptr == NULL ||
+                            !zzlPairOrdersAfter(qeptr,qsptr,score,ele))
+                        {
+                            tptr = peptr;
+                            break;
+                        }
+                        peptr = qeptr;
+                        psptr = qsptr;
+                        moved++;
+                    }
+                }
+
+                if (moved == 0) {
+                    /* The member keeps its position, so only the score entry
+                     * has to be rewritten. Encode it exactly as zzlInsertAt()
+                     * would; the number of entries does not change. */
+                    long long lscore;
+
+                    if (double2ll(score,&lscore)) {
+                        zl = lpReplaceInteger(zl,&sptr,lscore);
+                    } else {
+                        char scorebuf[MAX_D2STRING_CHARS];
+                        int scorelen = d2string(scorebuf,sizeof(scorebuf),score);
+
+                        zl = lpReplace(zl,&sptr,(unsigned char*)scorebuf,scorelen);
+                    }
+                } else {
+                    /* Remember the insertion point as an offset: deleting the
+                     * old pair may reallocate the listpack, and shifts
+                     * everything behind the pair to the left. */
+                    size_t toff = 0;
+
+                    if (tptr != NULL) {
+                        toff = (size_t)(tptr-zl);
+                        if (tptr > sptr) {
+                            unsigned char *next = lpNext(zl,sptr);
+
+                            serverAssert(next != NULL);
+                            toff -= (size_t)(next-eptr);
+                        }
+                    }
+                    zl = zzlDelete(zl,eptr);
+                    zl = zzlInsertAt(zl,tptr == NULL ? NULL : zl+toff,ele,score);
+                }
+                zobj->ptr = zl;
                 *out_flags |= ZADD_OUT_UPDATED;
             }
             return 1;
