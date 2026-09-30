@@ -3924,11 +3924,16 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     uint8_t *tags = zbtScoreLeafHashTags(leaf);
     unsigned int leafcount = leaf->n.count;
     unsigned int nwords = leafcount / 8;
+    /* Index tag 1 represents stored leaf tags 0 and 1. Fold just that pair
+     * before matching so each word needs one mask computation. All other
+     * tags retain their complete byte value. Exact lane checks below still
+     * reject the usual SWAR carry false positives. */
+    uint64_t keep_bits = tag == 1 ? ~UINT64_C(0x0101010101010101) : UINT64_MAX;
+    uint8_t match_tag = tag == 1 ? 0 : tag;
     for (unsigned int w = 0; w < nwords; w++) {
         uint64_t word;
         memcpy(&word, tags + w * 8, 8);
-        uint64_t mask = zbtIndexTagMask(word, tag);
-        if (tag == 1) mask |= zbtIndexTagMask(word, 0);
+        uint64_t mask = zbtIndexTagMask(word & keep_bits, match_tag);
         while (mask) {
             unsigned int lane = zbtIndexFirstTag(mask);
             unsigned int physical = w * 8 + lane;
@@ -4144,6 +4149,52 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             if (seen[i] == 0) missed++;
         test_cond("Cursor-driven scan visits every live member at least once",
             missed == 0);
+        zfree(seen);
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree ZSCAN with colliding zero/one leaf tags\n");
+    {
+        const int N = 257, LIMIT = 1000000;
+        zbtreeSet *zs = zbtreeCreate();
+        zbtreeReserve(zs, N);
+        int *seen = zcalloc(sizeof(int) * LIMIT);
+        unsigned char *expected = zcalloc(LIMIT);
+        int inserted = 0, limit = 0;
+        /* Choose real members with alternating hash tag bytes 0, 1, 2, 3.
+         * Zero and one share the same index tag; the neighboring byte values
+         * also exercise the exact checks after a word-mask match. The sparse
+         * membership oracle is independent of the scan's tag matching. */
+        for (int i = 0; i < LIMIT && inserted < N; i++) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "member:%d", i);
+            uint32_t hash = (uint32_t)dictGenHashFunction(buf, len);
+            if ((hash >> 24) != (unsigned int)(inserted % 4)) continue;
+            sds ele = sdsnewlen(buf, len);
+            double score;
+            zbtreeInsertPosition position;
+            serverAssert(!zbtreeFindForAdd(zs, ele, &score, &position));
+            zbtreeInsertNew(zs, (double)inserted, ele, &position);
+            sdsfree(ele);
+            expected[i] = 1;
+            limit = i + 1;
+            inserted++;
+        }
+        serverAssert(inserted == N);
+        zbtScanTestPrivdata pd = {seen, limit};
+        uint64_t cursor = 0;
+        unsigned long calls = 0;
+        do {
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
+            serverAssert(++calls < 100000);
+        } while (cursor);
+        int complete = 1;
+        for (int i = 0; i < limit; i++) {
+            if ((seen[i] != 0) != (expected[i] != 0)) complete = 0;
+        }
+        test_cond("Scan preserves membership with zero/one aliases and adjacent tags",
+                  complete);
+        zfree(expected);
         zfree(seen);
         zbtreeFree(zs);
     }
