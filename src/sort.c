@@ -161,6 +161,21 @@ int sortCompare(const void *s1, const void *s2) {
                     cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
                 }
             }
+            /* The weights compared equal (or both of them were missing):
+             * fall back to comparing the elements themselves, so that the
+             * result does not depend on the order the sorting vector happened
+             * to be built in -- which, for set and sorted set inputs, comes
+             * from a hash table that is reseeded at every server start. Same
+             * reason the numeric comparison above breaks its ties.
+             *
+             * This is compareStringObjects() and not collateStringObjects()
+             * even though the comparison a few lines above may use strcoll():
+             * the tie order must be a total order over arbitrary binary
+             * elements, and strcoll() cannot provide one -- it stops at the
+             * first NUL, and ties every string it cannot convert under a
+             * multibyte locale. */
+            if (cmp == 0)
+                cmp = compareStringObjects(so1->obj,so2->obj);
         } else {
             /* Compare elements directly. */
             if (server.sort_store) {
