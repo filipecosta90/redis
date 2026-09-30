@@ -1347,27 +1347,27 @@ start_server {tags {"zset"}} {
     test {ZSET with a large member stays in the B+ tree encoding} {
         set original_max [lindex [r config get zset-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 0
-        r del large-member-zset
-        r zadd large-member-zset 1 short
-        assert_encoding btree large-member-zset
+        r del large-member-zset{t}
+        r zadd large-member-zset{t} 1 short
+        assert_encoding btree large-member-zset{t}
 
         set large [string repeat x 4096]
-        r zadd large-member-zset 2 $large
-        assert_encoding btree large-member-zset
-        assert_equal {short 1} [r zrange large-member-zset 0 0 withscores]
-        assert_equal 2 [r zscore large-member-zset $large]
+        r zadd large-member-zset{t} 2 $large
+        assert_encoding btree large-member-zset{t}
+        assert_equal {short 1} [r zrange large-member-zset{t} 0 0 withscores]
+        assert_equal 2 [r zscore large-member-zset{t} $large]
 
         # Exercise lookup, ordering, score changes, and scans while the long
         # member is stored outside its score leaf.
-        r zadd large-member-zset 1.5 middle 3 tail
-        assert_equal 2 [r zrank large-member-zset $large]
-        assert_equal 1 [r zrevrank large-member-zset $large]
+        r zadd large-member-zset{t} 1.5 middle 3 tail
+        assert_equal 2 [r zrank large-member-zset{t} $large]
+        assert_equal 1 [r zrevrank large-member-zset{t} $large]
         assert_equal {middle 1.5} \
-            [r zrange large-member-zset 1.5 1.5 byscore withscores]
-        assert_equal 0 [r zadd large-member-zset 0 $large]
-        assert_equal $large [r zrange large-member-zset 0 0]
+            [r zrange large-member-zset{t} 1.5 1.5 byscore withscores]
+        assert_equal 0 [r zadd large-member-zset{t} 0 $large]
+        assert_equal $large [r zrange large-member-zset{t} 0 0]
 
-        set scanned [lindex [r zscan large-member-zset 0 count 100] 1]
+        set scanned [lindex [r zscan large-member-zset{t} 0 count 100] 1]
         set scanned_members {}
         foreach {member score} $scanned {
             lappend scanned_members $member
@@ -1375,21 +1375,21 @@ start_server {tags {"zset"}} {
         assert_equal [lsort [list short middle tail $large]] \
                      [lsort $scanned_members]
 
-        r del large-member-other
-        r zadd large-member-other 5 $large 7 other
-        assert_encoding btree large-member-other
+        r del large-member-other{t}
+        r zadd large-member-other{t} 5 $large 7 other
+        assert_encoding btree large-member-other{t}
         assert_equal [list $large 5] \
-            [r zinter 2 large-member-zset large-member-other withscores]
+            [r zinter 2 large-member-zset{t} large-member-other{t} withscores]
 
-        r del large-member-copy
-        assert_equal 1 [r copy large-member-zset large-member-copy]
-        assert_encoding btree large-member-copy
-        assert_equal [r zrange large-member-zset 0 -1 withscores] \
-                     [r zrange large-member-copy 0 -1 withscores]
-        assert_equal 1 [r zrem large-member-zset middle]
-        assert_equal 1 [r zremrangebyscore large-member-zset 3 3]
-        assert_equal [list $large 0] [r zpopmin large-member-zset]
-        assert_equal 0 [r zscore large-member-copy $large]
+        r del large-member-copy{t}
+        assert_equal 1 [r copy large-member-zset{t} large-member-copy{t}]
+        assert_encoding btree large-member-copy{t}
+        assert_equal [r zrange large-member-zset{t} 0 -1 withscores] \
+                     [r zrange large-member-copy{t} 0 -1 withscores]
+        assert_equal 1 [r zrem large-member-zset{t} middle]
+        assert_equal 1 [r zremrangebyscore large-member-zset{t} 3 3]
+        assert_equal [list $large 0] [r zpopmin large-member-zset{t}]
+        assert_equal 0 [r zscore large-member-copy{t} $large]
 
         r config set zset-max-listpack-entries $original_max
     }
@@ -1450,26 +1450,26 @@ start_server {tags {"zset"}} {
     test {ZSET btree byte-full edge pages preserve order} {
         set original_max [lindex [r config get zset-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 0
-        r del edge-right edge-left
+        r del edge-right{t} edge-left{t}
 
         for {set j 0} {$j < 200} {incr j} {
             set member [format "%04d%s" $j [string repeat x 296]]
-            r zadd edge-right $j $member
-            r zadd edge-left [expr {-$j}] $member
+            r zadd edge-right{t} $j $member
+            r zadd edge-left{t} [expr {-$j}] $member
         }
 
         set first [format "%04d%s" 0 [string repeat x 296]]
         set last [format "%04d%s" 199 [string repeat x 296]]
-        assert_encoding btree edge-right
-        assert_encoding btree edge-left
-        assert_equal $first [r zrange edge-right 0 0]
-        assert_equal $last [r zrange edge-right -1 -1]
-        assert_equal $last [r zrange edge-left 0 0]
-        assert_equal $first [r zrange edge-left -1 -1]
+        assert_encoding btree edge-right{t}
+        assert_encoding btree edge-left{t}
+        assert_equal $first [r zrange edge-right{t} 0 0]
+        assert_equal $last [r zrange edge-right{t} -1 -1]
+        assert_equal $last [r zrange edge-left{t} 0 0]
+        assert_equal $first [r zrange edge-left{t} -1 -1]
 
-        assert_equal 150 [r zremrangebyrank edge-right 25 174]
-        assert_equal [r zrange edge-right 0 -1] \
-                     [lreverse [r zrevrange edge-right 0 -1]]
+        assert_equal 150 [r zremrangebyrank edge-right{t} 25 174]
+        assert_equal [r zrange edge-right{t} 0 -1] \
+                     [lreverse [r zrevrange edge-right{t} 0 -1]]
 
         r config set zset-max-listpack-entries $original_max
     }
@@ -1477,37 +1477,37 @@ start_server {tags {"zset"}} {
     test {ZSET btree large range deletion rebuilds a usable member index} {
         set original_max [lindex [r config get zset-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 0
-        r del delete-rank delete-score
+        r del delete-rank{t} delete-score{t}
 
         set args {}
         for {set j 0} {$j < 2048} {incr j} {
             set member [format "member:%04d:%s" $j [string repeat x 372]]
             lappend args $j $member
         }
-        assert_equal 2048 [r zadd delete-rank {*}$args]
-        assert_equal 1 [r copy delete-rank delete-score]
+        assert_equal 2048 [r zadd delete-rank{t} {*}$args]
+        assert_equal 1 [r copy delete-rank{t} delete-score{t}]
 
-        assert_equal 1025 [r zremrangebyrank delete-rank 512 1536]
-        assert_equal 1025 [r zremrangebyscore delete-score 512 1536]
-        assert_equal [r zrange delete-rank 0 -1 withscores] \
-                     [r zrange delete-score 0 -1 withscores]
-        assert_equal 1023 [r zcard delete-rank]
+        assert_equal 1025 [r zremrangebyrank delete-rank{t} 512 1536]
+        assert_equal 1025 [r zremrangebyscore delete-score{t} 512 1536]
+        assert_equal [r zrange delete-rank{t} 0 -1 withscores] \
+                     [r zrange delete-score{t} 0 -1 withscores]
+        assert_equal 1023 [r zcard delete-rank{t}]
         set member511 [format "member:%04d:%s" 511 [string repeat x 372]]
         set member512 [format "member:%04d:%s" 512 [string repeat x 372]]
         set member1537 [format "member:%04d:%s" 1537 [string repeat x 372]]
-        assert_equal 511 [r zrank delete-rank $member511]
-        assert_equal 512 [r zrank delete-rank $member1537]
-        assert_equal {} [r zscore delete-rank $member512]
+        assert_equal 511 [r zrank delete-rank{t} $member511]
+        assert_equal 512 [r zrank delete-rank{t} $member1537]
+        assert_equal {} [r zscore delete-rank{t} $member512]
 
         set member0 [format "member:%04d:%s" 0 [string repeat x 372]]
         set member2047 [format "member:%04d:%s" 2047 [string repeat x 372]]
-        foreach key {delete-rank delete-score} {
+        foreach key {delete-rank{t} delete-score{t}} {
             assert_equal 1 [r zadd $key 1000 new-member]
             assert_equal 0 [r zadd $key 3000 $member0]
             assert_equal 1 [r zrem $key $member2047]
         }
-        assert_equal [r zrange delete-rank 0 -1 withscores] \
-                     [r zrange delete-score 0 -1 withscores]
+        assert_equal [r zrange delete-rank{t} 0 -1 withscores] \
+                     [r zrange delete-score{t} 0 -1 withscores]
 
         r config set zset-max-listpack-entries $original_max
     }
