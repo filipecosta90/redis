@@ -421,9 +421,9 @@ proc test_scan {type} {
                     assert_encoding btree zset
                     r hello $proto
                     set preceding [string repeat p 65536]
-                    r set preceding $preceding
+                    r set "{zset}:preceding" $preceding
                     r multi
-                    r get preceding
+                    r get "{zset}:preceding"
                     r zscan zset 0 count 10000
                     r ping
                     set replies [r exec]
@@ -452,9 +452,9 @@ proc test_scan {type} {
                 r hello $proto
                 foreach size {0 1024 65536} {
                     set preceding [string repeat x $size]
-                    r set preceding $preceding
+                    r set "{zset}:preceding" $preceding
                     r multi
-                    r getrange preceding 0 -1
+                    r getrange "{zset}:preceding" 0 -1
                     r zscan zset 0 count 10000 match absent:*
                     r zscan zset 0 count 10000
                     r ping
