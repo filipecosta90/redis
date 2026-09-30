@@ -15,6 +15,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 /*-----------------------------------------------------------------------------
  * B+ tree implementation of the low level sorted set API
@@ -3869,6 +3872,18 @@ static int zbtIndexHashReachesBucket(const zbtIndexTable *table, uint32_t hash,
     return 0;
 }
 
+#ifdef __SSE2__
+/* Unlike the SWAR mask, these bits are exact byte matches. The caller only
+ * loads complete vectors wholly inside the tag array. */
+static inline unsigned int zbtIndexScanTagMask16(const uint8_t *tags,
+                                                __m128i keep, __m128i match)
+{
+    __m128i word = _mm_loadu_si128((const __m128i *)tags);
+    return (unsigned int)_mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_and_si128(word, keep), match));
+}
+#endif
+
 /* Return the members represented by one physical table slot. Usually its tag
  * occurs once in the score leaf and the answer is immediate. If tags collide,
  * emit each member from every matching slot on its own search path. Duplicates
@@ -3915,7 +3930,9 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
      * zbtIndexTagMask() itself), so every candidate is re-checked against
      * the stored byte before being accepted -- same idiom, same file.
      *
-     * Only full 8-byte words are read via the SWAR path; the tag array
+     * On SSE2 targets complete 16-byte vectors use exact byte comparisons
+     * first, avoiding carry false positives. The remaining full 8-byte words
+     * use the SWAR path. No vector or word reads past leafcount: the tag array
      * directly abuts live member-record bytes with no guaranteed trailing
      * slack, so an out-of-bounds 8-byte load past a partial final word
      * would be unsafe. The scalar tail below covers the remainder. */
@@ -3930,7 +3947,23 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
      * reject the usual SWAR carry false positives. */
     uint64_t keep_bits = tag == 1 ? ~UINT64_C(0x0101010101010101) : UINT64_MAX;
     uint8_t match_tag = tag == 1 ? 0 : tag;
-    for (unsigned int w = 0; w < nwords; w++) {
+    unsigned int first_word = 0;
+#ifdef __SSE2__
+    __m128i vector_keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
+    __m128i vector_match = _mm_set1_epi8((char)match_tag);
+    unsigned int vectors = leafcount / 16;
+    for (unsigned int v = 0; v < vectors; v++) {
+        unsigned int mask = zbtIndexScanTagMask16(tags + v * 16,
+                                                vector_keep, vector_match);
+        while (mask) {
+            unsigned int physical = v * 16 + __builtin_ctz(mask);
+            positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
+            mask &= mask - 1;
+        }
+    }
+    first_word = vectors * 2;
+#endif
+    for (unsigned int w = first_word; w < nwords; w++) {
         uint64_t word;
         memcpy(&word, tags + w * 8, 8);
         uint64_t mask = zbtIndexTagMask(word & keep_bits, match_tag);
@@ -4152,6 +4185,32 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zfree(seen);
         zbtreeFree(zs);
     }
+
+#ifdef __SSE2__
+    printf("Testing exact vector scan tag masks\n");
+    {
+        uint8_t storage[31];
+        int correct = 1;
+        for (unsigned int tag = 0; tag < 256; tag++) {
+            __m128i keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
+            __m128i match = _mm_set1_epi8(tag == 1 ? 0 : (char)tag);
+            for (unsigned int offset = 0; offset < 16; offset++) {
+                uint8_t *tags = storage + offset;
+                for (unsigned int pattern = 0; pattern < 512; pattern++) {
+                    unsigned int expected = 0;
+                    for (unsigned int i = 0; i < 16; i++) {
+                        tags[i] = (uint8_t)(pattern < 256 ? pattern + i : pattern);
+                        if (tags[i] == tag || (tag == 1 && tags[i] == 0))
+                            expected |= 1u << i;
+                    }
+                    if (zbtIndexScanTagMask16(tags, keep, match) != expected)
+                        correct = 0;
+                }
+            }
+        }
+        test_cond("Vector tag masks preserve every tag and unaligned lane", correct);
+    }
+#endif
 
     printf("Testing B+ tree ZSCAN with colliding zero/one leaf tags\n");
     {
