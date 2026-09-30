@@ -4005,6 +4005,35 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     return emitted;
 }
 
+#ifdef __SSE2__
+/* Resolve a bucket's live leaves together before visiting its slots. Fetching
+ * headers first gives the independent tag-array hints time to overlap, while
+ * the ordinary scan below retains all validation, collision checks and order. */
+static void zbtIndexScanPrefetch(const zbtreeSet *zs, zbtIndexTable *table,
+                                 zbtIndexBucket *bucket)
+{
+    zbtScoreLeaf *leaves[ZBT_INDEX_BUCKET_ITEMS];
+    unsigned int count = 0;
+    uint64_t tags = zbtIndexTags(bucket);
+    for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++, tags >>= 8) {
+        if ((tags & 0xff) == 0) continue;
+        uint32_t id = zbtIndexGetId(table, bucket, pos);
+        if (id == ZBT_INDEX_DELETED_ID || id >= zs->next_score_leaf_id) continue;
+        zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
+        if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) continue;
+        leaves[count++] = leaf;
+        redis_prefetch_read(leaf);
+    }
+    for (unsigned int i = 0; i < count; i++) {
+        zbtScoreLeaf *leaf = leaves[i];
+        if (leaf->n.count == 0) continue;
+        uint8_t *tags = zbtScoreLeafHashTags(leaf);
+        redis_prefetch_read(tags);
+        redis_prefetch_read(tags + leaf->n.count - 1);
+    }
+}
+#endif
+
 /* The low half of the cursor is a group of eight buckets plus one; the high
  * half identifies the current table. A resize keeps the old table in place, so
  * the cursor remains valid while leaves are copied. Installing the new table
@@ -4048,6 +4077,9 @@ uint64_t zbtreeScan(zbtreeSet *zs, uint64_t cursor,
                 local = bucket_index - first_buckets;
             }
             zbtIndexBucket *bucket = zbtIndexBucketAt(table, local);
+#ifdef __SSE2__
+            zbtIndexScanPrefetch(zs, table, bucket);
+#endif
             for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
                 emitted += zbtIndexScanSlot(zs, table, bucket, pos,
                                             fn, privdata);
