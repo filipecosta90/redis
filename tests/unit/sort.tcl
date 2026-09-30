@@ -259,10 +259,78 @@ foreach command {SORT SORT_RO} {
         r del myset
         r sadd myset a b c d e f g h i l m n o p q r s t u v z aa aaa azz
         foreach ele {a aa aaa azz b c d e f g h i l m n o p q r s t u v z} {
-            set score:$ele 100
+            r set score:$ele 100
         }
         r sort myset by score:*
     } {a aa aaa azz b c d e f g h i l m n o p q r s t u v z} {cluster:skip}
+
+    # The enclosing start_server overrides list-max-ziplist-size to 16, so the
+    # list cases are sized either side of that to cover both encodings.
+    foreach {type enc elements} {
+        list  listpack   {a aa aaa azz b c d e f g h i l}
+        list  quicklist  {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
+        set   listpack   {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
+        set   hashtable  {1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+                          21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37
+                          38 39 40}
+        zset  listpack   {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
+    } {
+        test "SORT BY <pattern> ALPHA breaks ties by element ($type $enc)" {
+            r del mykey mydst
+            foreach ele $elements {
+                switch $type {
+                    list {r rpush mykey $ele}
+                    set  {r sadd mykey $ele}
+                    zset {r zadd mykey 0 $ele}
+                }
+                r set w_$ele tied
+                r hset wobj_$ele weight tied
+            }
+            # Must be checked before the first SORT: sorting a zset by a
+            # pattern converts it to skiplist in place.
+            assert_encoding $enc mykey
+
+            set expected [lsort $elements]
+            assert_equal $expected [r sort mykey by w_* alpha]
+            assert_equal $expected [r sort mykey by wobj_*->weight alpha]
+
+            # The STORE path is the replicated one, and uses a different
+            # comparison for the weights, so assert it separately.
+            r sort mykey by w_* alpha store mydst
+            assert_equal $expected [r lrange mydst 0 -1]
+        } {} {cluster:skip}
+    }
+
+    test "SORT BY <pattern> ALPHA breaks ties by element (zset skiplist)" {
+        set origin_config [config_get_set zset-max-listpack-entries 0]
+        set elements {a aa aaa azz b c d e f g h i l m n o p q r s t u v z}
+        r del mykey mydst
+        foreach ele $elements {
+            r zadd mykey 0 $ele
+            r set w_$ele tied
+        }
+        assert_encoding skiplist mykey
+
+        set expected [lsort $elements]
+        assert_equal $expected [r sort mykey by w_* alpha]
+        r sort mykey by w_* alpha store mydst
+        assert_equal $expected [r lrange mydst 0 -1]
+        config_set zset-max-listpack-entries $origin_config
+    } {} {cluster:skip}
+
+    test "SORT BY <pattern> ALPHA with every weight missing is deterministic" {
+        r del myset
+        r sadd myset a b c d e f g h i l m n o p q r s t u v z aa aaa azz
+        assert_equal {a aa aaa azz b c d e f g h i l m n o p q r s t u v z} \
+            [r sort myset by nonexisting_* alpha]
+    } {} {cluster:skip}
+
+    test "SORT BY <pattern> ALPHA puts missing weights first, ties by element" {
+        r del myset w_a w_c
+        r sadd myset f e d c b a
+        r mset w_a x w_c x
+        assert_equal {b d e f a c} [r sort myset by w_* alpha]
+    } {} {cluster:skip}
 
     test "SORT GET with pattern ending with just -> does not get hash field" {
         r del mylist
@@ -376,6 +444,48 @@ foreach command {SORT SORT_RO} {
         assert_match "*ql_listpack_max:-1 ql_compressed:1*" [r debug object lst_dst{t}]
         config_set list-max-listpack-size $origin_config
     } {} {needs:debug}
+}
+
+# SORT ... STORE is flagged WRITE and sort.c does no command rewriting, so the
+# command is replicated verbatim and the replica recomputes the order itself.
+# With tied BY weights and an undefined tie order the two nodes end up holding
+# lists with the same members in a different sequence.
+start_server {tags {"sort external:skip"}} {
+    start_server {} {
+        set master [srv -1 client]
+        set master_host [srv -1 host]
+        set master_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "SORT BY <pattern> ALPHA STORE replicates a deterministic order" {
+            # Forcing hashtable on both sides is load-bearing: with the default
+            # config these 40 integers land in an intset, whose iteration is
+            # already sorted, and the test would pass without the tiebreak.
+            $master config set set-max-intset-entries 0
+            $master config set set-max-listpack-entries 0
+            $replica config set set-max-intset-entries 0
+            $replica config set set-max-listpack-entries 0
+
+            $master del mykey mydst
+            for {set i 0} {$i < 40} {incr i} {
+                $master sadd mykey $i
+                $master set w_$i tied
+            }
+            assert_equal "hashtable" [$master object encoding mykey]
+
+            $replica replicaof $master_host $master_port
+            wait_for_sync $replica
+            assert_equal "hashtable" [$replica object encoding mykey]
+
+            $master sort mykey by w_* alpha store mydst
+            wait_for_ofs_sync $master $replica
+
+            set on_master [$master lrange mydst 0 -1]
+            set on_replica [$replica lrange mydst 0 -1]
+            assert_equal $on_master $on_replica
+            assert_equal [lsort [$master smembers mykey]] $on_master
+        }
+    }
 }
 
 start_cluster 1 0 {tags {"external:skip cluster sort"}} {
