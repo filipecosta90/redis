@@ -3876,11 +3876,11 @@ static int zbtIndexHashReachesBucket(const zbtIndexTable *table, uint32_t hash,
 /* Unlike the SWAR mask, these bits are exact byte matches. The caller only
  * loads complete vectors wholly inside the tag array. */
 static inline unsigned int zbtIndexScanTagMask16(const uint8_t *tags,
-                                                __m128i keep, __m128i match)
+                                                __m128i match)
 {
     __m128i word = _mm_loadu_si128((const __m128i *)tags);
     return (unsigned int)_mm_movemask_epi8(
-        _mm_cmpeq_epi8(_mm_and_si128(word, keep), match));
+        _mm_cmpeq_epi8(word, match));
 }
 #endif
 
@@ -3949,19 +3949,21 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     uint8_t match_tag = tag == 1 ? 0 : tag;
     unsigned int first_word = 0;
 #ifdef __SSE2__
-    __m128i vector_keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
-    __m128i vector_match = _mm_set1_epi8((char)match_tag);
-    unsigned int vectors = leafcount / 16;
-    for (unsigned int v = 0; v < vectors; v++) {
-        unsigned int mask = zbtIndexScanTagMask16(tags + v * 16,
-                                                vector_keep, vector_match);
-        while (mask) {
-            unsigned int physical = v * 16 + __builtin_ctz(mask);
-            positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
-            mask &= mask - 1;
+    /* Ordinary tags need only byte equality. The rare zero/one alias uses
+     * the folded SWAR path below, avoiding a mask in every vector iteration. */
+    if (tag != 1) {
+        __m128i vector_match = _mm_set1_epi8((char)tag);
+        unsigned int vectors = leafcount / 16;
+        for (unsigned int v = 0; v < vectors; v++) {
+            unsigned int mask = zbtIndexScanTagMask16(tags + v * 16, vector_match);
+            while (mask) {
+                unsigned int physical = v * 16 + __builtin_ctz(mask);
+                positions[count++] = zbtScoreLeafPhysicalPos(leaf, physical);
+                mask &= mask - 1;
+            }
         }
+        first_word = vectors * 2;
     }
-    first_word = vectors * 2;
 #endif
     for (unsigned int w = first_word; w < nwords; w++) {
         uint64_t word;
@@ -4192,18 +4194,17 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         uint8_t storage[31];
         int correct = 1;
         for (unsigned int tag = 0; tag < 256; tag++) {
-            __m128i keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
-            __m128i match = _mm_set1_epi8(tag == 1 ? 0 : (char)tag);
+            __m128i match = _mm_set1_epi8((char)tag);
             for (unsigned int offset = 0; offset < 16; offset++) {
                 uint8_t *tags = storage + offset;
                 for (unsigned int pattern = 0; pattern < 512; pattern++) {
                     unsigned int expected = 0;
                     for (unsigned int i = 0; i < 16; i++) {
                         tags[i] = (uint8_t)(pattern < 256 ? pattern + i : pattern);
-                        if (tags[i] == tag || (tag == 1 && tags[i] == 0))
+                        if (tags[i] == tag)
                             expected |= 1u << i;
                     }
-                    if (zbtIndexScanTagMask16(tags, keep, match) != expected)
+                    if (zbtIndexScanTagMask16(tags, match) != expected)
                         correct = 0;
                 }
             }
