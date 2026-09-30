@@ -1,4 +1,9 @@
 #!/bin/sh
+# Packed B-tree records can hold live pointers at unaligned addresses. Let
+# LeakSanitizer follow them. Keep caller options last so explicit overrides win.
+LSAN_OPTIONS="use_unaligned=1${LSAN_OPTIONS:+:$LSAN_OPTIONS}"
+export LSAN_OPTIONS
+
 # Raise open files limit (macOS default 256 is too low for tests).
 OPEN_FILE_LIMIT=$(ulimit -n 2>/dev/null)
 if [ -n "$OPEN_FILE_LIMIT" ] && [ "$OPEN_FILE_LIMIT" != "unlimited" ] && [ "$OPEN_FILE_LIMIT" -lt 1024 ]; then
