@@ -4029,6 +4029,8 @@ static void zbtIndexScanPrefetch(const zbtreeSet *zs, zbtIndexTable *table,
         if (leaf->n.count == 0) continue;
         uint8_t *tags = zbtScoreLeafHashTags(leaf);
         redis_prefetch_read(tags);
+        /* A full tag array can straddle three cache lines on x86. */
+        if (leaf->n.count > 64) redis_prefetch_read(tags + 64);
         redis_prefetch_read(tags + leaf->n.count - 1);
     }
 }
