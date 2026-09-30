@@ -1690,6 +1690,60 @@ static void zsetBtreeScanAddReply(client *c, const unsigned char *ele,
     addReplyBulkCBuffer(c, buf, scorelen);
 }
 
+/* Append a bulk string to a scratch buffer whose capacity was checked by the
+ * caller. Reuse the same short headers as addReplyBulkCBuffer(). */
+static char *zsetBtreeScanWriteBulk(char *p, const void *value, size_t len) {
+    if (len < OBJ_SHARED_BULKHDR_LEN) {
+        size_t hdrlen = OBJ_SHARED_HDR_STRLEN(len);
+        memcpy(p, shared.bulkhdr[len]->ptr, hdrlen);
+        p += hdrlen;
+    } else {
+        *p++ = '$';
+        p += ll2string(p, LONG_STR_SIZE, len);
+        *p++ = '\r';
+        *p++ = '\n';
+    }
+    memcpy(p, value, len);
+    p += len;
+    *p++ = '\r';
+    *p++ = '\n';
+    return p;
+}
+
+/* Keep this stack buffer out of the other SCAN paths. Small buffered replies
+ * need only one append to the client buffer, instead of one per bulk string.
+ * Check conservative space bounds before formatting anything so large members
+ * fall back without copying or formatting their reply twice. */
+__attribute__((noinline)) static int zsetBtreeScanReplyBuffered(
+        zsetBtreeScanData *data, const char *cursor, size_t cursorlen)
+{
+    char reply[8192];
+    size_t remaining = sizeof(reply) - 4 * LONG_STR_SIZE;
+    const size_t overhead = 2 * LONG_STR_SIZE + MAX_D2STRING_CHARS + 10;
+    size_t count = data->emitted / 2;
+    for (size_t i = 0; i < count; i++) {
+        size_t len = data->buffered[i].len;
+        if (len > remaining || overhead > remaining - len) return 0;
+        remaining -= len + overhead;
+    }
+
+    char *p = zsetBtreeScanWriteBulk(reply, cursor, cursorlen);
+    *p++ = '*';
+    p += ll2string(p, LONG_STR_SIZE, data->emitted);
+    *p++ = '\r';
+    *p++ = '\n';
+    for (size_t i = 0; i < count; i++) {
+        p = zsetBtreeScanWriteBulk(p, data->buffered[i].ele,
+                                 data->buffered[i].len);
+        char score[MAX_D2STRING_CHARS];
+        int scorelen = d2string(score, sizeof(score), data->buffered[i].score);
+        p = zsetBtreeScanWriteBulk(p, score, scorelen);
+    }
+    serverAssert((size_t)(p - reply) <= sizeof(reply));
+    addReplyProto(data->c, reply, p - reply);
+    return 1;
+}
+
 /* Buffer small replies so their headers need no deferred reply nodes. The
  * borrowed members remain valid throughout this read-only command. Larger
  * replies switch to streaming, keeping temporary storage bounded. */
@@ -2079,7 +2133,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
             setDeferredReplyBulkSds(c, data.cursor_reply,
                                     sdsnewlen(cursor_buf, cursor_len));
             setDeferredArrayLen(c, data.replylen, data.emitted);
-        } else {
+        } else if (!zsetBtreeScanReplyBuffered(&data, cursor_buf, cursor_len)) {
             addReplyBulkCBuffer(c, cursor_buf, cursor_len);
             addReplyArrayLen(c, data.emitted);
             for (size_t i = 0; i < data.emitted / 2; i++)

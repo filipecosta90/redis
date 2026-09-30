@@ -398,6 +398,50 @@ proc test_scan {type} {
             set _ {}
         } {} {resp3}
 
+        test {B+ tree ZSCAN buffered replies preserve binary members and score text} {
+            set scores {0 -0 1 -1 1.25 0.1 1e20 -1e20 9007199254740992 2.2250738585072014e-308 1.7976931348623157e308 +inf -inf}
+            foreach proto {2 3} {
+                foreach width {0 31 127 512 8192} {
+                    # Get the canonical bulk-string score text without the
+                    # client's RESP3 double-to-Tcl conversion (0 becomes 0.0).
+                    r hello 2
+                    r del zset
+                    for {set j 0} {$j < 129} {incr j} {
+                        r zadd zset 1 placeholder:$j
+                    }
+                    set expected {}
+                    for {set j 0} {$j < 32} {incr j} {
+                        set member "$j:[binary format H* 000d0aff][string repeat x $width]"
+                        r zadd zset [lindex $scores [expr {$j % [llength $scores]}]] $member
+                        dict set expected $member [r zscore zset $member]
+                    }
+                    for {set j 0} {$j < 129} {incr j} {
+                        r zrem zset placeholder:$j
+                    }
+                    assert_encoding btree zset
+                    r hello $proto
+                    set preceding [string repeat p 65536]
+                    r set preceding $preceding
+                    r multi
+                    r get preceding
+                    r zscan zset 0 count 10000
+                    r ping
+                    set replies [r exec]
+                    assert_equal $preceding [lindex $replies 0]
+                    assert_equal 0 [lindex $replies 1 0]
+                    set seen {}
+                    foreach {member score} [lindex $replies 1 1] {
+                        assert_equal [dict get $expected $member] $score
+                        dict set seen $member 1
+                    }
+                    assert_equal 32 [dict size $seen]
+                    assert_equal PONG [lindex $replies 2]
+                }
+            }
+            r hello 2
+            set _ {}
+        } {} {resp3}
+
         test {B+ tree ZSCAN headers preserve queued reply order} {
             r del zset
             for {set j 0} {$j < 129} {incr j} {
