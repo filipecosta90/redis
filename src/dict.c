@@ -1547,6 +1547,15 @@ void dictScanDefragBucket(dict *d,dictScanFunction *fn,
     plink = bucketref;
     while (de) {
         next = dictGetNext(de);
+
+        /* Warm the next chain element while fn() runs on the current one, so
+         * the callback's own duration is the prefetch distance. The chain is a
+         * list of separately allocated entries, so walking it serializes on a
+         * dependent load that is very likely to miss. In a no_value dict the
+         * entry pointer is the key (or the kvobj) itself, which is exactly the
+         * memory the callback dereferences next. */
+        if (next) __builtin_prefetch(decodeMaskedPtr(next), 0, 1);
+
         fn(privdata, de, plink);
 
         if (!next) break; /* if last element, break */
