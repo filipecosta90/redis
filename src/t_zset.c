@@ -4288,28 +4288,45 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
         addReplyArrayLen(c, rangelen);
     }
 
+    /* Cursor over the entries to pop, for the listpack encoding only. The
+     * listpack is left untouched while the reply is built and every popped
+     * entry is removed by a single range delete afterwards: deleting them one
+     * at a time costs a full tail memmove plus a zzlFind() re-scan per element,
+     * which makes popping N entries O(N^2). This mirrors what the list type
+     * already does in listTypeDelRange(). */
+    unsigned char *lpeptr = NULL;
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        lpeptr = lpSeek(zobj->ptr,where == ZSET_MAX ? -2 : 0);
+        serverAssertWithInfo(c,zobj,lpeptr != NULL);
+    }
+
     /* Remove the element. */
     do {
         if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *zl = zobj->ptr;
-            unsigned char *eptr, *sptr;
+            unsigned char *sptr;
             unsigned char *vstr;
             unsigned int vlen;
             long long vlong;
 
-            /* Get the first or last element in the sorted set. */
-            eptr = lpSeek(zl,where == ZSET_MAX ? -2 : 0);
-            serverAssertWithInfo(c,zobj,eptr != NULL);
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            vstr = lpGetValue(lpeptr,&vlen,&vlong);
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
             else
                 ele = sdsnewlen(vstr,vlen);
 
             /* Get the score. */
-            sptr = lpNext(zl,eptr);
+            sptr = lpNext(zl,lpeptr);
             serverAssertWithInfo(c,zobj,sptr != NULL);
             score = zzlGetScore(sptr);
+
+            /* Walk to the next entry to pop. Guarded on rangelen because on
+             * the final iteration there may be no further pair to step to. */
+            if (rangelen > 1) {
+                lpeptr = (where == ZSET_MAX) ? lpPrevN(zl,lpeptr,2)
+                                             : lpNext(zl,sptr);
+                serverAssertWithInfo(c,zobj,lpeptr != NULL);
+            }
         } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = zobj->ptr;
             zskiplist *zsl = zs->zsl;
@@ -4327,13 +4344,9 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
             serverPanic("Unknown sorted set encoding");
         }
 
-        serverAssertWithInfo(c,zobj,zsetDel(zobj,ele));
+        if (zobj->encoding == OBJ_ENCODING_SKIPLIST)
+            serverAssertWithInfo(c,zobj,zsetDel(zobj,ele));
         server.dirty++;
-
-        if (result_count == 0) { /* Do this only for the first iteration. */
-            char *events[2] = {"zpopmin","zpopmax"};
-            notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
-        }
 
         if (use_nested_array) {
             addReplyArrayLen(c,2);
@@ -4343,6 +4356,22 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
         sdsfree(ele);
         ++result_count;
     } while(--rangelen);
+
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        /* Drop every popped member/score pair in one go. result_count is a
+         * long and a listpack-encoded sorted set holds far fewer entries than
+         * LONG_MAX/2, so the doubling cannot overflow. */
+        zobj->ptr = (where == ZSET_MAX) ?
+            lpDeleteRange(zobj->ptr,-(result_count * 2),result_count * 2) :
+            lpDeleteRange(zobj->ptr,0,result_count * 2);
+    }
+
+    /* Emitted once for the whole pop, after the entries are gone, matching
+     * how the list type reports a ranged pop. */
+    {
+        char *events[2] = {"zpopmin","zpopmax"};
+        notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
+    }
 
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(key->ptr), zobj, oldsize, kvobjAllocSize(zobj));
