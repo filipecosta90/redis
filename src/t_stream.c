@@ -1684,18 +1684,36 @@ void streamLastValidID(stream *s, streamID *maxid)
  * allocator's 48 bytes bin. */
 #define STREAM_ID_STR_LEN 44
 
+/* Write 'id' in the standard <ms>-<seq> form into 'buf', which must have room
+ * for STREAM_ID_STR_LEN bytes, and return the number of bytes written (the
+ * result is not NUL terminated beyond what ull2string() leaves there).
+ *
+ * Two 64-bit values are at most 20 digits each, so 20 + 1 + 20 always fits. */
+static size_t streamIDToBuf(const streamID *id, char *buf) {
+    size_t len = ull2string(buf, STREAM_ID_STR_LEN, id->ms);
+    buf[len++] = '-';
+    len += ull2string(buf + len, STREAM_ID_STR_LEN - len, id->seq);
+    serverAssert(len < STREAM_ID_STR_LEN);
+    return len;
+}
+
 sds createStreamIDString(streamID *id) {
-    /* Optimization: pre-allocate a big enough buffer to avoid reallocs. */
-    sds str = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
-    sdssetlen(str, 0);
-    return sdscatfmt(str,"%U-%U", id->ms,id->seq);
+    char buf[STREAM_ID_STR_LEN];
+    size_t len = streamIDToBuf(id, buf);
+    return sdsnewlen(buf, len);
 }
 
 /* Emit a reply in the client output buffer by formatting a Stream ID
  * in the standard <ms>-<seq> format, using the simple string protocol
  * of REPL. */
 void addReplyStreamID(client *c, streamID *id) {
-    addReplyBulkSds(c,createStreamIDString(id));
+    /* Reply directly from the stack: a stream ID is emitted once per entry in
+     * an XRANGE/XREAD/XREADGROUP reply, and routing it through an sds costs an
+     * allocation and a free per entry for a string that never outlives the
+     * call. */
+    char buf[STREAM_ID_STR_LEN];
+    size_t len = streamIDToBuf(id, buf);
+    addReplyBulkCBuffer(c, buf, len);
 }
 
 void setDeferredReplyStreamID(client *c, void *dr, streamID *id) {
