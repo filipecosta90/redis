@@ -1981,12 +1981,20 @@ void zaddGenericCommand(client *c, int flags) {
     scoreidx = 2;
     while(scoreidx < c->argc) {
         char *opt = c->argv[scoreidx]->ptr;
-        if (!strcasecmp(opt,"nx")) flags |= ZADD_IN_NX;
-        else if (!strcasecmp(opt,"xx")) flags |= ZADD_IN_XX;
-        else if (!strcasecmp(opt,"ch")) ch = 1; /* Return num of elements added or updated. */
-        else if (!strcasecmp(opt,"incr")) flags |= ZADD_IN_INCR;
-        else if (!strcasecmp(opt,"gt")) flags |= ZADD_IN_GT;
-        else if (!strcasecmp(opt,"lt")) flags |= ZADD_IN_LT;
+        /* Guard each option with its own first byte before calling
+         * strcasecmp(). The options are the only arguments here that start
+         * with a letter, so in the common case -- this argument is already
+         * the first score -- the loop now ends on a byte compare instead of
+         * six strcasecmp() calls. The guards cannot change which option
+         * matches: a strcasecmp() match implies the first byte matches too.
+         * Same shape as SET's option parsing (t_string.c) and XADD's '*'
+         * fast path (t_stream.c). */
+        if ((opt[0] == 'n' || opt[0] == 'N') && !strcasecmp(opt,"nx")) flags |= ZADD_IN_NX;
+        else if ((opt[0] == 'x' || opt[0] == 'X') && !strcasecmp(opt,"xx")) flags |= ZADD_IN_XX;
+        else if ((opt[0] == 'c' || opt[0] == 'C') && !strcasecmp(opt,"ch")) ch = 1; /* Return num of elements added or updated. */
+        else if ((opt[0] == 'i' || opt[0] == 'I') && !strcasecmp(opt,"incr")) flags |= ZADD_IN_INCR;
+        else if ((opt[0] == 'g' || opt[0] == 'G') && !strcasecmp(opt,"gt")) flags |= ZADD_IN_GT;
+        else if ((opt[0] == 'l' || opt[0] == 'L') && !strcasecmp(opt,"lt")) flags |= ZADD_IN_LT;
         else break;
         scoreidx++;
     }
