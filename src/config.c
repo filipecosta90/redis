@@ -3624,6 +3624,7 @@ standardConfig static_configs[] = {
     createLongLongConfig("cluster-slot-migration-write-pause-timeout", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.asm_write_pause_timeout, 10*1000, INTEGER_CONFIG, NULL, NULL), /* 10 seconds */
     createLongLongConfig("cluster-slot-migration-sync-buffer-drain-timeout", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, LLONG_MAX, server.asm_sync_buffer_drain_timeout, 60000, INTEGER_CONFIG, NULL, NULL), /* 60 seconds */
     createLongLongConfig("slowlog-log-slower-than", NULL, MODIFIABLE_CONFIG, -1, LLONG_MAX, server.slowlog_log_slower_than, 10000, INTEGER_CONFIG, NULL, NULL),
+    createLongLongConfig("tracking-bcast-interval-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.tracking_bcast_interval_us, 0, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("latency-monitor-threshold", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.latency_monitor_threshold, 0, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024*1024, LONG_MAX, server.proto_max_bulk_len, 512ll*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),

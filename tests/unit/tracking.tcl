@@ -1161,4 +1161,27 @@ start_server {tags {"tracking network external:skip"} overrides {io-threads 4}} 
         r FLUSHALL
         $rd close
     }
+
+    test {BCAST invalidations are batched with tracking-bcast-interval-us} {
+        set rd [redis_deferring_client]
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on BCAST PREFIX t:
+        $rd read
+        r CONFIG SET tracking-bcast-interval-us 200000
+
+        # The first key after a long pause goes out at once, the next ones
+        # wait for the interval and go out together, even with the server idle.
+        r SET t:1 1
+        assert_equal {t:1} [lindex [$rd read] 1]
+        set start [clock milliseconds]
+        r SET t:2 1
+        r SET t:3 1
+        assert_equal {t:2 t:3} [lsort [lindex [$rd read] 1]]
+        set elapsed [expr {[clock milliseconds] - $start}]
+        assert_range $elapsed 50 2000
+
+        r CONFIG SET tracking-bcast-interval-us 0
+        $rd close
+    }
 }

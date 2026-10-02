@@ -28,12 +28,15 @@ uint64_t TrackingTableTotalItems = 0; /* Total number of IDs stored across
                                          an hint about the total memory we
                                          are using server side for CSC. */
 robj *TrackingChannelName;
+static int TrackingBcastPending = 0; /* Keys may wait in some bcastState. */
+static monotime TrackingBcastLastFlush = 0;
+static long long TrackingBcastTimer = -1; /* Wakes up the event loop to flush. */
 
 /* This is the structure that we have as value of the PrefixTable, and
  * represents the list of keys modified, and the list of clients that need
  * to be notified, for a given prefix. */
 typedef struct bcastState {
-    rax *keys;      /* Keys modified in the current event loop cycle. */
+    rax *keys;      /* Keys modified since the last broadcast. */
     rax *clients;   /* Clients subscribed to the notification events for this
                        prefix. */
 } bcastState;
@@ -374,6 +377,7 @@ void trackingRememberKeyToBroadcast(client *c, char *keyname, size_t keylen) {
          * change to the key, and can avoid sending the notification in the
          * case the client is in NOLOOP mode. */
         raxInsert(bs->keys,(unsigned char*)keyname,keylen,c,NULL);
+        TrackingBcastPending = 1;
     }
     raxStop(&ri);
 }
@@ -765,6 +769,36 @@ void trackingBroadcastInvalidationMessages(user *u) {
             trackingBcastInvalidationsForPrefix(bs);
     }
     raxStop(&ri);
+}
+
+static int trackingBcastTimerProc(struct aeEventLoop *el, long long id, void *data) {
+    UNUSED(el);
+    UNUSED(id);
+    UNUSED(data);
+    TrackingBcastTimer = -1;
+    return AE_NOMORE; /* The next beforeSleep flushes. */
+}
+
+/* Called in beforeSleep. With tracking-bcast-interval-us set, the keys
+ * modified less than that interval after the last broadcast wait for the
+ * next one: each BCAST client gets fewer and bigger invalidation messages,
+ * and the invalidations get up to that interval of latency. A timer wakes
+ * up the event loop if nothing else does. */
+void trackingHandleBroadcastInBeforeSleep(void) {
+    if (!TrackingBcastPending) return;
+    if (server.tracking_bcast_interval_us) {
+        monotime now = getMonotonicUs();
+        monotime due = TrackingBcastLastFlush + server.tracking_bcast_interval_us;
+        if (now < due) {
+            if (TrackingBcastTimer == -1)
+                TrackingBcastTimer = aeCreateTimeEvent(server.el,
+                    (due - now + 999) / 1000, trackingBcastTimerProc, NULL, NULL);
+            return;
+        }
+        TrackingBcastLastFlush = now;
+    }
+    TrackingBcastPending = 0;
+    trackingBroadcastInvalidationMessages(NULL);
 }
 
 /* This is just used in order to access the amount of used slots in the

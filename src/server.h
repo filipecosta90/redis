@@ -2585,6 +2585,7 @@ struct redisServer {
     /* Client side caching. */
     unsigned int tracking_clients;  /* # of clients with tracking enabled.*/
     size_t tracking_table_max_keys; /* Max number of keys in tracking table. */
+    long long tracking_bcast_interval_us; /* Min time between BCAST invalidations. */
     list *tracking_pending_keys; /* tracking invalidation keys pending to flush */
     list *pending_push_messages; /* pending publish or other push messages to flush */
     /* Sort parameters - qsort_r() is only available under BSD so we
@@ -3564,6 +3565,7 @@ uint64_t trackingGetTotalItems(void);
 uint64_t trackingGetTotalKeys(void);
 uint64_t trackingGetTotalPrefixes(void);
 void trackingBroadcastInvalidationMessages(user *u);
+void trackingHandleBroadcastInBeforeSleep(void);
 void trackingBroadcastFlushClientPrefixes(client *c);
 void clientSetUser(client *c, user *new_user, int auth_changed);
 int checkPrefixCollisionsOrReply(client *c, robj **prefix, size_t numprefix);
