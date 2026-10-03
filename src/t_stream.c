@@ -2133,9 +2133,12 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
             streamID pel_id;
             streamIteratorStart(&si,s,&nack->id,&nack->id,rev);
             if (streamIteratorGetID(&si,&pel_id,&numfields)) {
-                robj *idarg = createObjectFromStreamID(&pel_id);
+                /* Reply with the ID straight from the stack. The robj form
+                 * is only built below, where XCLAIM propagation consumes one. */
+                char idbuf[STREAM_ID_STR_LEN];
+                int idlen = streamFormatID(idbuf,sizeof(idbuf),&pel_id);
                 addReplyArrayLen(c,4);
-                addReplyBulk(c,idarg);
+                addReplyBulkCBuffer(c,idbuf,idlen);
                 addReplyArrayLen(c,numfields*2);
 
                 /* Emit field-value pairs */
@@ -2166,12 +2169,13 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
 
                 /* Propagate as XCLAIM */
                 if (spi) {
+                    robj *idarg = createObjectFromStreamID(&pel_id);
                     robj *delivery_count = createStringObjectFromLongLong(nack->delivery_count);
                     streamPropagateXCLAIMCopyFree(db_id,spi->keyname,group_last_id,spi->groupname,idarg,consumername,delivery_time,delivery_count);
                     decrRefCount(delivery_count);
+                    decrRefCount(idarg);
                     if (propCount) (*propCount)++;
                 }
-                decrRefCount(idarg);
                 arraylen++;
                 
                 /* Check count limit */
@@ -2253,8 +2257,12 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
              * the ID, the second is an array of field-value pairs. */
             addReplyArrayLen(c,2);
         }
-        robj *idarg = createObjectFromStreamID(&id);
-        addReplyBulk(c,idarg);
+        /* Reply with the ID straight from the stack. Plain XRANGE, XREVRANGE
+         * and XREAD never need the robj form at all; it is only built below,
+         * where XCLAIM propagation consumes one. */
+        char idbuf[STREAM_ID_STR_LEN];
+        int idlen = streamFormatID(idbuf,sizeof(idbuf),&id);
+        addReplyBulkCBuffer(c,idbuf,idlen);
         addReplyArrayLen(c,numfields*2);
 
         /* Emit the field-value pairs. */
@@ -2322,13 +2330,14 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
 
             /* Propagate as XCLAIM. */
             if (spi) {
+                robj *idarg = createObjectFromStreamID(&id);
                 robj *delivery_count = createStringObjectFromLongLong(nack->delivery_count);
                 streamPropagateXCLAIMCopyFree(db_id,spi->keyname,group_last_id,spi->groupname,idarg,consumername,delivery_time,delivery_count);
                 decrRefCount(delivery_count);
+                decrRefCount(idarg);
                 if (propCount) (*propCount)++;
             }
         }
-        decrRefCount(idarg);
         arraylen++;
         if (count && count == arraylen) break;
     }

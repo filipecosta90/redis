@@ -91,6 +91,21 @@ start_server {
         assert_error ERR* {r xadd mystream * c d}
     }
 
+    test {Stream IDs are replied verbatim when the ms half has 20 digits} {
+        # Every reply above is checked for its structure, not its text, and the
+        # IDs they carry have short ms halves. A formatter that dropped the ms
+        # half entirely would answer "-1" here and still pass the rest of the
+        # suite, so pin the exact bytes of both halves at their maximum width.
+        r DEL mystream
+        set maxms 18446744073709551615
+        assert_equal "$maxms-1" [r XADD mystream $maxms-1 f v]
+        assert_equal [list [list "$maxms-1" {f v}]] [r XRANGE mystream - +]
+        assert_equal [list [list "$maxms-1" {f v}]] [r XREVRANGE mystream + -]
+        assert_equal [list [list mystream [list [list "$maxms-1" {f v}]]]] \
+            [r XREAD COUNT 10 STREAMS mystream 0]
+        assert_equal "$maxms-1" [dict get [r XINFO STREAM mystream] last-generated-id]
+    }
+
     test {XADD auto-generated sequence is incremented for last ID} {
         r DEL mystream
         set id1 [r XADD mystream 123-456 item 1 value a]

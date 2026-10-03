@@ -4873,4 +4873,30 @@ start_server {tags {"stream external:skip needs:debug"}} {
         assert_equal [dict get $ginfo entries-read] 3
         assert_equal [dict get $ginfo lag] 97
     }
+
+    test {XREADGROUP propagates the entry ID verbatim as XCLAIM} {
+        # XREADGROUP turns each delivered entry into an XCLAIM for the replica,
+        # carrying the entry ID twice (as the claimed ID and as LASTID). No test
+        # in this file reads the replication stream, so the ID text on that path
+        # was unasserted; a formatter that mangled it would corrupt replica PELs
+        # while leaving every client-facing reply in this suite green.
+        r DEL mystream
+        set maxms 18446744073709551615
+        r XADD mystream $maxms-1 f v
+        r XGROUP CREATE mystream mygroup 0
+
+        set repl [attach_to_replication_stream]
+        r XREADGROUP GROUP mygroup myconsumer COUNT 10 STREAMS mystream >
+        # LASTID carries the group's last_id as it was *before* this delivery,
+        # which is why it is 0-0 here and not the entry's own ID.
+        assert_replication_stream $repl {
+            {multi}
+            {select *}
+            {xclaim mystream mygroup myconsumer 0 18446744073709551615-1 TIME * RETRYCOUNT 1 FORCE JUSTID LASTID 0-0}
+            {xgroup SETID mystream mygroup 18446744073709551615-1 ENTRIESREAD 1}
+            {exec}
+        }
+        close_replication_stream $repl
+    } {} {needs:repl}
+
 }
