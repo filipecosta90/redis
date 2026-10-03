@@ -13,6 +13,12 @@
 #include "xxhash.h"
 #include <string.h>
 
+/* static_assert() is C11. src/Makefile falls back to -std=c99 when the
+ * toolchain has no <stdatomic.h>, so provide the same shim ebuckets.c uses. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
 /* Every stream item inside the listpack, has a flags field that is used to
  * mark the entry as deleted, or having the same field as the "master"
  * entry at the start of the listpack> */
@@ -1677,25 +1683,41 @@ void streamLastValidID(stream *s, streamID *maxid)
     streamIteratorStop(&si);
 }
 
-/* Maximum size for a stream ID string. In theory 20*2+1 should be enough,
- * But to avoid chance for off by one issues and null-term, in case this will
- * be used as parsing buffer, we use a slightly larger buffer. On the other
- * hand considering sds header is gonna add 4 bytes, we wanna keep below the
- * allocator's 48 bytes bin. */
-#define STREAM_ID_STR_LEN 44
+/* The longest <ms>-<seq> string is 20 digits + '-' + 20 digits + the null
+ * terminator ull2string() writes, that is 42 bytes. STREAM_ID_STR_LEN keeps a
+ * small margin on top so the buffer can also be used for parsing. */
+static_assert(STREAM_ID_STR_LEN >= 42,
+              "STREAM_ID_STR_LEN cannot hold <ms>-<seq> plus a null terminator");
 
-sds createStreamIDString(streamID *id) {
-    /* Optimization: pre-allocate a big enough buffer to avoid reallocs. */
-    sds str = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
-    sdssetlen(str, 0);
-    return sdscatfmt(str,"%U-%U", id->ms,id->seq);
+/* Format 'id' as <ms>-<seq> into 'buf' and return the number of characters
+ * written, excluding the null terminator ull2string() leaves after them.
+ * 'buflen' must be at least STREAM_ID_STR_LEN, which is asserted.
+ *
+ * ull2string() returns 0 when the destination is too small. Given the buflen
+ * assertion that cannot happen here, but the postcondition is asserted anyway:
+ * an unchecked return would silently emit a malformed "-<seq>" rather than
+ * fail loudly. This repeats the fix made in de803f67b for the same helper. */
+int streamFormatID(char *buf, size_t buflen, const streamID *id) {
+    serverAssert(buflen >= STREAM_ID_STR_LEN);
+    int ms_len = ull2string(buf, buflen, id->ms);
+    serverAssert(ms_len > 0);
+    buf[ms_len] = '-';
+    int seq_len = ull2string(buf + ms_len + 1, buflen - ms_len - 1, id->seq);
+    serverAssert(seq_len > 0);
+    return ms_len + 1 + seq_len;
 }
 
-/* Emit a reply in the client output buffer by formatting a Stream ID
- * in the standard <ms>-<seq> format, using the simple string protocol
- * of REPL. */
+sds createStreamIDString(streamID *id) {
+    char buf[STREAM_ID_STR_LEN];
+    int len = streamFormatID(buf, sizeof(buf), id);
+    return sdsnewlen(buf, len);
+}
+
+/* Emit a stream ID in the standard <ms>-<seq> format as a RESP bulk string. */
 void addReplyStreamID(client *c, streamID *id) {
-    addReplyBulkSds(c,createStreamIDString(id));
+    char buf[STREAM_ID_STR_LEN];
+    int len = streamFormatID(buf, sizeof(buf), id);
+    addReplyBulkCBuffer(c, buf, len);
 }
 
 void setDeferredReplyStreamID(client *c, void *dr, streamID *id) {

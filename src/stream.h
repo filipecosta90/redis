@@ -214,6 +214,9 @@ void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, sds 
 robj *streamDup(robj *o);
 int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep);
 int streamParseID(const robj *o, streamID *id);
+/* Maximum size for a stream ID string, see streamFormatID(). */
+#define STREAM_ID_STR_LEN 44
+int streamFormatID(char *buf, size_t buflen, const streamID *id);
 robj *createObjectFromStreamID(streamID *id);
 int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id, int seq_given);
 int streamDeleteItem(stream *s, streamID *id);
