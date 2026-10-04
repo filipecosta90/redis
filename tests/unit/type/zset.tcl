@@ -499,6 +499,101 @@ start_server {tags {"zset"}} {
             assert_equal {1 30} [r zrank zranktmp z withscore]
         }
 
+        # A score update on a listpack-encoded sorted set repositions the member
+        # without rebuilding the listpack, so the result has to be byte-identical
+        # to the listpack a plain insert of the same final content produces. DUMP
+        # serializes the listpack verbatim, so comparing DUMP compares the bytes.
+        #
+        # Entry sizes are deliberately mixed: integer-encoded members, 1-byte
+        # members and long ones, with both integer and string scores. With
+        # uniform entry widths an offset mistake stays entry-aligned and the
+        # ordering still comes out right, which is exactly the case these
+        # assertions would miss.
+        proc zset_update_matches_fresh_insert {rd setup updates} {
+            uplevel 1 [list set _setup $setup]
+            uplevel 1 [list set _updates $updates]
+            uplevel 1 {
+                r del zupd{t} zref{t}
+                foreach {m sc} $_setup { r zadd zupd{t} $sc $m }
+                foreach {m sc} $_updates { r zadd zupd{t} $sc $m }
+
+                # Final content, built by insertion only.
+                unset -nocomplain _final
+                array set _final $_setup
+                array set _final $_updates
+                foreach {m sc} [array get _final] { r zadd zref{t} $sc $m }
+
+                assert_encoding listpack zupd{t}
+                assert_encoding listpack zref{t}
+                assert_equal [r zrange zref{t} 0 -1 withscores] [r zrange zupd{t} 0 -1 withscores]
+                assert_equal [r dump zref{t}] [r dump zupd{t}]
+            }
+        }
+
+        if {$encoding == "listpack"} {
+            test "ZADD listpack score update - member moves towards the tail" {
+                # The deleted pair is much wider than the pairs it moves over,
+                # so the insertion offset has to be corrected by the exact span
+                # of that pair rather than by an assumed entry size.
+                zset_update_matches_fresh_insert r \
+                    {a 0.12345678901234567 b 2 c 3 d 4 e 5 f 6} {a 5.5}
+            }
+
+            test "ZADD listpack score update - member moves towards the head" {
+                zset_update_matches_fresh_insert r \
+                    {aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 b 2 c 3 d 4 e 5 f 6} {f 1.5}
+            }
+
+            test "ZADD listpack score update - member moves to the head and to the tail" {
+                zset_update_matches_fresh_insert r {a 1 b 2 c 3 d 4 e 5} {e -100}
+                zset_update_matches_fresh_insert r {a 1 b 2 c 3 d 4 e 5} {a 100}
+            }
+
+            test "ZADD listpack score update - member keeps its position" {
+                # Score entry rewritten in place: growing, shrinking, and
+                # crossing the integer/string encoding boundary both ways.
+                zset_update_matches_fresh_insert r {a 1 b 5 c 9} {b 1099511627776}
+                zset_update_matches_fresh_insert r {a 1 b 0.12345678901234567 c 9} {b 3}
+                zset_update_matches_fresh_insert r {a 1 b 5 c 9} {b 5.5}
+            }
+
+            test "ZADD listpack score update - equal scores keep lexicographic order" {
+                # Only the tie-break decides placement here, so inverting its
+                # sense still yields a plausibly sorted set but the wrong one.
+                zset_update_matches_fresh_insert r {a 1 b 1 c 2} {c 1}
+                zset_update_matches_fresh_insert r {a 1 b 2 c 2} {a 2}
+                # Integer-encoded members take zzlCompareElements' ll2string path.
+                zset_update_matches_fresh_insert r {0 1 12345678901234567890 1 7 2} {7 1}
+            }
+
+            test "ZADD listpack score update - long moves over a full listpack" {
+                # Long headward moves are the case where walking outwards from
+                # the member costs more than rescanning from the head.
+                set members {}
+                for {set i 0} {$i < 100} {incr i} {
+                    lappend members [format "m%03d%s" $i [string repeat x [expr {$i % 7}]]] \
+                                    [expr {$i + 1}]
+                }
+                zset_update_matches_fresh_insert r $members {m099 0.5}
+                zset_update_matches_fresh_insert r $members {m000 1000}
+            }
+
+            test "ZINCRBY listpack score update - repeated increments keep order" {
+                r del zincr{t}
+                for {set i 0} {$i < 40} {incr i} { r zadd zincr{t} [expr {$i + 1}] m$i }
+                for {set i 0} {$i < 60} {incr i} { r zincrby zincr{t} 1 m7 }
+                assert_encoding listpack zincr{t}
+                assert_equal 68 [r zscore zincr{t} m7]
+                set got [r zrange zincr{t} 0 -1 withscores]
+                set prev -inf
+                foreach {m sc} $got {
+                    assert {$sc >= $prev}
+                    set prev $sc
+                }
+                assert_equal 40 [r zcard zincr{t}]
+            }
+        }
+
         test "ZINCRBY - can create a new sorted set - $encoding" {
             r del zset
             r zincrby zset 1 foo
