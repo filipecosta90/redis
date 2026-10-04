@@ -1772,6 +1772,18 @@ static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
         return;
     }
 
+    /* Equal expiries may be kept in either order. Append if the last tuple
+     * already proves that the new field belongs at the end. Persistent
+     * fields sort after every volatile field. */
+    unsigned char *last = lpLast(lpt->lp);
+    long long last_expire = HASH_LP_NO_TTL;
+    if (last)
+        serverAssert(lpGetIntegerValue(last, &last_expire));
+    if (!last || (last_expire != HASH_LP_NO_TTL && last_expire <= ent[2].lval)) {
+        lpt->lp = lpBatchAppend(lpt->lp, ent, 3);
+        return;
+    }
+
     struct lpFindArgs r = {
             .max_to_search = UINT64_MAX,
             .expire_time = ent[2].lval,
