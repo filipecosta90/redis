@@ -198,6 +198,9 @@ typedef enum ExpireSetCond {
     HFE_LT = 1<<3
 } ExpireSetCond;
 
+/* Minimum batch size for amortizing a listpack tail-expiry lookup. */
+#define HASH_LP_EX_MIN_APPEND_BATCH 8
+
 /* Used by hashTypeSetEx() for setting fields or their expiry  */
 typedef struct HashTypeSetEx {
 
@@ -213,13 +216,18 @@ typedef struct HashTypeSetEx {
                                          * is above minExpire of the hash, then we don't
                                          * have to update global HFE DS */
 
+    /* Conservative upper bound for volatile listpack expiries in this batch.
+     * Invalid when the bound is unknown or persistent fields may remain.
+     * HSETEX preserves existing TTLs and expires each new field before the next. */
+    uint64_t maxExpire;
+
     /* Optionally provide client for notification */
     client *c;
     const char *cmd;
 } HashTypeSetEx;
 
 int hashTypeSetExInit(robj *key, kvobj *kvo, client *c, redisDb *db,
-                      ExpireSetCond expireSetCond, HashTypeSetEx *ex);
+                      ExpireSetCond expireSetCond, unsigned long fieldCount, HashTypeSetEx *ex);
 
 SetExRes hashTypeSetEx(robj *o, sds field, uint64_t expireAt, HashTypeSetEx *exInfo);
 
@@ -1806,7 +1814,7 @@ void listpackExAddNew(robj *o, char *field, size_t flen,
 static void listpackExUpdateExpiry(robj *o, sds field,
                                    unsigned char *fptr,
                                    unsigned char *vptr,
-                                   uint64_t expire_at) {
+                                   uint64_t expire_at, int append) {
     unsigned int slen = 0;
     long long val = 0;
     unsigned char tmp[512] = {0};
@@ -1842,7 +1850,10 @@ static void listpackExUpdateExpiry(robj *o, sds field,
     }
     ent[2].lval = expire_at;
 
-    listpackExAddInternal(o, ent);
+    if (append)
+        lpt->lp = lpBatchAppend(lpt->lp, ent, 3);
+    else
+        listpackExAddInternal(o, ent);
     sdsfree(tmpval);
 }
 
@@ -1865,7 +1876,8 @@ SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
         /* Return error if already there is no ttl. */
         if (prevExpire == EB_EXPIRE_TIME_INVALID)
             return HSETEX_NO_CONDITION_MET;
-        listpackExUpdateExpiry(ex->hashObj, field, fptr, vptr, HASH_LP_NO_TTL);
+        listpackExUpdateExpiry(ex->hashObj, field, fptr, vptr, HASH_LP_NO_TTL, 0);
+        ex->maxExpire = EB_EXPIRE_TIME_INVALID;
         return HSETEX_OK;
     }
 
@@ -1896,7 +1908,15 @@ SetExRes hashTypeSetExpiryListpack(HashTypeSetEx *ex, sds field,
     if (ex->minExpireFields > expireAt)
         ex->minExpireFields = expireAt;
 
-    listpackExUpdateExpiry(ex->hashObj, field, fptr, vptr, expireAt);
+    /* A finite upper bound proves that this tuple belongs at the tail after
+     * removal. Equal expiries may be kept in either order. The bound remains
+     * conservative when fields are removed or their expiry is decreased. */
+    int append = expireAt >= ex->maxExpire;
+    listpackExUpdateExpiry(ex->hashObj, field, fptr, vptr, expireAt, append);
+    if (expireAt == HASH_LP_NO_TTL)
+        ex->maxExpire = EB_EXPIRE_TIME_INVALID;
+    else if (append)
+        ex->maxExpire = expireAt;
     return HSETEX_OK;
 }
 
@@ -2334,7 +2354,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
                     /* keep old field along with TTL */
                 } else if (expireTime != HASH_LP_NO_TTL) {
                     /* re-insert field and override TTL */
-                    listpackExUpdateExpiry(o, field, fptr, vptr, HASH_LP_NO_TTL);
+                    listpackExUpdateExpiry(o, field, fptr, vptr, HASH_LP_NO_TTL, 0);
                 }
             }
         }
@@ -2587,7 +2607,7 @@ void initDictExpireMetadata(robj *o) {
 
 /* Init HashTypeSetEx struct before calling hashTypeSetEx() */
 int hashTypeSetExInit(robj *key, kvobj *o, client *c, redisDb *db,
-                      ExpireSetCond expireSetCond, HashTypeSetEx *ex)
+                      ExpireSetCond expireSetCond, unsigned long fieldCount, HashTypeSetEx *ex)
 {
     dict *ht = o->ptr;
     ex->expireSetCond = expireSetCond;
@@ -2597,6 +2617,7 @@ int hashTypeSetExInit(robj *key, kvobj *o, client *c, redisDb *db,
     ex->key = key;
     ex->hashObj = o;
     ex->minExpireFields = EB_EXPIRE_TIME_INVALID;
+    ex->maxExpire = EB_EXPIRE_TIME_INVALID;
 
     /* Take care that HASH support expiration */
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
@@ -2621,6 +2642,17 @@ int hashTypeSetExInit(robj *key, kvobj *o, client *c, redisDb *db,
             m->hfe = ebCreate();     /* Allocate HFE DS */
             m->expireMeta.trash = 1; /* mark as trash (as long it wasn't ebAdd()) */
         }
+    }
+
+    /* Amortize tail decoding across larger batches. Persistent fields sort
+     * last and prevent a finite bound. No listpack pointer survives a mutation. */
+    if (fieldCount >= HASH_LP_EX_MIN_APPEND_BATCH && o->encoding == OBJ_ENCODING_LISTPACK_EX) {
+        listpackEx *lpt = o->ptr;
+        unsigned char *last = lpLast(lpt->lp);
+        long long expiry = HASH_LP_NO_TTL;
+        if (last) serverAssert(lpGetIntegerValue(last, &expiry));
+        if (!last || expiry != HASH_LP_NO_TTL)
+            ex->maxExpire = expiry;
     }
 
     /* Read minExpire from attached ExpireMeta to the hash */
@@ -4927,7 +4959,7 @@ void hsetexCommand(client *c) {
     /* Check if we will set the expiration time. */
     set_expiry = flags & (HFE_EX | HFE_PX | HFE_EXAT | HFE_PXAT);
     if (set_expiry)
-        hashTypeSetExInit(c->argv[1], o, c, c->db, 0, &setex);
+        hashTypeSetExInit(c->argv[1], o, c, c->db, 0, field_count, &setex);
 
     if (hashTypeIsTemplate(o)) {
         /* Template hash: set every field at once in a single template switch. */
@@ -5391,7 +5423,7 @@ void hgetexCommand(client *c) {
         oldsize = kvobjAllocSize(o);
     oldlen = hashTypeLength(o, 0);
     if (parse_flags)
-        hashTypeSetExInit(c->argv[1], o, c, c->db, 0, &setex);
+        hashTypeSetExInit(c->argv[1], o, c, c->db, 0, num_fields, &setex);
 
     /* Track fields for subkey notifications by event type. */
     fieldvec fvexpired, fvdeleted, fvupdated;
@@ -6610,7 +6642,7 @@ static void hexpireGenericCommand(client *c, long long basetime, int unit) {
         oldsize = kvobjAllocSize(hashObj);
 
     HashTypeSetEx exCtx;
-    hashTypeSetExInit(keyArg, hashObj, c, c->db, args.expireCondition, &exCtx);
+    hashTypeSetExInit(keyArg, hashObj, c, c->db, args.expireCondition, args.fieldCount, &exCtx);
     addReplyArrayLen(c, args.fieldCount);
 
     /* Lazy allocation of fieldsToRemove - only allocate when failures occur */
@@ -6854,7 +6886,7 @@ void hpersistCommand(client *c) {
 
             if (server.memory_tracking_enabled)
                 oldsize = kvobjAllocSize(hashObj);
-            listpackExUpdateExpiry(hashObj, field, fptr, vptr, HASH_LP_NO_TTL);
+            listpackExUpdateExpiry(hashObj, field, fptr, vptr, HASH_LP_NO_TTL, 0);
             if (server.memory_tracking_enabled)
                 updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), hashObj, oldsize, kvobjAllocSize(hashObj));
             addReplyLongLong(c, HFE_PERSIST_OK);

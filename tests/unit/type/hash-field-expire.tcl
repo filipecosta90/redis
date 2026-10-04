@@ -56,6 +56,136 @@ proc dumpAllHashes {client} {
 
 ############################### TESTS #########################################
 
+start_server {tags {"hash external:skip needs:debug"}} {
+    test "Listpack field expiry updates preserve ordering and values" {
+        r config set hash-max-listpack-entries 512
+        r config set hash-max-listpack-value 4096
+        set base 4102444800000
+        set large "[string repeat x 513]\x00tail"
+        set values [list a 0 b $large c -9223372036854775808 d 007 e tail]
+        set allfields {a b c d e f g h i j k l m n o p}
+        foreach field [lrange $allfields 5 end] { lappend values $field value:$field }
+        r hset ordered {*}$values
+        assert_equal {1} [r hpexpireat ordered [expr {$base - 1000}] FIELDS 1 a]
+        assert_equal {1} [r hpexpireat ordered $base FIELDS 1 b]
+        assert_equal {1} [r hpexpireat ordered [expr {$base + 1000}] FIELDS 1 c]
+        set expected [dict create a [expr {$base - 1000}] b $base \
+                                  c [expr {$base + 1000}] d -1 e -1]
+        foreach field [lrange $allfields 5 end] { dict set expected $field -1 }
+        assert_encoding listpackex ordered
+
+        # Exercise equal TTLs, movement in both directions, and transitions
+        # between volatile and persistent fields, including duplicate fields.
+        set updates [list \
+            [list HPEXPIREAT ordered $base FIELDS 2 b b] \
+            [list HPEXPIREAT ordered [expr {$base + 500}] FIELDS 1 b] \
+            [list HPEXPIREAT ordered [expr {$base - 500}] FIELDS 1 b] \
+            [list HPEXPIREAT ordered [expr {$base + 2000}] FIELDS 1 b] \
+            [list HPEXPIREAT ordered [expr {$base - 2000}] FIELDS 1 b] \
+            [list HPERSIST ordered FIELDS 2 b b] \
+            [list HPEXPIREAT ordered $base FIELDS 1 d] \
+            [list HPEXPIREAT ordered [expr {$base + 3000}] FIELDS 1 e] \
+            [list HPERSIST ordered FIELDS 1 e] \
+            [list HPEXPIREAT ordered $base FIELDS 5 e d c b a] \
+            [list HPEXPIREAT ordered [expr {$base + 1}] FIELDS 5 a b c d e] \
+            [list HPEXPIREAT ordered $base FIELDS 16 {*}$allfields] \
+            [list HPEXPIREAT ordered [expr {$base + 1}] FIELDS 32 {*}$allfields {*}$allfields] \
+            [list HPERSIST ordered FIELDS 5 c a e b d]]
+
+        foreach update $updates {
+            set replies {}
+            if {[lindex $update 0] eq "HPEXPIREAT"} {
+                foreach field [lrange $update 5 end] {
+                    dict set expected $field [lindex $update 2]
+                    lappend replies 1
+                }
+            } else {
+                foreach field [lrange $update 4 end] {
+                    lappend replies [expr {[dict get $expected $field] == -1 ? -1 : 1}]
+                    dict set expected $field -1
+                }
+            }
+            assert_equal $replies [r {*}$update]
+            assert_equal [dict values $expected] \
+                         [r hpexpiretime ordered FIELDS 16 {*}[dict keys $expected]]
+            set fields [r hkeys ordered]
+            set expiries [r hpexpiretime ordered FIELDS 16 {*}$fields]
+            set previous 0
+            foreach expiry $expiries {
+                # Persistent fields sort after all volatile fields.
+                if {$expiry == -1} { set expiry 9223372036854775807 }
+                assert {$expiry >= $previous}
+                set previous $expiry
+            }
+            foreach {field value} $values {
+                assert_equal $value [r hget ordered $field]
+            }
+            assert_encoding listpackex ordered
+        }
+
+        # Restore must preserve both the listpack and its field expiries.
+        assert_equal {1 1 1} [r hpexpireat ordered $base FIELDS 3 c a b]
+        assert_equal [list $base $base $base -1 -1] \
+                     [r hpexpiretime ordered FIELDS 5 a b c d e]
+        r restore restored 0 [r dump ordered]
+        assert_equal [r hgetall ordered] [r hgetall restored]
+        assert_equal [r hpexpiretime ordered FIELDS 16 {*}$allfields] \
+                     [r hpexpiretime restored FIELDS 16 {*}$allfields]
+    }
+
+    test "Batch field expiry bound handles additions persistence and conversion" {
+        r config set hash-max-listpack-entries 512
+        r config set hash-max-listpack-value 4096
+        set base 4102444800000
+        set values {}
+        set expiries {}
+        for {set i 1} {$i <= 16} {incr i} {
+            dict set values f$i value:$i
+            dict set expiries f$i $base
+        }
+        assert_equal 1 [r hsetex batch PXAT $base FIELDS 16 {*}$values]
+        assert_encoding listpackex batch
+
+        # New fields are temporarily persistent during HSETEX. Each receives
+        # its expiry before the next update, including duplicate fields.
+        set updates [list f1 [string repeat x 513] new:a "binary\x00value" \
+                          f2 42 new:b 007 f1 final f3 three f4 four \
+                          f5 five f6 six f7 seven f8 eight]
+        assert_equal 1 [r hsetex batch PXAT [expr {$base + 1}] \
+                       FIELDS [expr {[llength $updates] / 2}] {*}$updates]
+        foreach {field value} $updates {
+            dict set values $field $value
+            dict set expiries $field [expr {$base + 1}]
+        }
+        assert_encoding listpackex batch
+        assert_equal [dict values $values] [r hmget batch {*}[dict keys $values]]
+        assert_equal [dict values $expiries] \
+                     [r hpexpiretime batch FIELDS 18 {*}[dict keys $expiries]]
+
+        # Persistence invalidates the finite bound for the rest of the batch.
+        assert_equal [dict values $values] \
+                     [r hgetex batch PERSIST FIELDS 18 {*}[dict keys $values]]
+        assert_equal [lrepeat 18 -1] \
+                     [r hpexpiretime batch FIELDS 18 {*}[dict keys $values]]
+        assert_equal [lrepeat 18 1] \
+                     [r hpexpireat batch [expr {$base + 2}] FIELDS 18 {*}[dict keys $values]]
+        foreach field [dict keys $expiries] { dict set expiries $field [expr {$base + 2}] }
+
+        # Crossing the entry limit after initialization makes the bound unused.
+        r config set hash-max-listpack-entries 18
+        set updates {f1 one f2 two f3 three f4 four f5 five f6 six f7 seven new:c new}
+        assert_equal 1 [r hsetex batch PXAT [expr {$base + 3}] FIELDS 8 {*}$updates]
+        foreach {field value} $updates {
+            dict set values $field $value
+            dict set expiries $field [expr {$base + 3}]
+        }
+        assert_encoding hashtable batch
+        assert_equal [dict values $values] [r hmget batch {*}[dict keys $values]]
+        assert_equal [dict values $expiries] \
+                     [r hpexpiretime batch FIELDS 19 {*}[dict keys $expiries]]
+    }
+}
+
 start_server {tags {"external:skip needs:debug"}} {
     foreach type {listpackex hashtable} {
         if {$type eq "hashtable"} {
