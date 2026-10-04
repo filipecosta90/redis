@@ -15,6 +15,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 /*-----------------------------------------------------------------------------
  * B+ tree implementation of the low level sorted set API
@@ -4120,12 +4123,25 @@ static inline uint64_t zbtLeafTagWord(const uint8_t *tags) {
     return intrev64ifbe(word);
 }
 
+#ifdef __SSE2__
+/* Unlike the SWAR mask, these bits are exact byte matches. The caller only
+ * loads complete vectors wholly inside the tag array. */
+static inline unsigned int zbtIndexScanTagMask16(const uint8_t *tags,
+                                                __m128i keep, __m128i match)
+{
+    __m128i word = _mm_loadu_si128((const __m128i *)tags);
+    return (unsigned int)_mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_and_si128(word, keep), match));
+}
+#endif
+
 /* Store the logical positions of the leaf tags that an index tag can stand
  * for, and return their number. 'tags' is the physical array, which is in
  * reverse order when 'reversed' is set. zbtIndexTag() folds leaf tag zero
- * into one. Eight tags are compared at once. As with bucket tags, a mask bit
- * can be set above a real match, so each candidate is checked against its
- * byte. Only complete words are loaded: member records follow the tags. */
+ * into one. SSE2 compares complete 16-byte vectors exactly; the portable
+ * path handles full eight-byte words and checks each candidate byte because
+ * SWAR masks can include carry false positives. Only complete vectors and
+ * words are loaded: member records follow the tags. */
 static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
                                              unsigned int count, int reversed,
                                              uint8_t tag,
@@ -4134,10 +4150,29 @@ static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
     unsigned int found = 0;
     unsigned int words = count / 8;
     unsigned int last = reversed ? count - 1 : 0;
-    for (unsigned int w = 0; w < words; w++) {
+    /* Index tag one represents leaf tags zero and one. Fold that pair
+     * before matching, retaining the exact checks for SWAR carry bits. */
+    uint64_t keep_bits = tag == 1 ? ~UINT64_C(0x0101010101010101) : UINT64_MAX;
+    uint8_t match_tag = tag == 1 ? 0 : tag;
+    unsigned int first_word = 0;
+#ifdef __SSE2__
+    __m128i vector_keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
+    __m128i vector_match = _mm_set1_epi8((char)match_tag);
+    unsigned int vectors = count / 16;
+    for (unsigned int v = 0; v < vectors; v++) {
+        unsigned int mask = zbtIndexScanTagMask16(tags + v * 16,
+                                                vector_keep, vector_match);
+        while (mask) {
+            unsigned int pos = v * 16 + __builtin_ctz(mask);
+            positions[found++] = reversed ? last - pos : pos;
+            mask &= mask - 1;
+        }
+    }
+    first_word = vectors * 2;
+#endif
+    for (unsigned int w = first_word; w < words; w++) {
         uint64_t word = zbtLeafTagWord(tags + w * 8);
-        uint64_t mask = zbtIndexTagMask(word, tag);
-        if (tag == 1) mask |= zbtIndexTagMask(word, 0);
+        uint64_t mask = zbtIndexTagMask(word & keep_bits, match_tag);
         while (mask) {
             unsigned int pos = w * 8 + zbtIndexFirstTag(mask);
             if (tags[pos] == tag || (tag == 1 && tags[pos] == 0))
@@ -4222,6 +4257,37 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     return emitted;
 }
 
+#ifdef __SSE2__
+/* Resolve a bucket's live leaves together before visiting its slots. Fetching
+ * headers first gives the independent tag-array hints time to overlap, while
+ * the ordinary scan below retains all validation, collision checks and order. */
+static void zbtIndexScanPrefetch(const zbtreeSet *zs, zbtIndexTable *table,
+                                 zbtIndexBucket *bucket)
+{
+    zbtScoreLeaf *leaves[ZBT_INDEX_BUCKET_ITEMS];
+    unsigned int count = 0;
+    uint64_t tags = zbtIndexTags(bucket);
+    for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++, tags >>= 8) {
+        if ((tags & 0xff) == 0) continue;
+        uint32_t id = zbtIndexGetId(table, bucket, pos);
+        if (id == ZBT_INDEX_DELETED_ID || id >= zs->next_score_leaf_id) continue;
+        zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
+        if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) continue;
+        leaves[count++] = leaf;
+        redis_prefetch_read(leaf);
+    }
+    for (unsigned int i = 0; i < count; i++) {
+        zbtScoreLeaf *leaf = leaves[i];
+        if (leaf->n.count == 0) continue;
+        uint8_t *tags = zbtScoreLeafHashTags(leaf);
+        redis_prefetch_read(tags);
+        /* A full tag array can straddle three cache lines on x86. */
+        if (leaf->n.count > 64) redis_prefetch_read(tags + 64);
+        redis_prefetch_read(tags + leaf->n.count - 1);
+    }
+}
+#endif
+
 /* Return every member represented in 'table' whose home bucket is one of the
  * buckets of scan group 'group'. Slots in the group's own buckets are returned
  * without rehashing their members. That may repeat a member displaced from an
@@ -4244,6 +4310,9 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
      * a different leaf. Start loading those leaves before reading them. */
     for (unsigned long index = home_start; index < home_end; index++) {
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
+#ifdef __SSE2__
+        zbtIndexScanPrefetch(zs, table, bucket);
+#else
         for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++) {
             if ((uint8_t)(zbtIndexTags(bucket) >> (pos * 8)) == 0) continue;
             uint32_t id = zbtIndexGetId(table, bucket, pos);
@@ -4253,6 +4322,7 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
             redis_prefetch_read(leaf);
             redis_prefetch_read((unsigned char *)leaf + 64);
         }
+#endif
     }
 
     for (unsigned long index = home_start; index < home_end; index++) {
@@ -4917,6 +4987,78 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             if (seen[i] == 0) missed++;
         test_cond("Cursor-driven scan visits every live member at least once",
             missed == 0);
+        zfree(seen);
+        zbtreeFree(zs);
+    }
+
+#ifdef __SSE2__
+    printf("Testing exact vector scan tag masks\n");
+    {
+        uint8_t storage[31];
+        int correct = 1;
+        for (unsigned int tag = 0; tag < 256; tag++) {
+            __m128i keep = _mm_set1_epi8(tag == 1 ? -2 : -1);
+            __m128i match = _mm_set1_epi8(tag == 1 ? 0 : (char)tag);
+            for (unsigned int offset = 0; offset < 16; offset++) {
+                uint8_t *tags = storage + offset;
+                for (unsigned int pattern = 0; pattern < 512; pattern++) {
+                    unsigned int expected = 0;
+                    for (unsigned int i = 0; i < 16; i++) {
+                        tags[i] = (uint8_t)(pattern < 256 ? pattern + i : pattern);
+                        if (tags[i] == tag || (tag == 1 && tags[i] == 0))
+                            expected |= 1u << i;
+                    }
+                    if (zbtIndexScanTagMask16(tags, keep, match) != expected)
+                        correct = 0;
+                }
+            }
+        }
+        test_cond("Vector tag masks preserve every tag and unaligned lane", correct);
+    }
+#endif
+
+    printf("Testing B+ tree ZSCAN with colliding zero/one leaf tags\n");
+    {
+        const int N = 257, LIMIT = 1000000;
+        zbtreeSet *zs = zbtreeCreate();
+        zbtreeReserve(zs, N);
+        int *seen = zcalloc(sizeof(int) * LIMIT);
+        unsigned char *expected = zcalloc(LIMIT);
+        int inserted = 0, limit = 0;
+        /* Choose real members with alternating hash tag bytes 0, 1, 2, 3.
+         * Zero and one share the same index tag; the neighboring byte values
+         * also exercise the exact checks after a word-mask match. The sparse
+         * membership oracle is independent of the scan's tag matching. */
+        for (int i = 0; i < LIMIT && inserted < N; i++) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "member:%d", i);
+            uint32_t hash = (uint32_t)dictGenHashFunction(buf, len);
+            if ((hash >> 24) != (unsigned int)(inserted % 4)) continue;
+            sds ele = sdsnewlen(buf, len);
+            double score;
+            zbtreeInsertPosition position;
+            serverAssert(!zbtreeFindForAdd(zs, ele, &score, &position));
+            zbtreeInsertNew(zs, (double)inserted, ele, &position);
+            sdsfree(ele);
+            expected[i] = 1;
+            limit = i + 1;
+            inserted++;
+        }
+        serverAssert(inserted == N);
+        zbtScanTestPrivdata pd = {seen, limit};
+        uint64_t cursor = 0;
+        unsigned long calls = 0;
+        do {
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
+            serverAssert(++calls < 100000);
+        } while (cursor);
+        int complete = 1;
+        for (int i = 0; i < limit; i++) {
+            if ((seen[i] != 0) != (expected[i] != 0)) complete = 0;
+        }
+        test_cond("Scan preserves membership with zero/one aliases and adjacent tags",
+                  complete);
+        zfree(expected);
         zfree(seen);
         zbtreeFree(zs);
     }
