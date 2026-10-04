@@ -1789,11 +1789,10 @@ static void listpackExAddInternal(robj *o, listpackEntry ent[3]) {
             .expire_time = ent[2].lval,
     };
 
-    /* Check if there is a field with a larger TTL. */
+    /* Find the first persistent field or expiry greater than or equal to the
+     * new expiry, and insert before it. */
     lpFindCb(lpt->lp, NULL, &r, cbFindInListpack, 0);
 
-    /* If list is empty or there is no field with a larger TTL, result will be
-     * NULL. Otherwise, just insert before the found item.*/
     if (r.p)
         lpt->lp = lpBatchInsert(lpt->lp, r.p, LP_BEFORE, ent, 3, NULL);
     else
