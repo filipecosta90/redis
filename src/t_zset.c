@@ -1274,6 +1274,14 @@ static unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds el
     return zl;
 }
 
+/* A headward score update walks over the pairs the member jumps, while
+ * zzlInsert()'s head scan walks over the pairs before its *new* slot. The
+ * two overlap, so a move that crosses more than half the distance to the
+ * head costs more than the scan it replaces. Bound the walk and fall back
+ * to the plain delete + re-insert beyond this many pairs; the tailward walk
+ * needs no bound, since it is always a prefix of the scan it replaces. */
+#define ZZL_UPDATE_BACKWARD_MAX 4
+
 /* Return 1 when the (member,score) pair at (eptr,sptr) sorts strictly after
  * (score,ele) in sorted set order, i.e. when (score,ele) has to be placed
  * before it. */
@@ -1662,8 +1670,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             if (score != curscore) {
                 unsigned char *zl = zobj->ptr;
                 unsigned char *sptr = lpNext(zl,eptr);
-                unsigned char *tptr;    /* Insert before this pair, NULL = tail. */
+                unsigned char *tptr = NULL; /* Insert before this pair, NULL = tail. */
                 unsigned long moved = 0;
+                int fullscan = 0;       /* Headward move too long: rescan. */
 
                 serverAssert(sptr != NULL);
                 if (score > curscore) {
@@ -1698,11 +1707,19 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
                         }
                         peptr = qeptr;
                         psptr = qsptr;
-                        moved++;
+                        if (++moved > ZZL_UPDATE_BACKWARD_MAX) {
+                            fullscan = 1;
+                            break;
+                        }
                     }
                 }
 
-                if (moved == 0) {
+                if (fullscan) {
+                    /* Beyond the bound the outward walk saves nothing, so
+                     * take the original path. */
+                    zl = zzlDelete(zl,eptr);
+                    zl = zzlInsert(zl,ele,score);
+                } else if (moved == 0) {
                     /* The member keeps its position, so only the score entry
                      * has to be rewritten. Encode it exactly as zzlInsertAt()
                      * would; the number of entries does not change. */
