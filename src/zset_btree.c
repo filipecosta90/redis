@@ -8,6 +8,9 @@
  * GNU Affero General Public License v3 (AGPLv3).
  */
 
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 #include "server.h"
 #include "zset_btree.h"
 
@@ -15,9 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#ifdef __SSE2__
-#include <emmintrin.h>
-#endif
 
 /*-----------------------------------------------------------------------------
  * B+ tree implementation of the low level sorted set API
