@@ -57,6 +57,9 @@ nd = "nd"
 ot = "ot"
 # Local variable abbreviations widespread across the codebase.
 cpy = "cpy"
+# B-tree element arrays and fast-path iterator abbreviations.
+eles = "eles"
+fiter = "fiter"
 # Latency-tracking subsystem identifiers.
 advices = "advices"
 # t_string GETRANGE/SETRANGE locals.
