@@ -8,6 +8,7 @@
  * GNU Affero General Public License v3 (AGPLv3).
  */
 
+#include "fmacros.h"
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
