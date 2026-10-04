@@ -109,6 +109,34 @@ start_server {tags {"hash external:skip needs:debug"}} {
         assert_equal [r hpexpiretime ordered FIELDS 5 a b c d e] \
                      [r hpexpiretime restored FIELDS 5 a b c d e]
     }
+
+    test "HSETEX handles value reallocation and conversion during a batch" {
+        r config set hash-max-listpack-value 4096
+        set expiry 4102444800000
+        set large [string repeat x 4096]
+        foreach limit {4 8} {
+            r config set hash-max-listpack-entries $limit
+            r del batch
+            r hset batch f1 old f2 17 f3 untouched
+            r hpexpireat batch [expr {$expiry - 1000}] FIELDS 3 f1 f2 f3
+            assert_encoding listpackex batch
+
+            # Four requested fields fit the threshold, so conversion cannot
+            # happen in the command's initial argument check. With limit 4,
+            # adding f5 converts the hash before the duplicate f1 is updated.
+            assert_equal 1 [r hsetex batch PXAT $expiry FIELDS 4 \
+                f1 $large f4 "binary\x00value" f5 -9223372036854775808 f1 final]
+            assert_equal [list final 17 untouched "binary\x00value" -9223372036854775808] \
+                [r hmget batch f1 f2 f3 f4 f5]
+            assert_equal [list $expiry [expr {$expiry - 1000}] [expr {$expiry - 1000}] $expiry $expiry] \
+                [r hpexpiretime batch FIELDS 5 f1 f2 f3 f4 f5]
+            if {$limit == 4} {
+                assert_encoding hashtable batch
+            } else {
+                assert_encoding listpackex batch
+            }
+        }
+    }
 }
 
 start_server {tags {"external:skip needs:debug"}} {

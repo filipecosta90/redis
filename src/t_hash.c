@@ -2305,6 +2305,57 @@ int hashTypeExists(redisDb *db, kvobj *o, sds field, int hfeFlags, int *isHashDe
 
 static_assert(HASH_SET_TAKE_VALUE == ENTRY_TAKE_VALUE, "ENTRY_TAKE_VALUE must match HASH_SET_TAKE_VALUE");
 
+/* Set a listpack-ex field and optionally return its position after mutation.
+ * A returned position is valid only until the next listpack mutation. */
+static int hashTypeSetListpackEx(redisDb *db, kvobj *o, sds field, sds value,
+                                 int flags, unsigned char **fieldptr) {
+    int update = 0;
+    serverAssert(!fieldptr || (flags & HASH_SET_KEEP_TTL));
+    unsigned char *fptr = NULL, *vptr = NULL, *tptr = NULL;
+    listpackEx *lpt = o->ptr;
+    long long expireTime = HASH_LP_NO_TTL;
+
+    fptr = lpFirst(lpt->lp);
+    if (fptr != NULL) {
+        fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, sdslen(field), 2);
+        if (fptr != NULL) {
+            /* Grab pointer to the value (fptr points to the field) */
+            vptr = lpNext(lpt->lp, fptr);
+            serverAssert(vptr != NULL);
+
+            /* Replace value */
+            lpt->lp = lpReplace(lpt->lp, &vptr, (unsigned char *) value, sdslen(value));
+            update = 1;
+
+            fptr = lpPrev(lpt->lp, vptr);
+            serverAssert(fptr != NULL);
+
+            tptr = lpNext(lpt->lp, vptr);
+            serverAssert(tptr && lpGetIntegerValue(tptr, &expireTime));
+
+            if (flags & HASH_SET_KEEP_TTL) {
+                /* keep old field along with TTL */
+            } else if (expireTime != HASH_LP_NO_TTL) {
+                /* re-insert field and override TTL */
+                listpackExUpdateExpiry(o, field, fptr, vptr, HASH_LP_NO_TTL);
+            }
+        }
+    }
+
+    if (!update)
+        listpackExAddNew(o, field, sdslen(field), value, sdslen(value),
+                         HASH_LP_NO_TTL);
+
+    /* Check if the listpack needs to be converted to a hash table */
+    if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+        hashTypeConvert(db, o, OBJ_ENCODING_HT);
+
+
+    if (fieldptr && o->encoding == OBJ_ENCODING_LISTPACK_EX)
+        *fieldptr = update ? fptr : lpPrevN(lpt->lp, lpLast(lpt->lp), 2);
+    return update;
+}
+
 int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
     int update = 0;
 
@@ -2341,45 +2392,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
         if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
             hashTypeConvert(db, o, OBJ_ENCODING_HT);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-        unsigned char *fptr = NULL, *vptr = NULL, *tptr = NULL;
-        listpackEx *lpt = o->ptr;
-        long long expireTime = HASH_LP_NO_TTL;
-
-        fptr = lpFirst(lpt->lp);
-        if (fptr != NULL) {
-            fptr = lpFind(lpt->lp, fptr, (unsigned char*)field, sdslen(field), 2);
-            if (fptr != NULL) {
-                /* Grab pointer to the value (fptr points to the field) */
-                vptr = lpNext(lpt->lp, fptr);
-                serverAssert(vptr != NULL);
-
-                /* Replace value */
-                lpt->lp = lpReplace(lpt->lp, &vptr, (unsigned char *) value, sdslen(value));
-                update = 1;
-
-                fptr = lpPrev(lpt->lp, vptr);
-                serverAssert(fptr != NULL);
-
-                tptr = lpNext(lpt->lp, vptr);
-                serverAssert(tptr && lpGetIntegerValue(tptr, &expireTime));
-
-                if (flags & HASH_SET_KEEP_TTL) {
-                    /* keep old field along with TTL */
-                } else if (expireTime != HASH_LP_NO_TTL) {
-                    /* re-insert field and override TTL */
-                    listpackExUpdateExpiry(o, field, fptr, vptr, HASH_LP_NO_TTL);
-                }
-            }
-        }
-
-        if (!update)
-            listpackExAddNew(o, field, sdslen(field), value, sdslen(value),
-                             HASH_LP_NO_TTL);
-
-        /* Check if the listpack needs to be converted to a hash table */
-        if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
-            hashTypeConvert(db, o, OBJ_ENCODING_HT);
-
+        update = hashTypeSetListpackEx(db, o, field, value, flags, NULL);
     } else if (o->encoding == OBJ_ENCODING_HT) {
         dict *ht = o->ptr;
         /* check if field already exists */
@@ -4979,11 +4992,24 @@ void hsetexCommand(client *c) {
             if (flags & (HFE_EX | HFE_PX | HFE_EXAT | HFE_PXAT | HFE_KEEPTTL))
                 opt |= HASH_SET_KEEP_TTL;
 
-            hashTypeSet(c->db, o, field, value, opt);
+            unsigned char *fptr = NULL;
+            if (set_expiry && o->encoding == OBJ_ENCODING_LISTPACK_EX)
+                hashTypeSetListpackEx(c->db, o, field, value, opt, &fptr);
+            else
+                hashTypeSet(c->db, o, field, value, opt);
             vecPush(vset, c->argv[first_field_pos + (i * 2)]);
-            /* Update the expiration time. */
+            /* Update the expiration time, reusing the field position only
+             * within this iteration and before any further mutation. */
             if (set_expiry) {
-                int ret = hashTypeSetEx(o, field, expire_time, &setex);
+                int ret;
+                if (fptr) {
+                    listpackEx *lpt = o->ptr;
+                    unsigned char *vptr = lpNext(lpt->lp, fptr);
+                    unsigned char *tptr = lpNext(lpt->lp, vptr);
+                    ret = hashTypeSetExpiryListpack(&setex, field, fptr, vptr, tptr, expire_time);
+                } else {
+                    ret = hashTypeSetEx(o, field, expire_time, &setex);
+                }
                 if (ret == HSETEX_OK) {
                     vecPush(vupdated, c->argv[first_field_pos + (i * 2)]);
                 } else if (ret == HSETEX_DELETED) {
