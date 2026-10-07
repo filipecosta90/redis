@@ -69,6 +69,7 @@ unsigned char *lpLast(unsigned char *lp);
 unsigned char *lpNext(unsigned char *lp, unsigned char *p);
 unsigned char *lpNextWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes);
 unsigned char *lpNextN(unsigned char *lp, unsigned char *p, unsigned long n);
+unsigned char *lpNextValidating(unsigned char *lp, unsigned char *p);
 unsigned char *lpPrev(unsigned char *lp, unsigned char *p);
 unsigned char *lpPrevN(unsigned char *lp, unsigned char *p, unsigned long n);
 size_t lpBytes(unsigned char *lp);

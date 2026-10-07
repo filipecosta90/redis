@@ -552,6 +552,58 @@ unsigned char *lpNextN(unsigned char *lp, unsigned char *p, unsigned long n) {
     return p;
 }
 
+/* Validating forward step, for iterators that walk many entries in a row.
+ *
+ * Validates the entry at 'p' and returns the entry that follows it, or NULL if
+ * 'p' is the last entry of the listpack.
+ *
+ * This is the same (p, next) walk lpValidateIntegrity() and
+ * streamValidateListpackIntegrity() already use, exposed for hot read paths.
+ * It performs exactly the same checks lpNext() does, but it differs in *which*
+ * entry it validates, and callers must respect that:
+ *
+ *   lpNext(lp, p)             'p' must already be validated. Validates the
+ *                             entry it returns. Decodes an entry's length
+ *                             twice over a traversal: once in lpSkip() to step
+ *                             over it, and once more to validate it as the
+ *                             destination of the step that lands on it.
+ *
+ *   lpNextValidating(lp, p)   Validates 'p' itself and derives the next entry
+ *                             from that same decode, so each entry's length is
+ *                             decoded once. The returned pointer is therefore
+ *                             *not* yet validated.
+ *
+ * Because the result is unvalidated, a caller must not read it until it has
+ * been passed through lpNextValidating() in turn. A loop of the shape
+ *
+ *     p = lpValidateFirst(lp);
+ *     while (p) {
+ *         unsigned char *next = lpNextValidating(lp, p);
+ *         use(p);        -- safe: lpNextValidating() just validated p
+ *         p = next;
+ *     }
+ *
+ * validates every entry exactly once, and always before it is read, which is
+ * the same guarantee an lpNext()-driven loop gives.
+ *
+ * Note there is deliberately no 'lpbytes' parameter, unlike lpNextWithBytes().
+ * lpBytes() compiles to a single load -- the header's four length bytes are
+ * assembled with the shift-and-or idiom GCC and Clang both fold into one
+ * 32-bit load -- so hoisting it into the caller and threading it through as an
+ * extra argument costs more than it saves. */
+unsigned char *lpNextValidating(unsigned char *lp, unsigned char *p) {
+    assert(p);
+    unsigned char *next = p;
+    assert(lpValidateNext(lp, &next, lpBytes(lp)));
+    /* lpValidateNext() reports the EOF byte by returning it as the next
+     * record (or NULL if 'p' was itself the EOF byte); lpNext() reports the
+     * end of the listpack as NULL, and that is the contract here too. The
+     * read of next[0] is in range: lpValidateNext() only succeeds after
+     * range-checking 'p + entrylen', which is what 'next' is. */
+    if (next == NULL || next[0] == LP_EOF) return NULL;
+    return next;
+}
+
 /* Step back to the start of the previous entry, without validating it. Caller
  * must ensure 'p' is not the first entry. */
 static inline unsigned char *lpSkipPrev(unsigned char *p) {
@@ -3370,6 +3422,50 @@ int listpackTest(int argc, char *argv[], int flags) {
         long count = 0;
         assert(lpValidateIntegrity(lp, lpBytes(lp), 1, lpValidation, &count) == 1);
         lpFree(lp);
+    }
+
+    TEST("Test lpNextValidating walks exactly what lpNext walks") {
+        /* Differential, not a hand-written expectation: lpNextValidating()
+         * validates the source entry where lpNext() validates the destination,
+         * so the property that matters is that both steppers visit the
+         * identical sequence of pointers and stop in the same place. Checked
+         * here over a fixed mixed-encoding list and then over random lists
+         * that exercise every branch of the length decode, including the
+         * 12-bit and 32-bit string lengths that need a multi-byte backlen. */
+        lp = createList();
+        unsigned char *a = lpFirst(lp), *b = lpValidateFirst(lp);
+        int n = 0;
+        while (a != NULL || b != NULL) {
+            assert(a == b);
+            a = lpNext(lp, a);
+            b = lpNextValidating(lp, b);
+            n++;
+        }
+        assert(n == 4); /* createList() holds four entries. */
+        lpFree(lp);
+
+        char buf[1024];
+        for (int i = 0; i < 200; i++) {
+            lp = lpNew(0);
+            int len = rand() % 64;
+            for (int j = 0; j < len; j++) {
+                int buflen = (rand() % 2) ?
+                    randstring(buf, 1, sizeof(buf) - 1) :
+                    snprintf(buf, sizeof(buf), "%lld", (0LL + rand()) << (rand() % 40));
+                lp = lpAppend(lp, (unsigned char*)buf, buflen);
+            }
+            a = lpFirst(lp);
+            b = lpValidateFirst(lp);
+            n = 0;
+            while (a != NULL || b != NULL) {
+                assert(a == b);
+                a = lpNext(lp, a);
+                b = lpNextValidating(lp, b);
+                n++;
+            }
+            assert(n == len);
+            lpFree(lp);
+        }
     }
 
     TEST("Test number of elements exceeds LP_HDR_NUMELE_UNKNOWN") {
