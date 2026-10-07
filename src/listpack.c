@@ -552,6 +552,52 @@ unsigned char *lpNextN(unsigned char *lp, unsigned char *p, unsigned long n) {
     return p;
 }
 
+/* Validating forward step, for iterators that walk many entries in a row.
+ *
+ * Validates the entry at 'p' and returns the entry that follows it, or NULL if
+ * 'p' is the last entry of the listpack. 'lpbytes' must be lpBytes(lp).
+ *
+ * This is the same (p, next) walk lpValidateIntegrity() and
+ * streamValidateListpackIntegrity() already use, exposed for hot read paths.
+ * It performs exactly the same checks lpNext() does, but it differs in *which*
+ * entry it validates, and callers must respect that:
+ *
+ *   lpNext(lp, p)               'p' must already be validated. Validates the
+ *                               entry it returns. Decodes an entry's length
+ *                               twice over a traversal: once in lpSkip() to
+ *                               step over it, and once more to validate it as
+ *                               the destination of the step that lands on it.
+ *
+ *   lpNextValidating(lp, p, n)  Validates 'p' itself and derives the next
+ *                               entry from that same decode, so each entry's
+ *                               length is decoded once. The returned pointer
+ *                               is therefore *not* yet validated.
+ *
+ * Because the result is unvalidated, a caller must not read it until it has
+ * been passed through lpNextValidating() in turn. A loop of the shape
+ *
+ *     p = lpValidateFirst(lp);
+ *     while (p) {
+ *         unsigned char *next = lpNextValidating(lp, p, lpbytes);
+ *         use(p);        -- safe: lpNextValidating() just validated p
+ *         p = next;
+ *     }
+ *
+ * validates every entry exactly once, and always before it is read, which is
+ * the same guarantee an lpNext()-driven loop gives. */
+unsigned char *lpNextValidating(unsigned char *lp, unsigned char *p, const size_t lpbytes) {
+    assert(p);
+    unsigned char *next = p;
+    assert(lpValidateNext(lp, &next, lpbytes));
+    /* lpValidateNext() reports the EOF byte by returning it as the next
+     * record (or NULL if 'p' was itself the EOF byte); lpNext() reports the
+     * end of the listpack as NULL, and that is the contract here too. The
+     * read of next[0] is in range: lpValidateNext() only succeeds after
+     * range-checking 'p + entrylen', which is what 'next' is. */
+    if (next == NULL || next[0] == LP_EOF) return NULL;
+    return next;
+}
+
 /* Step back to the start of the previous entry, without validating it. Caller
  * must ensure 'p' is not the first entry. */
 static inline unsigned char *lpSkipPrev(unsigned char *p) {
@@ -570,6 +616,15 @@ unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
     if (p-lp == LP_HDR_SIZE) return NULL;
     p = lpSkipPrev(p);
     lpAssertValidEntry(lp, lpBytes(lp), p);
+    return p;
+}
+
+/* This is similar to lpPrev() but avoids the inner call to lpBytes when you already know the listpack size. */
+unsigned char *lpPrevWithBytes(unsigned char *lp, unsigned char *p, const size_t lpbytes) {
+    assert(p);
+    if (p-lp == LP_HDR_SIZE) return NULL;
+    p = lpSkipPrev(p);
+    lpAssertValidEntry(lp, lpbytes, p);
     return p;
 }
 
