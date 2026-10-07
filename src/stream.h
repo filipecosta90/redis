@@ -64,6 +64,8 @@ typedef struct streamIterator {
     uint64_t master_fields_count;       /* Master entries # of fields. */
     unsigned char *master_fields_start; /* Master entries start in listpack. */
     unsigned char *master_fields_ptr;   /* Master field to emit next. */
+    unsigned char *master_fields_next;  /* Successor of master_fields_ptr, from
+                                           its own validation. See lp_next. */
     int entry_flags;                    /* Flags of entry we are emitting. */
     int rev;                /* True if iterating end to start (reverse). */
     int skip_tombstones;    /* True if not emitting tombstone entries. */
@@ -81,6 +83,13 @@ typedef struct streamIterator {
                                header on every step is pure overhead. */
     unsigned char *lp_last_ele; /* Previous listpack element position for corruption detection. */
     unsigned char *lp_ele;  /* Current listpack cursor. */
+    unsigned char *lp_next; /* Successor of lp_ele, obtained from the same
+                               decode that validated lp_ele. Lets the per-field
+                               walk decode each entry's length once instead of
+                               twice -- see lpNextValidating(). Only maintained
+                               while an entry is being emitted, i.e. between a
+                               streamIteratorGetID() that returned 1 and the
+                               streamIteratorGetField() calls that follow it. */
     unsigned char *lp_flags; /* Current entry flags pointer. */
     /* Buffers used to hold the string of lpGet() when the element is
      * integer encoded, so that there is no string representation of the
