@@ -3427,6 +3427,52 @@ int listpackTest(int argc, char *argv[], int flags) {
         lpFree(lp);
     }
 
+    TEST("Test lpNextValidating walks exactly what lpNext walks") {
+        /* Differential, not a hand-written expectation: lpNextValidating()
+         * validates the source entry where lpNext() validates the destination,
+         * so the property that matters is that both steppers visit the
+         * identical sequence of pointers and stop in the same place. Checked
+         * here over a fixed mixed-encoding list and then over random lists
+         * that exercise every branch of the length decode, including the
+         * 12-bit and 32-bit string lengths that need a multi-byte backlen. */
+        lp = createList();
+        size_t lpbytes = lpBytes(lp);
+        unsigned char *a = lpFirst(lp), *b = lpValidateFirst(lp);
+        int n = 0;
+        while (a != NULL || b != NULL) {
+            assert(a == b);
+            a = lpNext(lp, a);
+            b = lpNextValidating(lp, b, lpbytes);
+            n++;
+        }
+        assert(n == 4); /* createList() holds four entries. */
+        lpFree(lp);
+
+        char buf[1024];
+        for (int i = 0; i < 200; i++) {
+            lp = lpNew(0);
+            int len = rand() % 64;
+            for (int j = 0; j < len; j++) {
+                int buflen = (rand() % 2) ?
+                    randstring(buf, 1, sizeof(buf) - 1) :
+                    snprintf(buf, sizeof(buf), "%lld", (0LL + rand()) << (rand() % 40));
+                lp = lpAppend(lp, (unsigned char*)buf, buflen);
+            }
+            lpbytes = lpBytes(lp);
+            a = lpFirst(lp);
+            b = lpValidateFirst(lp);
+            n = 0;
+            while (a != NULL || b != NULL) {
+                assert(a == b);
+                a = lpNext(lp, a);
+                b = lpNextValidating(lp, b, lpbytes);
+                n++;
+            }
+            assert(n == len);
+            lpFree(lp);
+        }
+    }
+
     TEST("Test number of elements exceeds LP_HDR_NUMELE_UNKNOWN") {
         lp = lpNew(0);
         for (int i = 0; i < LP_HDR_NUMELE_UNKNOWN + 1; i++)
