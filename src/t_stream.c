@@ -1389,8 +1389,31 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
     si->lpbytes = 0;
     si->lp_last_ele = NULL;
     si->lp_ele = NULL; /* Current listpack cursor. */
+    si->lp_next = NULL;
+    si->master_fields_next = NULL;
     si->rev = rev;     /* Direction, if non-zero reversed, from end to start. */
     si->skip_tombstones = 1;    /* By default tombstones aren't emitted. */
+}
+
+/* Seed the one-entry lookahead streamIteratorGetField() walks on.
+ *
+ * The invariant it establishes, and that GetField() then maintains, is:
+ * si->lp_ele is a validated entry and si->lp_next is its successor, obtained
+ * from the very decode that validated si->lp_ele. That lets the per-field walk
+ * spend one length decode per entry instead of the two an lpNext() step costs
+ * (one to skip the current entry, one to validate the destination).
+ *
+ * Called once per emitted entry, on the paths where GetID() returns 1, so the
+ * extra decode it spends here is amortised over the entry's 2*numfields steps.
+ * si->entry_flags must already be set, since SAMEFIELDS entries read their
+ * field names through the separate master_fields_ptr cursor. */
+static void streamIteratorSeedLookahead(streamIterator *si) {
+    si->lp_next = si->lp_ele ?
+        lpNextValidating(si->lp, si->lp_ele, si->lpbytes) : NULL;
+    if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+        si->master_fields_next = si->master_fields_ptr ?
+            lpNextValidating(si->lp, si->master_fields_ptr, si->lpbytes) : NULL;
+    }
 }
 
 /* Return 1 and store the current item ID at 'id' if there are still
@@ -1505,6 +1528,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
+                    streamIteratorSeedLookahead(si);
                     return 1; /* Valid item returned. */
                 }
             } else {
@@ -1518,6 +1542,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
+                    streamIteratorSeedLookahead(si);
                     return 1; /* Valid item returned. */
                 }
             }
@@ -1552,15 +1577,28 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
  * lengths by reference, that are valid until the next iterator call, assuming
  * no one touches the stream meanwhile. */
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen) {
+    /* Each step below advances a cursor onto the successor that was already
+     * computed for it, then re-establishes the lookahead for the entry it
+     * just landed on. lpNextValidating() validates the entry it is given, so
+     * every cursor is validated before the lpGet() that reads it, exactly as
+     * lpNext() validated its destination before the caller read it. The
+     * difference is that the length of each entry is now decoded once rather
+     * than twice. */
     if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
         *fieldptr = lpGet(si->master_fields_ptr,fieldlen,si->field_buf);
-        si->master_fields_ptr = lpNextWithBytes(si->lp,si->master_fields_ptr,si->lpbytes);
+        si->master_fields_ptr = si->master_fields_next;
+        si->master_fields_next = si->master_fields_ptr ?
+            lpNextValidating(si->lp,si->master_fields_ptr,si->lpbytes) : NULL;
     } else {
         *fieldptr = lpGet(si->lp_ele,fieldlen,si->field_buf);
-        si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
+        si->lp_ele = si->lp_next;
+        si->lp_next = si->lp_ele ?
+            lpNextValidating(si->lp,si->lp_ele,si->lpbytes) : NULL;
     }
     *valueptr = lpGet(si->lp_ele,valuelen,si->value_buf);
-    si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
+    si->lp_ele = si->lp_next;
+    si->lp_next = si->lp_ele ?
+        lpNextValidating(si->lp,si->lp_ele,si->lpbytes) : NULL;
 }
 
 /* Remove the current entry from the stream: can be called after the
