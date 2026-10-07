@@ -1386,6 +1386,7 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
     }
     si->stream = s;
     si->lp = NULL;     /* There is no current listpack right now. */
+    si->lpbytes = 0;
     si->lp_last_ele = NULL;
     si->lp_ele = NULL; /* Current listpack cursor. */
     si->rev = rev;     /* Direction, if non-zero reversed, from end to start. */
@@ -1414,11 +1415,12 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
             streamDecodeID(si->ri.key,&si->master_id);
             /* Get the master fields count. */
             si->lp = si->ri.data;
+            si->lpbytes = lpBytes(si->lp);
             si->lp_ele = lpFirst(si->lp);           /* Seek items count */
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek deleted count. */
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek num fields. */
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes); /* Seek deleted count. */
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes); /* Seek num fields. */
             si->master_fields_count = lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek first field. */
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes); /* Seek first field. */
             si->master_fields_start = si->lp_ele;
             /* We are now pointing to the first field of the master entry.
              * We need to seek either the first or the last entry depending
@@ -1427,7 +1429,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 /* If we are iterating in normal order, skip the master fields
                  * to seek the first actual entry. */
                 for (uint64_t i = 0; i < si->master_fields_count; i++)
-                    si->lp_ele = lpNext(si->lp,si->lp_ele);
+                    si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
             } else {
                 /* If we are iterating in reverse direction, just seek the
                  * last part of the last entry in the listpack (that is, the
@@ -1440,9 +1442,9 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
              * emitted the current entry, and have to go back to the previous
              * one. */
             int64_t lp_count = lpGetInteger(si->lp_ele);
-            while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+            while(lp_count--) si->lp_ele = lpPrevWithBytes(si->lp,si->lp_ele,si->lpbytes);
             /* Seek lp-count of prev entry. */
-            si->lp_ele = lpPrev(si->lp,si->lp_ele);
+            si->lp_ele = lpPrevWithBytes(si->lp,si->lp_ele,si->lpbytes);
         }
 
         /* For every radix tree node, iterate the corresponding listpack,
@@ -1452,7 +1454,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 /* If we are going forward, skip the previous entry
                  * lp-count field (or in case of the master entry, the zero
                  * term field) */
-                si->lp_ele = lpNext(si->lp,si->lp_ele);
+                si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
                 if (si->lp_ele == NULL) break;
             } else {
                 /* If we are going backward, read the number of elements this
@@ -1464,21 +1466,21 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->lp_ele = NULL;
                     break;
                 }
-                while(lp_count--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+                while(lp_count--) si->lp_ele = lpPrevWithBytes(si->lp,si->lp_ele,si->lpbytes);
             }
 
             /* Get the flags entry. */
             si->lp_flags = si->lp_ele;
             int64_t flags = lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele); /* Seek ID. */
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes); /* Seek ID. */
 
             /* Get the ID: it is encoded as difference between the master
              * ID and this entry ID. */
             *id = si->master_id;
             id->ms += lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele);
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
             id->seq += lpGetInteger(si->lp_ele);
-            si->lp_ele = lpNext(si->lp,si->lp_ele);
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
 
             /* The number of entries is here or not depending on the
              * flags. */
@@ -1486,7 +1488,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 *numfields = si->master_fields_count;
             } else {
                 *numfields = lpGetInteger(si->lp_ele);
-                si->lp_ele = lpNext(si->lp,si->lp_ele);
+                si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
             }
             serverAssert(*numfields>=0);
 
@@ -1527,7 +1529,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 int64_t to_discard = (flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
                                       *numfields : *numfields*2;
                 for (int64_t i = 0; i < to_discard; i++)
-                    si->lp_ele = lpNext(si->lp,si->lp_ele);
+                    si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
             } else {
                 int64_t prev_times = 4; /* flag + id ms + id seq + one more to
                                            go back to the previous entry "count"
@@ -1535,7 +1537,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                 /* If the entry was not flagged SAMEFIELD we also read the
                  * number of fields, so go back one more. */
                 if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS)) prev_times++;
-                while(prev_times--) si->lp_ele = lpPrev(si->lp,si->lp_ele);
+                while(prev_times--) si->lp_ele = lpPrevWithBytes(si->lp,si->lp_ele,si->lpbytes);
             }
         }
 
@@ -1552,13 +1554,13 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen) {
     if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
         *fieldptr = lpGet(si->master_fields_ptr,fieldlen,si->field_buf);
-        si->master_fields_ptr = lpNext(si->lp,si->master_fields_ptr);
+        si->master_fields_ptr = lpNextWithBytes(si->lp,si->master_fields_ptr,si->lpbytes);
     } else {
         *fieldptr = lpGet(si->lp_ele,fieldlen,si->field_buf);
-        si->lp_ele = lpNext(si->lp,si->lp_ele);
+        si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
     }
     *valueptr = lpGet(si->lp_ele,valuelen,si->value_buf);
-    si->lp_ele = lpNext(si->lp,si->lp_ele);
+    si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
 }
 
 /* Remove the current entry from the stream: can be called after the
