@@ -76,6 +76,9 @@ typedef struct streamIterator {
     uint64_t end_seq;
     raxIterator ri;         /* Rax iterator. */
     unsigned char *lp;      /* Current listpack. */
+    size_t lpbytes;         /* Cached lpBytes(lp): the iterator steps thousands
+                               of times over one listpack, and re-reading the
+                               header on every step is pure overhead. */
     unsigned char *lp_last_ele; /* Previous listpack element position for corruption detection. */
     unsigned char *lp_ele;  /* Current listpack cursor. */
     unsigned char *lp_flags; /* Current entry flags pointer. */
