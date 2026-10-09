@@ -1401,7 +1401,7 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
  * not repaid by the steps it saves, so narrow entries keep the plain walk.
  * The value is measured, not chosen: see the field-count ladder recorded with
  * this change. */
-#define STREAM_LOOKAHEAD_MIN_FIELDS 5
+#define STREAM_LOOKAHEAD_MIN_FIELDS 2
 
 /* Seed the one-entry lookahead streamIteratorGetField() walks on.
  *
