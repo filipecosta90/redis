@@ -67,6 +67,11 @@ typedef struct streamIterator {
     unsigned char *master_fields_next;  /* Successor of master_fields_ptr, from
                                            its own validation. See lp_next. */
     int entry_flags;                    /* Flags of entry we are emitting. */
+    int lookahead;          /* True while the entry being emitted is wide enough
+                               for the one-decode lookahead to pay for itself.
+                               Set per entry by streamIteratorSeedLookahead();
+                               lp_next and master_fields_next are only live, and
+                               only read, while this is true. */
     int rev;                /* True if iterating end to start (reverse). */
     int skip_tombstones;    /* True if not emitting tombstone entries. */
     uint64_t start_key[2];  /* Start key as 128 bit big endian. */

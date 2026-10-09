@@ -1391,9 +1391,17 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
     si->lp_ele = NULL; /* Current listpack cursor. */
     si->lp_next = NULL;
     si->master_fields_next = NULL;
+    si->lookahead = 0;
     si->rev = rev;     /* Direction, if non-zero reversed, from end to start. */
     si->skip_tombstones = 1;    /* By default tombstones aren't emitted. */
 }
+
+/* Fields-per-entry at or above which streamIteratorGetField()'s one-decode
+ * lookahead is worth arming. Below it the single decode the seeding costs is
+ * not repaid by the steps it saves, so narrow entries keep the plain walk.
+ * The value is measured, not chosen: see the field-count ladder recorded with
+ * this change. */
+#define STREAM_LOOKAHEAD_MIN_FIELDS 5
 
 /* Seed the one-entry lookahead streamIteratorGetField() walks on.
  *
@@ -1406,8 +1414,17 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
  * Called once per emitted entry, on the paths where GetID() returns 1, so the
  * extra decode it spends here is amortised over the entry's 2*numfields steps.
  * si->entry_flags must already be set, since SAMEFIELDS entries read their
- * field names through the separate master_fields_ptr cursor. */
-static void streamIteratorSeedLookahead(streamIterator *si) {
+ * field names through the separate master_fields_ptr cursor.
+ *
+ * Seeding is not free: it costs one decode per entry regardless of how many
+ * fields that entry then turns out to have, so on narrow entries it is pure
+ * overhead with nothing to amortise it over. Entries below
+ * STREAM_LOOKAHEAD_MIN_FIELDS therefore stay on the plain lpNext() walk, and
+ * only wide ones arm the lookahead. */
+static void streamIteratorSeedLookahead(streamIterator *si, int64_t numfields) {
+    si->lookahead = numfields >= STREAM_LOOKAHEAD_MIN_FIELDS;
+    if (!si->lookahead) return;
+
     si->lp_next = si->lp_ele ?
         lpNextValidating(si->lp, si->lp_ele, si->lpbytes) : NULL;
     if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
@@ -1528,7 +1545,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
-                    streamIteratorSeedLookahead(si);
+                    streamIteratorSeedLookahead(si, *numfields);
                     return 1; /* Valid item returned. */
                 }
             } else {
@@ -1542,7 +1559,7 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
-                    streamIteratorSeedLookahead(si);
+                    streamIteratorSeedLookahead(si, *numfields);
                     return 1; /* Valid item returned. */
                 }
             }
@@ -1577,28 +1594,45 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
  * lengths by reference, that are valid until the next iterator call, assuming
  * no one touches the stream meanwhile. */
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen) {
-    /* Each step below advances a cursor onto the successor that was already
-     * computed for it, then re-establishes the lookahead for the entry it
-     * just landed on. lpNextValidating() validates the entry it is given, so
-     * every cursor is validated before the lpGet() that reads it, exactly as
-     * lpNext() validated its destination before the caller read it. The
-     * difference is that the length of each entry is now decoded once rather
-     * than twice. */
+    /* With the lookahead armed, each step below advances a cursor onto the
+     * successor that was already computed for it, then re-establishes the
+     * lookahead for the entry it just landed on. lpNextValidating() validates
+     * the entry it is given, so every cursor is validated before the lpGet()
+     * that reads it, exactly as lpNext() validated its destination before the
+     * caller read it. The difference is that the length of each entry is then
+     * decoded once rather than twice.
+     *
+     * On entries too narrow to repay the seeding (see
+     * STREAM_LOOKAHEAD_MIN_FIELDS) the lookahead is not armed and the steps
+     * fall back to the plain lpNext() walk. si->lookahead is fixed for the
+     * whole of an entry's walk, so the branch is perfectly predicted. */
     if (si->entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
         *fieldptr = lpGet(si->master_fields_ptr,fieldlen,si->field_buf);
-        si->master_fields_ptr = si->master_fields_next;
-        si->master_fields_next = si->master_fields_ptr ?
-            lpNextValidating(si->lp,si->master_fields_ptr,si->lpbytes) : NULL;
+        if (si->lookahead) {
+            si->master_fields_ptr = si->master_fields_next;
+            si->master_fields_next = si->master_fields_ptr ?
+                lpNextValidating(si->lp,si->master_fields_ptr,si->lpbytes) : NULL;
+        } else {
+            si->master_fields_ptr = lpNextWithBytes(si->lp,si->master_fields_ptr,si->lpbytes);
+        }
     } else {
         *fieldptr = lpGet(si->lp_ele,fieldlen,si->field_buf);
+        if (si->lookahead) {
+            si->lp_ele = si->lp_next;
+            si->lp_next = si->lp_ele ?
+                lpNextValidating(si->lp,si->lp_ele,si->lpbytes) : NULL;
+        } else {
+            si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
+        }
+    }
+    *valueptr = lpGet(si->lp_ele,valuelen,si->value_buf);
+    if (si->lookahead) {
         si->lp_ele = si->lp_next;
         si->lp_next = si->lp_ele ?
             lpNextValidating(si->lp,si->lp_ele,si->lpbytes) : NULL;
+    } else {
+        si->lp_ele = lpNextWithBytes(si->lp,si->lp_ele,si->lpbytes);
     }
-    *valueptr = lpGet(si->lp_ele,valuelen,si->value_buf);
-    si->lp_ele = si->lp_next;
-    si->lp_next = si->lp_ele ?
-        lpNextValidating(si->lp,si->lp_ele,si->lpbytes) : NULL;
 }
 
 /* Remove the current entry from the stream: can be called after the
