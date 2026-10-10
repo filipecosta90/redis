@@ -1430,16 +1430,37 @@ dictEntry *dictGetFairRandomKey(dict *d) {
     return entries[idx];
 }
 
-/* Function to reverse bits. Algorithm from:
- * http://graphics.stanford.edu/~seander/bithacks.html#ReverseParallel */
-static unsigned long rev(unsigned long v) {
-    unsigned long s = CHAR_BIT * sizeof(v); // bit size; must be power of 2
-    unsigned long mask = ~0UL;
-    while ((s >>= 1) > 0) {
-        mask ^= (mask << s);
-        v = ((v >> s) & mask) | ((v << s) & ~mask);
+/* Return the cursor of the bucket a scan visits after 'v', for a table whose
+ * bucket mask is 'm'.
+ *
+ * A scan increments the cursor in reverse bit order, so that growing or
+ * shrinking the table can only ever make it re-visit buckets, never skip them.
+ * The textbook way to write that is "reverse the cursor, add one, reverse it
+ * back", which is what this used to do. There is no bit-reversal instruction
+ * reachable from C on either x86-64 or AArch64, so the reversal was a six-round
+ * shift-and-mask loop and the scan paid two of them for every bucket it
+ * visited. A profile hides that cost, because the arithmetic overlaps the
+ * bucket load it sits next to; it shows up as soon as you add or remove one.
+ *
+ * Incrementing in reverse bit order is the same thing as propagating a carry
+ * from the top of the mask downwards: flip the highest bit, and if it was
+ * already set, carry into the next one down. That is one iteration per trailing
+ * one-bit of the reversed cursor -- one in the common case, two on average. */
+static inline unsigned long dictNextScanCursor(unsigned long v, unsigned long m) {
+    unsigned long bit = (m + 1) >> 1;   /* the mask's highest bit */
+
+    /* SCAN takes the cursor straight from the client, so it can arrive with
+     * bits set outside the mask. The reversal form dropped them as a side
+     * effect of the carry running off the end; here they have to be dropped
+     * explicitly. */
+    v &= m;
+
+    while (bit) {
+        v ^= bit;
+        if (v & bit) return v;          /* no carry out of this bit: done */
+        bit >>= 1;
     }
-    return v;
+    return 0;                           /* carried past the last bit: scan over */
 }
 
 /* dictScan() is used to iterate over the elements of a dictionary.
@@ -1587,14 +1608,8 @@ unsigned long dictScanDefrag(dict *d,
         m0 = DICTHT_SIZE_MASK(d->ht_size_exp[htidx0]);
         dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx0][v & m0]);
 
-        /* Set unmasked bits so incrementing the reversed cursor
-         * operates on the masked bits */
-        v |= ~m0;
-
         /* Increment the reverse cursor */
-        v = rev(v);
-        v++;
-        v = rev(v);
+        v = dictNextScanCursor(v, m0);
 
     } else {
         htidx0 = 0;
@@ -1617,10 +1632,7 @@ unsigned long dictScanDefrag(dict *d,
             dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx1][v & m1]);
 
             /* Increment the reverse cursor not covered by the smaller mask.*/
-            v |= ~m1;
-            v = rev(v);
-            v++;
-            v = rev(v);
+            v = dictNextScanCursor(v, m1);
 
             /* Continue while bits covered by mask difference is non-zero */
         } while (v & (m0 ^ m1));
