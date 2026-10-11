@@ -1430,35 +1430,32 @@ dictEntry *dictGetFairRandomKey(dict *d) {
     return entries[idx];
 }
 
-/* Function to reverse bits, using the AArch64 rbit instruction where it is
- * available and an unrolled bit-parallel reversal elsewhere. */
-#ifdef __aarch64__
-static inline unsigned long rev(unsigned long x) {
-    __asm__ __volatile__(
-        "rbit %0, %0"
-        : "+r"(x)
-    );
-    return x;
+/* Return the cursor of the bucket a scan visits after 'v', for a table whose
+ * bucket mask is 'm'.
+ *
+ * The cursor is incremented in reverse bit order, so that resizing the table
+ * can only make a scan re-visit buckets, never skip them. That is the same
+ * operation as propagating a carry from the top bit of the mask downwards:
+ * flip the highest bit, and carry into the next one down if it was already
+ * set. It costs one iteration, plus one more per leading one-bit of the
+ * cursor -- two on average, and at most one per bit of the mask for the
+ * cursor that ends a cycle. */
+static inline unsigned long dictNextScanCursor(unsigned long v, unsigned long m) {
+    unsigned long bit = m ^ (m >> 1); /* The mask's highest bit. */
+
+    /* SCAN takes the cursor straight from the client, so it can arrive with
+     * bits set outside the mask. The reversal form this replaces dropped them
+     * as a side effect of the carry running off the end; here they have to be
+     * dropped explicitly. */
+    v &= m;
+
+    while (bit) {
+        v ^= bit;
+        if (v & bit) return v; /* No carry out of this bit, done. */
+        bit >>= 1;
+    }
+    return 0; /* Carried past the last bit, the scan is over. */
 }
-#else
-static inline unsigned long rev(unsigned long x) {
-#if ULONG_MAX == 4294967295UL
-    x = ((x & 0x55555555) << 1) | ((x >> 1) & 0x55555555);
-    x = ((x & 0x33333333) << 2) | ((x >> 2) & 0x33333333);
-    x = ((x & 0x0F0F0F0F) << 4) | ((x >> 4) & 0x0F0F0F0F);
-    x = ((x & 0x00FF00FF) << 8) | ((x >> 8) & 0x00FF00FF);
-    x = (x << 16) | (x >> 16);
-#else
-    x = ((x & 0x5555555555555555ULL) << 1)  | ((x >> 1)  & 0x5555555555555555ULL);
-    x = ((x & 0x3333333333333333ULL) << 2)  | ((x >> 2)  & 0x3333333333333333ULL);
-    x = ((x & 0x0F0F0F0F0F0F0F0FULL) << 4)  | ((x >> 4)  & 0x0F0F0F0F0F0F0F0FULL);
-    x = ((x & 0x00FF00FF00FF00FFULL) << 8)  | ((x >> 8)  & 0x00FF00FF00FF00FFULL);
-    x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
-    x = (x << 32) | (x >> 32);
-#endif
-    return x;
-}
-#endif
 
 /* dictScan() is used to iterate over the elements of a dictionary.
  *
@@ -1483,7 +1480,9 @@ static inline unsigned long rev(unsigned long x) {
  * The main idea is to increment a cursor starting from the higher order
  * bits. That is, instead of incrementing the cursor normally, the bits
  * of the cursor are reversed, then the cursor is incremented, and finally
- * the bits are reversed again.
+ * the bits are reversed again. dictNextScanCursor() computes the same value
+ * without the two reversals, by propagating a carry downwards from the top
+ * bit of the mask.
  *
  * This strategy is needed because the hash table may be resized between
  * iteration calls.
@@ -1605,14 +1604,8 @@ unsigned long dictScanDefrag(dict *d,
         m0 = DICTHT_SIZE_MASK(d->ht_size_exp[htidx0]);
         dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx0][v & m0]);
 
-        /* Set unmasked bits so incrementing the reversed cursor
-         * operates on the masked bits */
-        v |= ~m0;
-
-        /* Increment the reverse cursor */
-        v = rev(v);
-        v++;
-        v = rev(v);
+        /* Advance the cursor in reverse bit order */
+        v = dictNextScanCursor(v, m0);
 
     } else {
         htidx0 = 0;
@@ -1634,11 +1627,8 @@ unsigned long dictScanDefrag(dict *d,
         do {
             dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx1][v & m1]);
 
-            /* Increment the reverse cursor not covered by the smaller mask.*/
-            v |= ~m1;
-            v = rev(v);
-            v++;
-            v = rev(v);
+            /* Advance the cursor against the larger table's mask. */
+            v = dictNextScanCursor(v, m1);
 
             /* Continue while bits covered by mask difference is non-zero */
         } while (v & (m0 ^ m1));
@@ -2042,6 +2032,46 @@ static dictType BenchmarkDictTypeNoValue = {
 } while(0)
 
 /* ./redis-server test dict [<count> | --accurate] */
+/* The bit-reversal form dictNextScanCursor() replaces, kept as the reference
+ * oracle for the equivalence test below. Algorithm from:
+ * http://graphics.stanford.edu/~seander/bithacks.html#ReverseParallel */
+static unsigned long revForTest(unsigned long v) {
+    unsigned long s = CHAR_BIT * sizeof(v); /* bit size; must be power of 2 */
+    unsigned long mask = ~0UL;
+    while ((s >>= 1) > 0) {
+        mask ^= (mask << s);
+        v = ((v >> s) & mask) | ((v << s) & ~mask);
+    }
+    return v;
+}
+
+static unsigned long nextScanCursorRef(unsigned long v, unsigned long m) {
+    v |= ~m;
+    v = revForTest(v);
+    v++;
+    return revForTest(v);
+}
+
+/* Visit-count callback for the rehashing scan-coverage test. */
+static void scanCountCallback(void *privdata, const dictEntry *de, dictEntry **plink) {
+    UNUSED(plink);
+    long *seen = privdata;
+    seen[(long)(intptr_t)dictGetVal((dictEntry*)de)]++;
+}
+
+/* Walk a full scan cycle over 'd' and assert every one of 'n' elements, whose
+ * values are the integers [0, n), is returned at least once. */
+static void assertScanVisitsEverything(dict *d, long *seen, long n) {
+    unsigned long v = 0, iterations = 0;
+    memset(seen, 0, sizeof(long) * n);
+    do {
+        v = dictScan(d, v, scanCountCallback, seen);
+        /* A complete cycle cannot visit more buckets than the table has. */
+        assert(++iterations <= dictBuckets(d) + 1);
+    } while (v != 0);
+    for (long i = 0; i < n; i++) assert(seen[i] > 0);
+}
+
 int dictTest(int argc, char **argv, int flags) {
     long j;
     long long start, elapsed;
@@ -2408,6 +2438,72 @@ int dictTest(int argc, char **argv, int flags) {
         }
 
         dictRelease(d);
+    }
+
+    TEST("dictNextScanCursor matches the bit-reversal form") {
+        /* Every cursor of every complete scan cycle, for every small table
+         * size, including the empty table (ht_size_exp == -1 gives mask 0).
+         * Bit-exactness against the form the carry replaced is the whole
+         * correctness argument, so it is checked rather than argued. */
+        int maxexp = accurate ? 18 : 13;
+        for (int e = -1; e <= maxexp; e++) {
+            unsigned long m = DICTHT_SIZE_MASK(e);
+            unsigned long v = 0, visited = 0;
+            do {
+                assert(dictNextScanCursor(v, m) == nextScanCursorRef(v, m));
+                v = dictNextScanCursor(v, m);
+                visited++;
+                assert(visited <= m + 1);
+            } while (v != 0);
+            assert(visited == m + 1); /* a cycle visits every bucket exactly once */
+        }
+        /* SCAN takes the cursor from the client, so it can arrive with bits
+         * set outside the mask, and at any exponent the table can reach. */
+        int width = CHAR_BIT * sizeof(unsigned long);
+        int rounds = accurate ? 100000 : 2000;
+        for (int e = 0; e < width; e++) {
+            unsigned long m = DICTHT_SIZE_MASK(e);
+            unsigned long corners[] = { 0, 1, m, m >> 1, ~0UL, 1UL << (width - 1) };
+            for (size_t i = 0; i < sizeof(corners) / sizeof(*corners); i++)
+                assert(dictNextScanCursor(corners[i], m) == nextScanCursorRef(corners[i], m));
+            for (int t = 0; t < rounds; t++) {
+                unsigned long v = 0;
+                for (int b = 0; b < width; b += 8) v = (v << 8) ^ (unsigned long)(rand() & 0xff);
+                assert(dictNextScanCursor(v, m) == nextScanCursorRef(v, m));
+            }
+        }
+    }
+
+    TEST("dictScan visits every element while the table is rehashing") {
+        /* The rehashing branch of dictScanDefrag() advances the cursor
+         * against the larger table's mask while the bucket walk straddles
+         * both tables. Hold a dict at every intermediate rehash position,
+         * growing and shrinking, and assert the SCAN guarantee at each one. */
+        long counts[] = { 1, 2, 3, 5, 9, 17, 33, 100, 257, 1000 };
+        for (size_t c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+            long n = counts[c];
+            long *seen = zmalloc(sizeof(long) * n);
+            dict *sd = dictCreate(&BenchmarkDictType);
+            for (long i = 0; i < n; i++)
+                assert(dictAdd(sd, stringFromLongLong(i), (void*)(intptr_t)i) == DICT_OK);
+
+            assertScanVisitsEverything(sd, seen, n);   /* not rehashing */
+            dictExpand(sd, (unsigned long)n * 4 + 8);  /* grow */
+            while (dictIsRehashing(sd)) {
+                assertScanVisitsEverything(sd, seen, n);
+                dictRehash(sd, 1);
+            }
+            assertScanVisitsEverything(sd, seen, n);
+            dictExpand(sd, 8);                         /* shrink */
+            while (dictIsRehashing(sd)) {
+                assertScanVisitsEverything(sd, seen, n);
+                dictRehash(sd, 1);
+            }
+            assertScanVisitsEverything(sd, seen, n);
+
+            dictRelease(sd);
+            zfree(seen);
+        }
     }
 
     return 0;
