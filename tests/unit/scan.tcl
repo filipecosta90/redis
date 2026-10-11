@@ -377,6 +377,90 @@ proc test_scan {type} {
         assert_equal 100 [llength $keys2]
     }
 
+    test "{$type} SCAN ignores cursor bits above the table mask" {
+        # The cursor comes from the client, so it can carry bits above the
+        # table's bucket mask. Those bits select no bucket and are dropped
+        # rather than acted on, so two cursors differing only above the mask
+        # must behave identically.
+        r flushdb
+        populate 100
+
+        # Under cluster the low bits of a SCAN cursor are the kvstore slot
+        # index and the hash table cursor sits above them, so the cursors
+        # below are assembled around a slot that actually holds keys. Built
+        # from a bare cursor instead, kvstoreScan() finds the addressed slot
+        # empty, skips it and never calls dictScan() at all, and every
+        # iteration below returns the same thing whatever it was given.
+        if {$type eq "cluster"} {
+            set shift 14
+            set didx [r cluster keyslot key:1]
+        } else {
+            set shift 0
+            set didx 0
+        }
+
+        # 2**30 is far above the bucket mask of any table here (255 for a
+        # 100-key keyspace, 2047 for a 1000-field hash), so adding it to the
+        # hash table cursor must not change what the scan returns. It has to
+        # stay inside 32 bits: dictScan() takes an unsigned long, so on a
+        # 32-bit build anything above bit 31 is discarded on the way in and
+        # the comparison below would be a value against itself.
+        #
+        # The two scans go in one MULTI: populate leaves the keyspace dict
+        # mid-rehash, activerehashing finishes it from the cron, and a rehash
+        # step landing between the pair legitimately changes the answer.
+        set high [expr {1 << 30}]
+        foreach ht {0 1 2 3 7 64} {
+            set cur [expr {($ht << $shift) | $didx}]
+            set above [expr {(($ht + $high) << $shift) | $didx}]
+            r multi
+            r scan $cur
+            r scan $above
+            set res [r exec]
+            set plain [lindex $res 0]
+            set shifted [lindex $res 1]
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+        }
+
+        # An all-ones hash table cursor is the last bucket of a cycle, so a
+        # scan starting there finishes that table in a single step. The
+        # cursor is an unsigned long inside dictScan(), so "all ones" is
+        # width-dependent.
+        set bits [s arch_bits]
+        set allones [expr {(((1 << ($bits - $shift)) - 1) << $shift) | $didx}]
+        set next [lindex [r scan $allones] 0]
+        if {$type eq "cluster"} {
+            # The keyspace continues in later slots, so the iteration moves
+            # on to one of them rather than ending.
+            assert {$next == 0 || ($next & ((1 << $shift) - 1)) > $didx}
+        } else {
+            assert_equal 0 $next
+        }
+
+        # Same on a hashtable-encoded hash, which reaches dictScan directly
+        # rather than through the kvstore wrapper.
+        set elements {}
+        for {set j 0} {$j < 1000} {incr j} {
+            lappend elements key:$j $j
+        }
+        r hmset myhash {*}$elements
+        assert_encoding hashtable myhash
+        foreach cur {0 1 5 33} {
+            # Paired in a MULTI for the same reason as the keyspace scans
+            # above: hmset can leave the hash mid-rehash.
+            r multi
+            r hscan myhash $cur
+            r hscan myhash [expr {$cur + $high}]
+            set res [r exec]
+            set plain [lindex $res 0]
+            set shifted [lindex $res 1]
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+        }
+        r flushdb
+    }
+
     test "{$type} SSCAN with integer encoded object (issue #1345)" {
         set objects {1 a}
         r del set
