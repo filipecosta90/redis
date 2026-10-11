@@ -377,6 +377,56 @@ proc test_scan {type} {
         assert_equal 100 [llength $keys2]
     }
 
+    test "{$type} SCAN ignores cursor bits above the table mask" {
+        # The cursor comes from the client, so it can carry bits above the
+        # table's bucket mask. Those bits are dropped rather than acted on:
+        # two cursors that differ only above the mask must behave
+        # identically, and an all-ones cursor is the last bucket of any
+        # cycle, so it must end the iteration in a single step.
+        r flushdb
+        populate 100
+
+        # 2**40 is far above the bucket mask of a 100-key table, so adding it
+        # to a cursor must not change what the scan returns. Under cluster the
+        # low bits are the kvstore slot index and the HT cursor sits above
+        # them, so 2**40 is above the bucket mask either way.
+        #
+        # The two scans go in one MULTI: populate leaves the keyspace dict
+        # mid-rehash, activerehashing finishes it from the cron, and a rehash
+        # step landing between the pair legitimately changes the answer.
+        set high [expr {1 << 40}]
+        foreach cur {0 1 2 3 7 64} {
+            r multi
+            r scan $cur
+            r scan [expr {$cur + $high}]
+            set res [r exec]
+            set plain [lindex $res 0]
+            set shifted [lindex $res 1]
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+        }
+
+        # An all-ones cursor is the last bucket of any cycle, so a scan
+        # starting there ends in one step.
+        assert_equal 0 [lindex [r scan 18446744073709551615] 0]
+
+        # Same on a hashtable-encoded hash, which reaches dictScan directly
+        # rather than through the kvstore wrapper.
+        set elements {}
+        for {set j 0} {$j < 1000} {incr j} {
+            lappend elements key:$j $j
+        }
+        r hmset myhash {*}$elements
+        assert_encoding hashtable myhash
+        foreach cur {0 1 5 33} {
+            set plain [r hscan myhash $cur]
+            set shifted [r hscan myhash [expr {$cur + $high}]]
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+        }
+        r flushdb
+    }
+
     test "{$type} SSCAN with integer encoded object (issue #1345)" {
         set objects {1 a}
         r del set
