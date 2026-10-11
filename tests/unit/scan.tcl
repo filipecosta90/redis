@@ -377,6 +377,78 @@ proc test_scan {type} {
         assert_equal 100 [llength $keys2]
     }
 
+    test "{$type} SCAN ignores cursor bits above the table mask" {
+        # The cursor comes from the client, so it can carry bits above the
+        # table's bucket mask. Those bits select no bucket and are dropped
+        # rather than acted on, so two cursors differing only above the mask
+        # must return the same thing.
+        r flushdb
+        populate 100
+
+        # Hash-tagged keys, so under cluster they all land in ONE kvstore slot
+        # dict. With only one key per slot, every slot dict is walked to
+        # completion inside a single SCAN call, so the dict-level cursor is
+        # always 0 on the wire and bits above the bucket mask are consumed
+        # before a client can ever see them.
+        for {set j 0} {$j < 1000} {incr j} { r set "{t}:$j" v }
+
+        # Re-issue every cursor the server hands back, with 2**30 added, for a
+        # whole cycle. Hand-picked cursors would not do: under cluster the low
+        # bits of a cursor are the kvstore dict index, so a cursor that names
+        # an empty slot takes kvstoreScan()'s "move on" path without ever
+        # reaching dictScan().
+        #
+        # 2**30 has to stay inside 32 bits. dictScan() takes an unsigned long,
+        # so on a 32-bit build anything above bit 31 is discarded on the way
+        # in and the comparison below would be a value against itself.
+        #
+        # Both scans go in one MULTI: populate leaves the keyspace dict
+        # mid-rehash, activerehashing finishes it from the cron, and a rehash
+        # step landing between the pair legitimately changes the answer.
+        set high [expr {1 << 30}]
+        set c 0
+        set guard 0
+        while 1 {
+            assert {[incr guard] < 100000}
+            r multi
+            r scan $c
+            r scan [expr {$c + $high}]
+            lassign [r exec] plain shifted
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+            set c [lindex $plain 0]
+            if {$c == 0} break
+        }
+
+        # An all-ones cursor is the last bucket of a cycle, so a scan starting
+        # there ends the iteration in one step. Standalone only: under cluster
+        # the low bits would decode to a dict index, and the scan would resume
+        # from whatever slot that happens to name rather than end.
+        if {$type eq "standalone"} {
+            set allones [expr {(1 << [s arch_bits]) - 1}]
+            assert_equal 0 [lindex [r scan $allones] 0]
+        }
+
+        # Same on a hashtable-encoded hash, which reaches dictScan directly
+        # rather than through the kvstore wrapper.
+        set elements {}
+        for {set j 0} {$j < 1000} {incr j} {
+            lappend elements key:$j $j
+        }
+        r hmset hash {*}$elements
+        assert_encoding hashtable hash
+        foreach c {0 1 5 33} {
+            # Paired in a MULTI for the same reason as above: hmset can leave
+            # the hash mid-rehash.
+            r multi
+            r hscan hash $c
+            r hscan hash [expr {$c + $high}]
+            lassign [r exec] plain shifted
+            assert_equal [lindex $plain 0] [lindex $shifted 0]
+            assert_equal [lsort [lindex $plain 1]] [lsort [lindex $shifted 1]]
+        }
+    }
+
     test "{$type} SSCAN with integer encoded object (issue #1345)" {
         set objects {1 a}
         r del set
