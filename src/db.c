@@ -2852,6 +2852,19 @@ long long getExpire(redisDb *db, sds key, kvobj *kv) {
  *
  * key_mem_freed is an out parameter which contains the estimated
  * amount of memory freed due to the trimming (may be NULL) */
+/* The used memory deleteKeyAndPropagate() looks at before and after deleting
+ * a key, to measure what the deletion frees.
+ *
+ * When this thread frees the key, it is the memory of this thread only:
+ * meanwhile the IO threads allocate and free the output buffers of their
+ * clients, and the invalidation messages of the keys we delete among them.
+ * With lazy free another thread releases the memory, so we keep looking at
+ * the whole process, see performEvictions(). */
+static inline long long keyDeletionUsedMemory(int lazy) {
+    long long used = lazy ? (long long) zmalloc_used_memory() : zmalloc_used_memory_thread();
+    return used - (long long) freeMemoryGetNotCountedMemory();
+}
+
 static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, long long *key_mem_freed) {
     mstime_t latency;
     int del_flag = notify_type == NOTIFY_EXPIRED ? DB_FLAG_KEY_EXPIRED : DB_FLAG_KEY_EVICTED;
@@ -2882,12 +2895,12 @@ static void deleteKeyAndPropagate(redisDb *db, robj *keyobj, int notify_type, lo
      * using only zmalloc_used_memory but in CRDT we can't do that
      * so we use freeMemoryGetNotCountedMemory to avoid counting
      * AOF and slave buffers */
-    if (key_mem_freed) *key_mem_freed = (long long) zmalloc_used_memory() - freeMemoryGetNotCountedMemory();
+    if (key_mem_freed) *key_mem_freed = keyDeletionUsedMemory(lazy_flag);
     latencyStartMonitor(latency);
     dbGenericDelete(db, keyobj, lazy_flag, del_flag);
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded(latency_name, latency);
-    if (key_mem_freed) *key_mem_freed -= (long long) zmalloc_used_memory() - freeMemoryGetNotCountedMemory();
+    if (key_mem_freed) *key_mem_freed -= keyDeletionUsedMemory(lazy_flag);
 
     notifyKeyspaceEvent(notify_type, notify_name,keyobj, db->id);
     keyModified(NULL, db, keyobj, NULL, 1);

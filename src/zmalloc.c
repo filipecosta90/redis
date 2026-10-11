@@ -670,6 +670,16 @@ size_t zmalloc_used_memory(void) {
     return total_mem;
 }
 
+/* What the calling thread allocated minus what it freed. It can be negative,
+ * since a thread may free what another one allocated: only its variations
+ * are meaningful, and they don't see what the other threads do meanwhile. */
+long long zmalloc_used_memory_thread(void) {
+    long long thread_used_mem;
+    init_my_thread_index();
+    atomicGet(used_memory[my_thread_index].used_memory, thread_used_mem);
+    return thread_used_mem;
+}
+
 size_t zmalloc_get_peak_memory(void) {
     size_t peak;
     atomicGet(zmalloc_peak, peak);

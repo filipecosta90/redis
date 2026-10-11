@@ -233,6 +233,7 @@ client *createClient(connection *conn) {
     c->io_pushes_flags = 0;
     c->io_pushes_node = NULL;
     c->io_pushes_queued = 0;
+    c->io_pushes_unwritten = 0;
     c->postponed_list_node = NULL;
     c->client_tracking_redirection = 0;
     c->client_tracking_prefixes = NULL;
@@ -2416,6 +2417,7 @@ void freeClient(client *c) {
     freeClientOriginalArgv(c);
     freeClientDeferredObjects(c, 1);
     freeClientIODeferredObjects(c, 1);
+    if (c->io_pushes_unwritten) atomicDecr(server.io_pushes_mem, c->io_pushes_unwritten);
     tryUnlinkClientFromPendingRefReply(c, 1);
     if (c->deferred_reply_errors)
         listRelease(c->deferred_reply_errors);
@@ -3022,6 +3024,14 @@ int writeToClient(client *c, int handler_installed) {
         atomicIncr(server.stat_net_output_bytes, totwritten);
     }
     c->net_output_bytes += totwritten;
+
+    /* The pushes queued for this client, see queueClientPushes(), had their
+     * chance to be written: from now on what the socket did not take
+     * counts as memory for the eviction. */
+    if (unlikely(c->io_pushes_unwritten)) {
+        atomicDecr(server.io_pushes_mem, c->io_pushes_unwritten);
+        c->io_pushes_unwritten = 0;
+    }
 
     if (nwritten == -1) {
         if (connGetState(c->conn) != CONN_STATE_CONNECTED) {

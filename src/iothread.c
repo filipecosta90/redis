@@ -872,15 +872,20 @@ int processClientsFromMainThread(IOThread *t) {
  * its way between the threads): the IO thread appends it to the client output
  * buffers without being paused, see processPushesFromMainThread(). 'flags' are
  * client flags to set when the client is back in the main thread. Called by
- * the main thread, or by a module thread holding the GIL. */
+ * the main thread, or by a module thread holding the GIL.
+ *
+ * The memory of the queued pushes is not counted for the eviction until the
+ * IO thread wrote them, see freeMemoryGetPendingPushesMemory(). */
 void queueClientPushes(client *c, const char *proto, size_t len, uint64_t flags) {
     serverAssert(c->tid != IOTHREAD_MAIN_THREAD_ID &&
                  c->running_tid != IOTHREAD_MAIN_THREAD_ID);
     IOThread *t = &IOThreads[c->tid];
     pthread_mutex_lock(&t->pushes_mutex);
     if (len) {
+        size_t alloc = c->io_pushes ? sdsAllocSize(c->io_pushes) : 0;
         if (c->io_pushes) c->io_pushes = sdscatlen(c->io_pushes, proto, len);
         else c->io_pushes = sdsnewlen(proto, len);
+        atomicIncr(server.io_pushes_mem, sdsAllocSize(c->io_pushes) - alloc);
     }
     c->io_pushes_flags |= flags;
     if (!c->io_pushes_node) {
@@ -915,10 +920,20 @@ void fetchClientPushesFromIOThread(client *c) {
     c->flags |= flags;
     if (pushes) {
         uint64_t old_flags = c->flags;
+        size_t reply_bytes = c->reply_bytes;
         c->flags |= CLIENT_PUSHING;
         addReplyProto(c, pushes, sdslen(pushes));
         if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
+        /* The pushes moved to the output buffers, that an IO thread writes
+         * later if the client goes back to it: keep them out of the memory
+         * counted for the eviction until the next write of this client,
+         * see writeToClient(). */
+        size_t appended = c->reply_bytes > reply_bytes ? c->reply_bytes - reply_bytes : 0;
+        size_t alloc = sdsAllocSize(pushes);
+        c->io_pushes_unwritten += appended;
+        atomicIncr(server.io_pushes_mem, appended);
         sdsfree(pushes);
+        atomicDecr(server.io_pushes_mem, alloc);
     }
 }
 
@@ -960,11 +975,25 @@ static void processPushesFromMainThread(IOThread *t) {
         listDelNode(t->push_clients, ln);
         c->io_pushes_node = NULL;
         if (pushes) {
+            /* While we copy the pushes to the output buffers they are in
+             * memory twice, and the main thread may be checking the memory
+             * limit: keep out of the count an upper bound of what the copy
+             * allocates first, and what it really allocated afterwards.
+             * That follows the pushes until the next write of this client,
+             * see writeToClient(). */
+            size_t alloc = sdsAllocSize(pushes);
+            size_t bound = 2 * (sdslen(pushes) + PROTO_REPLY_CHUNK_BYTES);
+            size_t reply_bytes = c->reply_bytes;
+            atomicIncr(server.io_pushes_mem, bound);
             /* If the output buffer limits are reached, the client is on its
              * way to the main thread: no more writes for it here. */
             if (!appendClientPushesInIOThread(c, pushes, sdslen(pushes)))
                 listAddNodeTail(t->pushed_clients, c);
+            size_t appended = c->reply_bytes > reply_bytes ? c->reply_bytes - reply_bytes : 0;
+            c->io_pushes_unwritten += appended;
             sdsfree(pushes);
+            atomicIncr(server.io_pushes_mem, appended);
+            atomicDecr(server.io_pushes_mem, bound + alloc);
         }
     }
     if (in_transit) atomicSetWithSync(t->has_pushes, 1);

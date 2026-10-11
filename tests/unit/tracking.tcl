@@ -1185,3 +1185,61 @@ start_server {tags {"tracking network external:skip"} overrides {io-threads 4}} 
         $rd close
     }
 }
+
+start_server {tags {"tracking network external:skip"} overrides {io-threads 4}} {
+    test {Evicting keys tracked by clients in IO threads doesn't evict more keys for the invalidations} {
+        r config set latency-tracking no
+        r config set maxmemory-policy allkeys-lru
+        r config set maxmemory-eviction-tenacity 100
+
+        # 10 clients in IO threads, tracking 300 keys with a long name.
+        set clients {}
+        for {set j 0} {$j < 10} {incr j} {
+            set rd [redis_deferring_client]
+            $rd HELLO 3
+            $rd read
+            $rd CLIENT TRACKING on
+            $rd read
+            lappend clients $rd
+        }
+        for {set j 0} {$j < 300} {incr j} {
+            set key $j[string repeat x 1000]
+            r set $key x
+            foreach rd $clients {
+                $rd get $key
+                $rd read
+            }
+        }
+        assert_equal 0 [get_io_thread_clients 0]
+
+        # Wait for the cron to trim the query buffers, see the test about
+        # the eviction feedback loop in maxmemory.tcl.
+        after 1100
+
+        # Evicting about 40 keys queues about 40kb of invalidations for each
+        # client: while the IO threads write them, they must not be counted
+        # as memory to free, or all the keys get evicted.
+        set used [s used_memory]
+        r config set maxmemory [expr {$used - 40000}]
+        after 200
+
+        # One command to read both numbers: each command may evict a few
+        # more keys to make room for its own buffers.
+        set info [r info]
+        set evicted [getInfoProperty $info evicted_keys]
+        regexp {db\d+:keys=(\d+)} $info -> keys
+        assert_range $evicted 10 50
+        assert_equal 300 [expr {$keys + $evicted}]
+        foreach rd $clients {
+            assert_match {invalidate *} [$rd read]
+            $rd close
+        }
+
+        # Once written, nothing stays out of the count.
+        wait_for_condition 50 100 {
+            [s mem_not_counted_for_evict] == 0
+        } else {
+            fail "Memory of the invalidations still not counted for the eviction"
+        }
+    }
+}

@@ -1734,6 +1734,9 @@ typedef struct client {
     uint64_t io_pushes_flags; /* Client flags to set back in the main thread. */
     listNode *io_pushes_node; /* list node in io thread push_clients list */
     int io_pushes_queued;
+    size_t io_pushes_unwritten; /* Memory of the queued pushes moved to the output
+                                 * buffers, not counted for the eviction until the
+                                 * next write. Owned by the thread running the client. */
 } client;
 
 typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
@@ -2198,6 +2201,7 @@ struct redisServer {
     int io_threads_clients_num[IO_THREADS_MAX_NUM]; /* Number of clients assigned to each IO thread. */
     int io_threads_do_reads;    /* Read and parse from IO threads? */
     int io_threads_active;      /* Is IO threads currently active? */
+    redisAtomic size_t io_pushes_mem; /* Memory of the pushes queued for IO threads, not yet written. */
     pendingCommandPool cmd_pool; /* Shared pool for reusing pendingCommand,
                                   * only when IO threads disabled */
     int prefetch_batch_max_size;/* Maximum number of keys to prefetch in a single batch */
@@ -3892,6 +3896,7 @@ robj *gcraDup(robj *o);
 int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level);
 void updatePeakMemory(void);
 size_t freeMemoryGetNotCountedMemory(void);
+size_t freeMemoryGetPendingPushesMemory(void);
 int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 void preprocessCommand(client *c, pendingCommand *pcmd);

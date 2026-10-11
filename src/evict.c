@@ -368,6 +368,20 @@ size_t freeMemoryGetNotCountedMemory(void) {
     return overhead;
 }
 
+/* The push messages queued for the clients of the IO threads are freed as
+ * soon as the IO threads write them, see queueClientPushes(). When they are
+ * the invalidations of the keys we evict, counting them as used memory means
+ * evicting more keys to make room for them, and so on.
+ *
+ * This is not part of freeMemoryGetNotCountedMemory() since it changes while
+ * the IO threads work: we subtract it only to tell if we are over the limit,
+ * not to measure what deleting a key frees. */
+size_t freeMemoryGetPendingPushesMemory(void) {
+    size_t pushes_mem;
+    atomicGet(server.io_pushes_mem, pushes_mem);
+    return pushes_mem;
+}
+
 /* Get the memory status from the point of view of the maxmemory directive:
  * if the memory used is under the maxmemory setting then C_OK is returned.
  * Otherwise, if we are over the memory limit, the function returns
@@ -410,7 +424,7 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     /* Remove the size of slaves output buffers and AOF buffer from the
      * count of used memory. */
     mem_used = mem_reported;
-    size_t overhead = freeMemoryGetNotCountedMemory();
+    size_t overhead = freeMemoryGetNotCountedMemory() + freeMemoryGetPendingPushesMemory();
     mem_used = (mem_used > overhead) ? mem_used-overhead : 0;
 
     /* Compute the ratio of memory usage. */
@@ -440,7 +454,7 @@ int overMaxmemoryAfterAlloc(size_t moremem) {
     size_t mem_used = zmalloc_used_memory();
     if (mem_used + moremem <= server.maxmemory) return 0;
 
-    size_t overhead = freeMemoryGetNotCountedMemory();
+    size_t overhead = freeMemoryGetNotCountedMemory() + freeMemoryGetPendingPushesMemory();
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
     return mem_used + moremem > server.maxmemory;
 }

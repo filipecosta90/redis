@@ -2731,7 +2731,7 @@ static int updateReplBacklogSize(const char **err) {
 static int updateMaxmemory(const char **err) {
     UNUSED(err);
     if (server.maxmemory) {
-        size_t used = zmalloc_used_memory()-freeMemoryGetNotCountedMemory();
+        size_t used = zmalloc_used_memory()-freeMemoryGetNotCountedMemory()-freeMemoryGetPendingPushesMemory();
         if (server.maxmemory < used) {
             serverLog(LL_WARNING,"WARNING: the new maxmemory value set via CONFIG SET (%llu) is smaller than the current memory usage (%zu). This will result in key eviction and/or the inability to accept new write commands depending on the maxmemory-policy.", server.maxmemory, used);
         }

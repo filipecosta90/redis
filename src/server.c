@@ -3070,6 +3070,7 @@ void initServer(void) {
     server.unblocked_clients = listCreate();
     server.ready_keys = listCreate();
     server.tracking_pending_keys = listCreate();
+    atomicSet(server.io_pushes_mem, 0);
     server.pending_push_messages = listCreate();
     server.clients_waiting_acks = listCreate();
     server.get_ack_from_slaves = 0;
@@ -6777,7 +6778,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
              * compatibility. */
             "mem_fragmentation_ratio:%.2f\r\n", mh->total_frag,
             "mem_fragmentation_bytes:%zd\r\n", mh->total_frag_bytes,
-            "mem_not_counted_for_evict:%zu\r\n", freeMemoryGetNotCountedMemory(),
+            "mem_not_counted_for_evict:%zu\r\n", freeMemoryGetNotCountedMemory() + freeMemoryGetPendingPushesMemory(),
             "mem_replication_backlog:%zu\r\n", mh->repl_backlog,
             "mem_total_replication_buffers:%zu\r\n", server.repl_buffer_mem + server.repl_full_sync_buffer.mem_used,
             "mem_replica_full_sync_buffer:%zu\r\n", server.repl_full_sync_buffer.mem_used,
