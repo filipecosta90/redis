@@ -1430,17 +1430,35 @@ dictEntry *dictGetFairRandomKey(dict *d) {
     return entries[idx];
 }
 
-/* Function to reverse bits. Algorithm from:
- * http://graphics.stanford.edu/~seander/bithacks.html#ReverseParallel */
-static unsigned long rev(unsigned long v) {
-    unsigned long s = CHAR_BIT * sizeof(v); // bit size; must be power of 2
-    unsigned long mask = ~0UL;
-    while ((s >>= 1) > 0) {
-        mask ^= (mask << s);
-        v = ((v >> s) & mask) | ((v << s) & ~mask);
-    }
-    return v;
+/* Function to reverse bits, using the AArch64 rbit instruction where it is
+ * available and an unrolled bit-parallel reversal elsewhere. */
+#ifdef __aarch64__
+static inline unsigned long rev(unsigned long x) {
+    __asm__ __volatile__(
+        "rbit %0, %0"
+        : "+r"(x)
+    );
+    return x;
 }
+#else
+static inline unsigned long rev(unsigned long x) {
+#if ULONG_MAX == 4294967295UL
+    x = ((x & 0x55555555) << 1) | ((x >> 1) & 0x55555555);
+    x = ((x & 0x33333333) << 2) | ((x >> 2) & 0x33333333);
+    x = ((x & 0x0F0F0F0F) << 4) | ((x >> 4) & 0x0F0F0F0F);
+    x = ((x & 0x00FF00FF) << 8) | ((x >> 8) & 0x00FF00FF);
+    x = (x << 16) | (x >> 16);
+#else
+    x = ((x & 0x5555555555555555ULL) << 1)  | ((x >> 1)  & 0x5555555555555555ULL);
+    x = ((x & 0x3333333333333333ULL) << 2)  | ((x >> 2)  & 0x3333333333333333ULL);
+    x = ((x & 0x0F0F0F0F0F0F0F0FULL) << 4)  | ((x >> 4)  & 0x0F0F0F0F0F0F0F0FULL);
+    x = ((x & 0x00FF00FF00FF00FFULL) << 8)  | ((x >> 8)  & 0x00FF00FF00FF00FFULL);
+    x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
+    x = (x << 32) | (x >> 32);
+#endif
+    return x;
+}
+#endif
 
 /* dictScan() is used to iterate over the elements of a dictionary.
  *
