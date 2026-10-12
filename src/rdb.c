@@ -2888,6 +2888,35 @@ static void rdbDiscardTemplateFields(rdbTmplFields *out) {
     out->fields_lp = NULL;
 }
 
+/* Return 1 if any field or value of the listpack-encoded hash 'lp' is longer
+ * than hash-max-listpack-value, so the caller can convert it to a hash table.
+ *
+ * 'tuple_len' is 2 for a plain hash and 3 when each tuple carries a TTL; the
+ * TTL is an integer and is never examined. Integers are skipped for the same
+ * reason hashTypeTryConversion() skips them: a listpack integer is always
+ * short. */
+static int hashListpackExceedsValueLimit(unsigned char *lp, int tuple_len) {
+    /* No element can be longer than the listpack that holds it, so a small
+     * listpack needs no walk at all. */
+    if (lpBytes(lp) <= server.hash_max_listpack_value) return 0;
+
+    /* lpNext() recomputes lpBytes() for every element; hoist it. */
+    size_t lpbytes = lpBytes(lp);
+    unsigned char *p = lpFirst(lp);
+    int pos = 0;
+    while (p) {
+        if (pos < 2) { /* field and value; anything beyond is the TTL */
+            unsigned int slen;
+            long long lval;
+            if (lpGetValue(p, &slen, &lval) != NULL &&
+                slen > server.hash_max_listpack_value) return 1;
+        }
+        p = lpNextWithBytes(lp, p, lpbytes);
+        if (++pos == tuple_len) pos = 0;
+    }
+    return 0;
+}
+
 /* Load a Redis object of the specified type from the specified file.
  * On success a newly allocated object is returned, otherwise NULL.
  *
@@ -3815,7 +3844,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         goto emptykey;
                     }
 
-                    if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+                    if (hashTypeLength(o, 0) > server.hash_max_listpack_entries ||
+                        hashListpackExceedsValueLimit(o->ptr, 2))
                         hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
                     else
                         o->ptr = lpShrinkToFit(o->ptr);
@@ -3856,7 +3886,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
                 /* Convert listpack to hash table without registering in global HFE DS,
                  * if has HFEs, since the listpack is not connected yet to the DB */
-                if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
+                if (hashTypeLength(o, 0) > server.hash_max_listpack_entries ||
+                    hashListpackExceedsValueLimit(encoded, tuple_len))
                     hashTypeConvert(NULL /*db*/, o, OBJ_ENCODING_HT);
 
                 /* Try to convert to template-based hash if threshold met. Bulk
