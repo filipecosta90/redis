@@ -2891,27 +2891,50 @@ static void rdbDiscardTemplateFields(rdbTmplFields *out) {
 /* Return 1 if any field or value of the listpack-encoded hash 'lp' is longer
  * than hash-max-listpack-value, so the caller can convert it to a hash table.
  *
- * 'tuple_len' is 2 for a plain hash and 3 when each tuple carries a TTL; the
- * TTL is an integer and is never examined. Integers are skipped for the same
- * reason hashTypeTryConversion() skips them: a listpack integer is always
- * short. */
+ * 'tuple_len' is 2 for a plain hash and 3 when each tuple carries a TTL, which
+ * is always integer encoded and never over the limit.
+ *
+ * Integer encoded elements are measured by their decimal length, which is what
+ * every other hash load path does (see RDB_TYPE_HASH below, and
+ * rdbLoadTemplateFields) and what hashTypeTryConversion() does on the write
+ * path: HSET arguments are sds encoded, so a numeric value is measured as
+ * text there too. A 64 bit integer is at most 20 characters, so this can only
+ * change the answer for a limit below that, and the conversion is skipped
+ * entirely otherwise.
+ *
+ * Entries are stepped with the validating iterator and a malformed one returns
+ * 0 rather than asserting. This is the first code to look at the entries: an
+ * RDB load and a replica's full sync both reach rdbLoadObject() with
+ * deep_integrity_validation off, so only the listpack header has been checked.
+ * Refusing to start the server over an encoding decision would be worse than
+ * loading the key and letting the paths that already report corruption do so. */
 static int hashListpackExceedsValueLimit(unsigned char *lp, int tuple_len) {
+    size_t lpbytes = lpBytes(lp);
+
     /* No element can be longer than the listpack that holds it, so a small
      * listpack needs no walk at all. */
-    if (lpBytes(lp) <= server.hash_max_listpack_value) return 0;
+    if (lpbytes <= server.hash_max_listpack_value) return 0;
 
-    /* lpNext() recomputes lpBytes() for every element; hoist it. */
-    size_t lpbytes = lpBytes(lp);
-    unsigned char *p = lpFirst(lp);
+    unsigned char *p = lpValidateFirst(lp);
     int pos = 0;
     while (p) {
+        unsigned char *entry = p;
+        if (!lpValidateNext(lp, &p, lpbytes)) return 0;
+        /* lpValidateNext() validates the entry it is leaving and signals the
+         * end of the listpack by clearing 'p'. When it does, 'entry' is the
+         * EOF marker and not an element, so there is nothing to measure. */
+        if (!p) break;
         if (pos < 2) { /* field and value; anything beyond is the TTL */
             unsigned int slen;
             long long lval;
-            if (lpGetValue(p, &slen, &lval) != NULL &&
-                slen > server.hash_max_listpack_value) return 1;
+            if (lpGetValue(entry, &slen, &lval) != NULL) {
+                if (slen > server.hash_max_listpack_value) return 1;
+            } else if (server.hash_max_listpack_value < LP_INTBUF_SIZE - 1) {
+                char buf[LONG_STR_SIZE];
+                if ((size_t)ll2string(buf, sizeof(buf), lval) >
+                    server.hash_max_listpack_value) return 1;
+            }
         }
-        p = lpNextWithBytes(lp, p, lpbytes);
         if (++pos == tuple_len) pos = 0;
     }
     return 0;
@@ -3651,9 +3674,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         /* Fix the object encoding, and make sure to convert the encoded
          * data type into the base type if accordingly to the current
          * configuration there are too many elements in the encoded data
-         * type. Note that we only check the length and not max element
-         * size as this is an O(N) scan. Eventually everything will get
-         * converted. */
+         * type. Only the element count is checked here, since the max element
+         * size would cost an O(N) scan -- except for the hash cases, which do
+         * scan: a hash left over the value limit never converts later, because
+         * hashTypeTryConversion() only measures the arguments of the write in
+         * front of it. */
         switch(rdbtype) {
             case RDB_TYPE_HASH_ZIPMAP:
                 /* Since we don't keep zipmaps anymore, the rdb loading for these

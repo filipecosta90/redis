@@ -1065,6 +1065,79 @@ start_server {tags {"hash"}} {
         r debug set-active-expire 1
     } {OK} {needs:debug}
 
+    foreach {desc field value} {
+        string       f           01234567890123456789
+        integer      f           1234567890123
+        numeric-field 1234567890123 v
+    } {
+        test "RDB load listpack hash: $desc element over hash-max-listpack-value converts" {
+            r del myhash
+            r config set hash-max-listpack-entries 512
+            r config set hash-max-listpack-value 64
+            r hset myhash $field $value
+            assert_encoding listpack myhash
+            r config set hash-max-listpack-value 4
+            r debug reload
+            assert_encoding hashtable myhash
+            assert_equal $value [r hget myhash $field]
+        } {} {needs:debug}
+    }
+
+    test {RDB load listpack hash: element within hash-max-listpack-value stays listpack} {
+        r del myhash
+        r config set hash-max-listpack-entries 512
+        r config set hash-max-listpack-value 64
+        r hset myhash f v
+        r config set hash-max-listpack-value 4
+        r debug reload
+        assert_encoding listpack myhash
+        assert_equal v [r hget myhash f]
+    } {} {needs:debug}
+
+    test {RDB load listpackex hash: element over hash-max-listpack-value converts, TTL survives} {
+        r del myhash
+        r config set hash-max-listpack-entries 512
+        r config set hash-max-listpack-value 64
+        r hset myhash f 01234567890123456789
+        r hexpire myhash 1000 FIELDS 1 f
+        assert_encoding listpackex myhash
+        r config set hash-max-listpack-value 4
+        r debug reload
+        assert_encoding hashtable myhash
+        assert_equal 01234567890123456789 [r hget myhash f]
+        assert_range [lindex [r httl myhash FIELDS 1 f] 0] 1 1000
+    } {} {needs:debug}
+
+    test {RDB load listpackex hash: short element keeps listpackex and its TTL} {
+        r del myhash
+        r config set hash-max-listpack-entries 512
+        r config set hash-max-listpack-value 64
+        r hset myhash f v
+        r hexpire myhash 1000 FIELDS 1 f
+        r config set hash-max-listpack-value 4
+        r debug reload
+        assert_encoding listpackex myhash
+        assert_range [lindex [r httl myhash FIELDS 1 f] 0] 1 1000
+    } {} {needs:debug}
+
+    # -9223372036854775808 is the longest value a listpack integer can hold, at
+    # exactly 20 characters, which is the bound the load path's integer check
+    # uses. Either side of it the reload must agree with a fresh write.
+    test {RDB load listpack hash: longest integer converts at a limit of 19 but not 20} {
+        foreach {limit expected} {19 hashtable 20 listpack} {
+            r del myhash
+            r config set hash-max-listpack-entries 512
+            r config set hash-max-listpack-value 64
+            r hset myhash f -9223372036854775808
+            r config set hash-max-listpack-value $limit
+            r debug reload
+            assert_encoding $expected myhash
+            assert_equal -9223372036854775808 [r hget myhash f]
+        }
+    } {} {needs:debug}
+
+    r config set hash-max-listpack-value 64
+
     # On some platforms strtold("+inf") with valgrind returns a non-inf result
     if {!$::valgrind} {
         test {HINCRBYFLOAT does not allow NaN or Infinity} {
