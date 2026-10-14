@@ -278,6 +278,13 @@ endif
 # Include paths to dependencies
 FINAL_CFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram -I../deps/fpconv -I../deps/xxhash
 
+# MEASUREMENT-ONLY CONTROL -- NEVER MERGE.
+# Forces every function onto a 64-byte boundary so that a code-layout shift
+# cannot be mistaken for the effect of the patch under test. Present on all
+# three arms of this control (base / rbit / carry) so the comparison is
+# layout-invariant by construction rather than by argument.
+FINAL_CFLAGS+= -falign-functions=64
+
 # Determine systemd support and/or build preference (defaulting to auto-detection)
 BUILD_WITH_SYSTEMD=no
 LIBSYSTEMD_LIBS=-lsystemd
