@@ -1181,6 +1181,41 @@ dictIterator *dictGetSafeIterator(dict *d) {
     return i;
 }
 
+/* How many buckets ahead of the cursor an iterator warms the keys it is about
+ * to hand out. Unlike a scan, an iterator walks the table linearly, so the
+ * bucket array itself is already covered by the hardware stride prefetcher --
+ * what is not covered is the key each bucket points at, which lives in its own
+ * allocation somewhere else entirely. */
+#define DICT_ITER_PREFETCH_DEPTH 4
+
+/* Warm the key a few buckets ahead of the one the iterator is returning.
+ *
+ * Every caller that iterates a dict of strings dereferences the key on the
+ * instruction after it receives it -- sdslen() reads the header byte at
+ * key[-1] -- and nothing brings that line in beforehand, so the dereference
+ * stalls once per element. The address is knowable several elements early,
+ * because the walk is a linear index scan over a table that cannot be resized
+ * underneath a live iterator.
+ *
+ * For a no_value dict the bucket holds the key pointer itself (tagged), so
+ * decodeMaskedPtr() lands directly on the key. For a normal entry it lands on
+ * the dictEntry, which is the line the following de->key load needs. Either
+ * way the prefetch is a hint with no control flow and no state, so iteration
+ * order, rehashing and the delete-safety contract are all untouched.
+ *
+ * always_inline is deliberate: a helper whose only effect is
+ * __builtin_prefetch() is inferred side-effect free by GCC's ipa-pure-const
+ * pass and DCE then deletes every call to it, with no warning and no change in
+ * behaviour, so the only symptom would be that this does nothing at all. */
+static inline __attribute__((always_inline))
+void dictIterPrefetchAhead(dictIterator *iter) {
+    long ahead = iter->index + DICT_ITER_PREFETCH_DEPTH;
+    if (ahead < (long) DICTHT_SIZE(iter->d->ht_size_exp[iter->table])) {
+        dictEntry *de = iter->d->ht_table[iter->table][ahead];
+        if (de) redis_prefetch_read(decodeMaskedPtr(de));
+    }
+}
+
 dictEntry *dictNext(dictIterator *iter)
 {
     while (1) {
@@ -1213,6 +1248,7 @@ dictEntry *dictNext(dictIterator *iter)
             /* We need to save the 'next' here, the iterator user
              * may delete the entry we are returning. */
             iter->nextEntry = dictGetNext(iter->entry);
+            dictIterPrefetchAhead(iter);
             return iter->entry;
         }
     }
