@@ -1467,7 +1467,7 @@ static inline unsigned long dictNextScanCursor(unsigned long v, unsigned long m)
  * resident, there is no miss to hide, and the lookahead is pure overhead --
  * measured at +7% on an 8KB table and +6% on a 1MB one, against -17% to -22%
  * once the array is 4MB or more. */
-#define DICT_SCAN_PREFETCH_DEPTH 3
+#define DICT_SCAN_PREFETCH_DEPTH 4
 #define DICT_SCAN_PREFETCH_MIN_BYTES (2 * 1024 * 1024)
 
 /* Return the cursor of the next bucket this scan will visit, and warm the cache
