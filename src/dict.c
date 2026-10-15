@@ -1490,14 +1490,24 @@ static inline unsigned long dictNextScanCursor(unsigned long v, unsigned long m)
  * side-effect free by GCC's ipa-pure-const pass, and DCE then deletes the calls
  * to it -- with no warning and no change in behaviour, so the only symptom is
  * that the prefetch silently does nothing. Giving the call a result the caller
- * needs anyway keeps it alive without depending on a compiler attribute. */
-static unsigned long dictScanPrefetchNext(dict *d, int htidx, unsigned long v, unsigned long m) {
+ * needs anyway keeps it alive without depending on a compiler attribute.
+ *
+ * always_inline is likewise deliberate. Left to itself GCC emits this out of
+ * line and the warm-up then costs a call, a reload of the table pointer and a
+ * reload of ht_size_exp[] on every bucket -- overhead charged to the very loop
+ * the prefetch exists to speed up. Inlined, the gate folds against the mask the
+ * caller already computed. */
+static inline __attribute__((always_inline))
+unsigned long dictScanPrefetchNext(dictEntry **table, unsigned long v, unsigned long m) {
     unsigned long next = dictNextScanCursor(v, m);
 
-    if (DICTHT_SIZE(d->ht_size_exp[htidx]) * sizeof(dictEntry *) >=
-        DICT_SCAN_PREFETCH_MIN_BYTES)
-    {
-        dictEntry **table = d->ht_table[htidx];
+    /* 'm' is the table's size minus one, so the array spans (m + 1) pointers.
+     * Deriving the gate from the mask rather than re-reading ht_size_exp[] keeps
+     * it on a value the caller already holds in a register: once inlined, the
+     * test costs a compare and no memory reference at all. A mask of 0 (an
+     * exponent of -1, i.e. no table) is 8 bytes by this arithmetic and so is
+     * gated off, which is what we want. */
+    if ((m + 1) * sizeof(dictEntry *) >= DICT_SCAN_PREFETCH_MIN_BYTES) {
         unsigned long ahead = next;
 
         dictEntry *de = table[ahead & m];
@@ -1655,7 +1665,7 @@ unsigned long dictScanDefrag(dict *d,
         htidx0 = 0;
         m0 = DICTHT_SIZE_MASK(d->ht_size_exp[htidx0]);
         /* Increment the reverse cursor, warming the buckets it will reach */
-        unsigned long next = dictScanPrefetchNext(d, htidx0, v, m0);
+        unsigned long next = dictScanPrefetchNext(d->ht_table[htidx0], v, m0);
         dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx0][v & m0]);
         v = next;
 
@@ -1679,7 +1689,7 @@ unsigned long dictScanDefrag(dict *d,
         do {
             /* Increment the reverse cursor not covered by the smaller mask,
              * warming the buckets it will reach. */
-            unsigned long next = dictScanPrefetchNext(d, htidx1, v, m1);
+            unsigned long next = dictScanPrefetchNext(d->ht_table[htidx1], v, m1);
             dictScanDefragBucket(d, fn, defragfns, privdata, &d->ht_table[htidx1][v & m1]);
             v = next;
 
