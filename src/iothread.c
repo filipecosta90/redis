@@ -1014,7 +1014,15 @@ static int processPushesFromMainThread(IOThread *t) {
     listRewind(t->pushed_clients, &li);
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
-        if (connHasWriteHandler(c->conn)) continue;
+        if (connHasWriteHandler(c->conn)) {
+            /* The socket did not take the last write: the client is not
+             * reading, and what we appended counts as memory from now on. */
+            if (c->io_pushes_unwritten) {
+                atomicDecr(server.io_pushes_mem, c->io_pushes_unwritten);
+                c->io_pushes_unwritten = 0;
+            }
+            continue;
+        }
         writeToClient(c, 0);
         if (!(c->io_flags & CLIENT_IO_CLOSE_ASAP) && clientHasPendingReplies(c))
             connSetWriteHandler(c->conn, sendReplyToClient);

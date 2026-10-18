@@ -1306,3 +1306,30 @@ start_server {tags {"tracking network external:skip"} overrides {io-threads 2}} 
         foreach rd $clients {$rd close}
     }
 }
+
+start_server {tags {"tracking network external:skip"} overrides {io-threads 2}} {
+    test {A BCAST client in an IO thread that stops reading counts for the eviction} {
+        r config set maxmemory-policy allkeys-lru
+        set rd [redis_deferring_client]
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on BCAST PREFIX k:
+        $rd read
+        assert_equal 0 [get_io_thread_clients 0]
+        # From now on rd never reads: once its socket is full, what the IO
+        # thread appends for it is memory like any output buffer.
+        set maxmemory [expr {[s used_memory] + 5000000}]
+        r config set maxmemory $maxmemory
+        set pad [string repeat x 200]
+        set w [redis_deferring_client]
+        for {set i 0} {$i < 100000} {incr i 1000} {
+            for {set k $i} {$k < $i + 1000} {incr k} {$w SET k:$pad:$k v}
+            for {set k $i} {$k < $i + 1000} {incr k} {catch {$w read}}
+        }
+        set used [s used_memory]
+        assert_lessthan $used [expr {$maxmemory + 1000000}]
+        $w close
+        $rd close
+        r config set maxmemory 0
+    }
+}
