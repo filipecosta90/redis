@@ -27,6 +27,13 @@ static pthread_mutex_t mainThreadPendingClientsMutexes[IO_THREADS_MAX_NUM]; /* M
 static eventNotifier* mainThreadPendingClientsNotifiers[IO_THREADS_MAX_NUM]; /* Notifier for pending clients */
 static int mainThreadNewPushes[IO_THREADS_MAX_NUM]; /* Pushes queued since last notification */
 
+/* Max clients whose pushes an IO thread appends and writes in one round. The
+ * commands and replies of the other clients of the thread wait for the round,
+ * so between two rounds the IO thread goes back to its event loop. The clients
+ * left keep collecting pushes, that go out in fewer and bigger writes when the
+ * thread is busy. */
+#define IO_THREAD_PUSH_ROUND_CLIENTS 4
+
 /* Send the clients to the main thread for processing when the number of clients
  * in pending list reaches IO_THREAD_MAX_PENDING_CLIENTS, or check_size is 0. */
 static inline void sendPendingClientsToMainThreadIfNeeded(IOThread *t, int check_size) {
@@ -953,12 +960,12 @@ void notifyIOThreadsOfPushes(void) {
  * of this IO thread, and write them. A client on its way between the threads
  * keeps its pushes: the main thread fetches them if it gets the client, else
  * we append them once the client is back in our event loop. */
-static void processPushesFromMainThread(IOThread *t) {
+static int processPushesFromMainThread(IOThread *t) {
     int has_pushes = 0;
     atomicGetWithSync(t->has_pushes, has_pushes);
-    if (!has_pushes) return;
+    if (!has_pushes) return 0;
 
-    int in_transit = 0;
+    int in_transit = 0, more = 0, taken = 0;
     listIter li;
     listNode *ln;
     pthread_mutex_lock(&t->pushes_mutex);
@@ -970,6 +977,11 @@ static void processPushesFromMainThread(IOThread *t) {
             in_transit = 1;
             continue;
         }
+        if (taken == IO_THREAD_PUSH_ROUND_CLIENTS) {
+            more = 1;
+            break;
+        }
+        taken++;
         sds pushes = c->io_pushes;
         c->io_pushes = NULL;
         listDelNode(t->push_clients, ln);
@@ -996,7 +1008,7 @@ static void processPushesFromMainThread(IOThread *t) {
             atomicDecr(server.io_pushes_mem, bound + alloc);
         }
     }
-    if (in_transit) atomicSetWithSync(t->has_pushes, 1);
+    if (in_transit || more) atomicSetWithSync(t->has_pushes, 1);
     pthread_mutex_unlock(&t->pushes_mutex);
 
     listRewind(t->pushed_clients, &li);
@@ -1008,6 +1020,7 @@ static void processPushesFromMainThread(IOThread *t) {
             connSetWriteHandler(c->conn, sendReplyToClient);
     }
     listEmpty(t->pushed_clients);
+    return more;
 }
 
 void IOThreadBeforeSleep(struct aeEventLoop *el) {
@@ -1022,10 +1035,15 @@ void IOThreadBeforeSleep(struct aeEventLoop *el) {
      * pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData(el) || clientCompressionHasPendingData(el);
 
+    /* Hand the commands read in this round to the main thread first, so that it
+     * runs them while we write replies and pushes. */
+    sendPendingClientsToMainThreadIfNeeded(t, 0);
+
     /* Process clients from main thread, since the main thread may deliver clients
      * without notification during IO thread processing events. */
     int processed = processClientsFromMainThread(t);
-    processPushesFromMainThread(t);
+    /* A round of pushes; if clients are left, don't sleep. */
+    if (processPushesFromMainThread(t)) dont_sleep = 1;
     if (processed > 0) {
         /* If there are clients that are processed, we should not sleep since main
          * thread may want to continue deliverring clients without notification, so
@@ -1038,7 +1056,7 @@ void IOThreadBeforeSleep(struct aeEventLoop *el) {
         /* Try to process clients from main thread again, since before we set
          * running to 0, the main thread may deliver clients to this io thread. */
         processClientsFromMainThread(t);
-        processPushesFromMainThread(t);
+        if (processPushesFromMainThread(t)) dont_sleep = 1;
     }
     aeSetDontWait(t->el, dont_sleep);
 

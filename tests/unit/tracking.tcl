@@ -1243,3 +1243,66 @@ start_server {tags {"tracking network external:skip"} overrides {io-threads 4}} 
         }
     }
 }
+
+start_server {tags {"tracking network external:skip"} overrides {io-threads 2}} {
+    # More BCAST clients in one IO thread than one round of pushes takes, see
+    # IO_THREAD_PUSH_ROUND_CLIENTS.
+    proc read_with_timeout {rd ms} {
+        set fd [$rd channel]
+        set ::tracking_ready 0
+        fileevent $fd readable {set ::tracking_ready 1}
+        set id [after $ms {set ::tracking_ready -1}]
+        vwait ::tracking_ready
+        after cancel $id
+        fileevent $fd readable {}
+        if {$::tracking_ready == -1} {return TIMEOUT}
+        return [$rd read]
+    }
+
+    set clients {}
+    for {set j 0} {$j < 60} {incr j} {
+        set rd [redis_deferring_client]
+        $rd HELLO 3
+        $rd read
+        $rd CLIENT TRACKING on BCAST PREFIX c:
+        $rd read
+        lappend clients $rd
+    }
+
+    test {BCAST clients of one IO thread get a lone invalidation without waiting for other events} {
+        assert_equal 0 [get_io_thread_clients 0]
+        # One key and then nothing: the rounds after the first must not wait
+        # for another event to wake the IO thread up.
+        set start [clock milliseconds]
+        r SET c:lone x
+        set late 0
+        foreach rd $clients {
+            if {[read_with_timeout $rd 2000] ne {invalidate c:lone}} {incr late}
+        }
+        set elapsed [expr {[clock milliseconds] - $start}]
+        assert_equal 0 $late
+        if {!$::valgrind} {assert_lessthan $elapsed 200}
+    }
+
+    test {BCAST clients of one IO thread get every key under load} {
+        set n 3000
+        for {set i 0} {$i < $n} {incr i 100} {
+            set args {}
+            for {set k $i} {$k < $i + 100} {incr k} {lappend args c:$k x}
+            r MSET {*}$args
+            r SET other:$i x
+        }
+        set short 0
+        foreach rd $clients {
+            set got 0
+            while {$got < $n} {
+                set m [read_with_timeout $rd 3000]
+                if {$m eq {TIMEOUT}} break
+                incr got [llength [lindex $m 1]]
+            }
+            if {$got != $n} {incr short}
+        }
+        assert_equal 0 $short
+        foreach rd $clients {$rd close}
+    }
+}
