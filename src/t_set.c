@@ -1011,12 +1011,12 @@ void srandmemberWithCountCommand(client *c) {
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. This strategy walks the whole set,
-     * so it costs O(size) plus O(count) for the reply rather than growing with
-     * the rejection rate the way CASE 4 does, and the crossover between the two
-     * now sits well below size/3. MUL is left at 3 here: raising it would
-     * re-route a band this change does not otherwise touch, so it belongs in a
-     * separate change. */
+     * used into CASE 4 is highly inefficient. This strategy walks the whole
+     * set, so it costs O(size) plus O(count) for the reply rather than
+     * growing with the rejection rate the way CASE 4 does, and the crossover
+     * between the two now sits well below size/3. MUL is left at 3 here:
+     * raising it would re-route a band this change does not otherwise touch,
+     * so it belongs in a separate change. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator si;
         unsigned long remaining = size, needed = count;

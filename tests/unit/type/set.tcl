@@ -1259,7 +1259,7 @@ foreach type {single multiple single_multiple} {
         }
     }
 
-    test "SRANDMEMBER with <count> distribution for count > size/3 - hashtable" {
+    test "SRANDMEMBER count > size/3 distribution - hashtable" {
         # The histogram test above uses a 10 element set, which is small enough
         # that the sampler's window covers the whole table, so it cannot tell a
         # uniform sampler from one biased by the table's bucket layout. Use a
@@ -1298,7 +1298,7 @@ foreach type {single multiple single_multiple} {
         assert_lessthan $x2 400
     }
 
-    test "SRANDMEMBER with <count> distribution for count > size/3 - intset" {
+    test "SRANDMEMBER count > size/3 distribution - intset" {
         # The old strategy funnelled every encoding through a temporary dict,
         # so intset-encoded sets were skewed by the bucket layout too even
         # though intsetRandom() itself draws a uniform index. Same shape and
@@ -1329,7 +1329,7 @@ foreach type {single multiple single_multiple} {
         assert_lessthan $x2 400
     }
 
-    test "SRANDMEMBER with <count> for count > size/3 emits in set order - intset" {
+    test "SRANDMEMBER count > size/3 emits in set order - intset" {
         # Pins the one behaviour change: the single-pass path emits in set
         # iteration order, which for an intset is ascending. CASE 2 (count >=
         # size) has always done this; CASE 4 still emits in temp-dict order.
