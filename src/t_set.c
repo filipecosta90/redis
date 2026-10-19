@@ -882,8 +882,6 @@ void srandmemberWithCountCommand(client *c) {
     size_t len = 0;
     int64_t llele = 0;
 
-    dict *d;
-
     if (getRangeLongFromObjectOrReply(c,c->argv[2],-LONG_MAX,LONG_MAX,&l,NULL) != C_OK) return;
     if (l >= 0) {
         count = (unsigned long) l;
@@ -998,29 +996,40 @@ void srandmemberWithCountCommand(client *c) {
     /* CASE 3:
      * The number of elements inside the set is not greater than
      * SRANDMEMBER_SUB_STRATEGY_MUL times the number of requested elements.
-     * In this case we walk the set once and pick each element with the
-     * probability that keeps the final sample uniform, emitting the selected
-     * members straight into the reply (selection sampling, TAOCP vol. 2
-     * algorithm S).
+     * In this case we walk the set once and emit each member straight into the
+     * reply with probability 'needed/remaining', which yields a uniform subset
+     * with no temporary dictionary and no per-member allocation (selection
+     * sampling). 'needed <= remaining' is an invariant, so once the two are
+     * equal every remaining member is taken: the walk emits exactly 'count'
+     * members, which is what makes the reply length safe to emit up front.
+     *
+     * Members come out in set iteration order, which is ascending for intset;
+     * CASE 1 is the only case that must randomize order. CASE 4 below still
+     * samples with setTypeRandomElement(), whose distribution is not uniform,
+     * so the two strategies no longer agree on more than the element count.
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient.
-     *
-     * 'remaining' is the number of members not yet looked at and 'needed' the
-     * number still to emit, so 'needed <= remaining' holds at every step: once
-     * the two are equal every remaining member is selected, which is why the
-     * walk always emits exactly 'count' members. No auxiliary dictionary and
-     * no per-member allocation are required. */
+     * used into CASE 4 is highly inefficient. This strategy costs O(size)
+     * whatever 'count' is, so the crossover is now nearer size/10 than size/3;
+     * MUL stays at 3 as the conservative choice. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator si;
         unsigned long remaining = size, needed = count;
 
         addReplyArrayLen(c,count);
         setTypeInitIterator(&si, set);
+        /* No CLIENT_CLOSE_ASAP check in this loop: once that flag is set
+         * _prepareClientToWrite() discards the replies anyway, and breaking out
+         * early would leave needed > 0 and trip the assertion below. */
         while (needed && setTypeNext(&si, &str, &len, &llele) != -1) {
+            /* Guards the modulo: a setTypeSize()/iterator disagreement would
+             * divide by zero, which traps on x86 but yields 0 silently on
+             * aarch64. */
             serverAssert(remaining > 0);
             if (randomULong() % remaining < needed) {
+                /* addReplyBulkCBuffer() copies, so 'str' only has to stay
+                 * valid until the next setTypeNext(). */
                 if (str == NULL) {
                     addReplyBulkLongLong(c,llele);
                 } else {
@@ -1038,12 +1047,14 @@ void srandmemberWithCountCommand(client *c) {
     /* CASE 4: We have a big set compared to the requested number of elements.
      * In this case we can simply get random elements from the set and add
      * to the temporary set, trying to eventually get enough unique elements
-     * to reach the specified count. */
+     * to reach the specified count, then send the result to the user. */
     {
+        dict *d = dictCreate(&sdsReplyDictType);
+        dictIterator di;
+        dictEntry *de;
         unsigned long added = 0;
         sds sdsele;
 
-        d = dictCreate(&sdsReplyDictType);
         dictExpand(d, count);
         while (added < count) {
             setTypeRandomElement(set, &str, &len, &llele);
@@ -1060,12 +1071,6 @@ void srandmemberWithCountCommand(client *c) {
             else
                 sdsfree(sdsele);
         }
-    }
-
-    /* CASE 4: send the result to the user. */
-    {
-        dictIterator di;
-        dictEntry *de;
 
         addReplyArrayLen(c,count);
         dictInitIterator(&di, d);

@@ -4633,7 +4633,12 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. */
+     * used into CASE 4 is highly inefficient.
+     *
+     * Note: SRANDMEMBER replaced this strategy with single-pass selection
+     * sampling, which is both cheaper and uniform; see CASE 3 in
+     * srandmemberWithCountCommand() in t_set.c. The same change applies here
+     * but has to account for withscores, so it is left for a separate commit. */
     if (count*ZRANDMEMBER_SUB_STRATEGY_MUL > size) {
         /* Hashtable encoding (generic implementation) */
         dict *d = dictCreate(&sdsReplyDictType);

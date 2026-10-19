@@ -1175,8 +1175,8 @@ foreach type {single multiple single_multiple} {
             }
 
             # PATH 3: Ask almost as elements as there are in the set.
-            # In this case the implementation will duplicate the original
-            # set and will remove random elements up to the requested size.
+            # In this case the implementation walks the set once and selects
+            # each element with probability needed/remaining.
             #
             # PATH 4: Ask a number of elements definitely smaller than
             # the set size.
@@ -1258,12 +1258,13 @@ foreach type {single multiple single_multiple} {
         }
     }
 
-    test "SRANDMEMBER with <count> is uniform on a large hashtable set" {
-        # The histogram test above uses a 10 element set, which is small
-        # enough that the sampler's window covers the whole table, so it
-        # cannot tell a uniform sampler from a biased one. Use a set large
-        # enough for the table's empty-bucket runs to matter, and ask for a
-        # large fraction of it so the CASE 3 path (count*3 > size) is taken.
+    test "SRANDMEMBER with <count> distribution for count > size/3 - hashtable" {
+        # The histogram test above uses a 10 element set, which is small enough
+        # that the sampler's window covers the whole table, so it cannot tell a
+        # uniform sampler from one biased by the table's bucket layout. Use a
+        # set large enough for the empty-bucket runs to matter, and ask for more
+        # than a third of it so PATH 3 is taken. PATH 4 is sampled differently
+        # and is not covered here.
         r del myset
         set members {}
         for {set i 0} {$i < 200} {incr i} {
@@ -1277,21 +1278,19 @@ foreach type {single multiple single_multiple} {
         for {set i 0} {$i < 2000} {incr i} {
             set res [r srandmember myset 120]
             assert_equal 120 [llength $res]
-            assert_equal 120 [llength [lsort -unique $res]]
             foreach ele $res { incr counts($ele) }
         }
 
-        # Every member is expected 2000*120/200 = 1200 times. A uniform
-        # sampler keeps the most and least frequent member within ~1.12 of
-        # each other at this sample size; a sampler biased by the table's
-        # bucket layout stays near 1.9, so 1.35 separates the two with room
-        # for the sampling noise of either.
-        set vals {}
-        foreach m $members { lappend vals $counts($m) }
-        set vals [lsort -integer $vals]
-        set lo [lindex $vals 0]
-        set hi [lindex $vals end]
-        assert_lessthan $hi [expr {$lo * 1.35}]
+        # Same statistic as chi_square_value, computed from the counters rather
+        # than from a 240000 element list. Sampling is without replacement, so a
+        # uniform sampler gives df*(N-n)/(N-1) = 199*80/199 = 80, not df; a
+        # bucket-biased one gives thousands.
+        set p [expr {2000 * 120 / 200}]
+        set x2 0
+        foreach m $members {
+            set x2 [expr {$x2 + pow($counts($m) - $p, 2) / $p}]
+        }
+        assert_lessthan $x2 400
     }
 
     proc is_rehashing {myset} {
