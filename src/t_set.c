@@ -1053,8 +1053,6 @@ void srandmemberWithCountCommand(client *c) {
      * to reach the specified count, then send the result to the user. */
     {
         dict *d = dictCreate(&sdsReplyDictType);
-        dictIterator di;
-        dictEntry *de;
         unsigned long added = 0;
         sds sdsele;
 
@@ -1074,6 +1072,9 @@ void srandmemberWithCountCommand(client *c) {
             else
                 sdsfree(sdsele);
         }
+
+        dictIterator di;
+        dictEntry *de;
 
         addReplyArrayLen(c,count);
         dictInitIterator(&di, d);
