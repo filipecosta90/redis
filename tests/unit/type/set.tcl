@@ -1275,6 +1275,7 @@ foreach type {single multiple single_multiple} {
         assert_encoding hashtable myset
 
         unset -nocomplain counts
+        array set counts {}
         foreach m $members { set counts($m) 0 }
         for {set i 0} {$i < 2000} {incr i} {
             set res [r srandmember myset 120]
@@ -1284,15 +1285,64 @@ foreach type {single multiple single_multiple} {
         }
 
         # Same statistic as chi_square_value, computed from the counters rather
-        # than from a 240000 element list. Sampling is without replacement, so a
-        # uniform sampler gives df*(N-n)/(N-1) = 199*80/199 = 80, not df; a
-        # bucket-biased one gives thousands.
+        # than from a 240000 element list. Sampling is without replacement, so
+        # the uniform expectation is not df: each member appears in a draw with
+        # probability 120/200, so over 2000 draws Var = 2000*0.6*0.4 = 480 and
+        # E[x2] = 200*480/1200 = 80, with sd about 8. The bound below is ~40 sd
+        # out; a sampler biased by the bucket layout reads in the thousands.
+        set p [expr {2000 * 120 / 200}] ;# expected hits per member = 1200
+        set x2 0
+        foreach m $members {
+            set x2 [expr {$x2 + pow($counts($m) - $p, 2) / $p}]
+        }
+        assert_lessthan $x2 400
+    }
+
+    test "SRANDMEMBER with <count> distribution for count > size/3 - intset" {
+        # The old strategy funnelled every encoding through a temporary dict,
+        # so intset-encoded sets were skewed by the bucket layout too even
+        # though intsetRandom() itself draws a uniform index. Same shape and
+        # bound as the hashtable case above.
+        r del myset
+        set members {}
+        for {set i 0} {$i < 200} {incr i} {
+            lappend members $i
+        }
+        r sadd myset {*}$members
+        assert_encoding intset myset
+
+        unset -nocomplain counts
+        array set counts {}
+        foreach m $members { set counts($m) 0 }
+        for {set i 0} {$i < 2000} {incr i} {
+            set res [r srandmember myset 120]
+            assert_equal 120 [llength $res]
+            assert_equal 120 [llength [lsort -unique $res]]
+            foreach ele $res { incr counts($ele) }
+        }
+
         set p [expr {2000 * 120 / 200}]
         set x2 0
         foreach m $members {
             set x2 [expr {$x2 + pow($counts($m) - $p, 2) / $p}]
         }
         assert_lessthan $x2 400
+    }
+
+    test "SRANDMEMBER with <count> for count > size/3 emits in set order - intset" {
+        # Pins the one behaviour change: the single-pass path emits in set
+        # iteration order, which for an intset is ascending. CASE 2 (count >=
+        # size) has always done this; CASE 4 still emits in temp-dict order.
+        r del myset
+        for {set i 0} {$i < 300} {incr i} { r sadd myset $i }
+        assert_encoding intset myset
+
+        for {set i 0} {$i < 20} {incr i} {
+            set res [r srandmember myset 200]
+            assert_equal 200 [llength $res]
+            assert_equal 200 [llength [lsort -unique $res]]
+            assert_equal [lsort -integer $res] $res
+        }
     }
 
     proc is_rehashing {myset} {
