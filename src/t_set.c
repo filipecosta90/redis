@@ -995,56 +995,55 @@ void srandmemberWithCountCommand(client *c) {
         return;
     }
 
-    /* For CASE 3 and CASE 4 we need an auxiliary dictionary. */
-    d = dictCreate(&sdsReplyDictType);
-
     /* CASE 3:
      * The number of elements inside the set is not greater than
      * SRANDMEMBER_SUB_STRATEGY_MUL times the number of requested elements.
-     * In this case we create a set from scratch with all the elements, and
-     * subtract random elements to reach the requested number of elements.
+     * In this case we walk the set once and pick each element with the
+     * probability that keeps the final sample uniform, emitting the selected
+     * members straight into the reply (selection sampling, TAOCP vol. 2
+     * algorithm S).
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. */
+     * used into CASE 4 is highly inefficient.
+     *
+     * 'remaining' is the number of members not yet looked at and 'needed' the
+     * number still to emit, so 'needed <= remaining' holds at every step: once
+     * the two are equal every remaining member is selected, which is why the
+     * walk always emits exactly 'count' members. No auxiliary dictionary and
+     * no per-member allocation are required. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator si;
+        unsigned long remaining = size, needed = count;
 
-        /* Add all the elements into the temporary dictionary. */
+        addReplyArrayLen(c,count);
         setTypeInitIterator(&si, set);
-        dictExpand(d, size);
-        while (setTypeNext(&si, &str, &len, &llele) != -1) {
-            int retval = DICT_ERR;
-
-            if (str == NULL) {
-                retval = dictAdd(d,sdsfromlonglong(llele),NULL);
-            } else {
-                retval = dictAdd(d, sdsnewlen(str, len), NULL);
+        while (needed && setTypeNext(&si, &str, &len, &llele) != -1) {
+            serverAssert(remaining > 0);
+            if (randomULong() % remaining < needed) {
+                if (str == NULL) {
+                    addReplyBulkLongLong(c,llele);
+                } else {
+                    addReplyBulkCBuffer(c, str, len);
+                }
+                needed--;
             }
-            serverAssert(retval == DICT_OK);
+            remaining--;
         }
         setTypeResetIterator(&si);
-        serverAssert(dictSize(d) == size);
-
-        /* Remove random elements to reach the right count. */
-        while (size > count) {
-            dictEntry *de;
-            de = dictGetFairRandomKey(d);
-            dictUnlink(d,dictGetKey(de));
-            sdsfree(dictGetKey(de));
-            dictFreeUnlinkedEntry(d,de);
-            size--;
-        }
+        serverAssert(needed == 0);
+        return;
     }
 
     /* CASE 4: We have a big set compared to the requested number of elements.
      * In this case we can simply get random elements from the set and add
      * to the temporary set, trying to eventually get enough unique elements
      * to reach the specified count. */
-    else {
+    {
         unsigned long added = 0;
         sds sdsele;
 
+        d = dictCreate(&sdsReplyDictType);
         dictExpand(d, count);
         while (added < count) {
             setTypeRandomElement(set, &str, &len, &llele);
@@ -1063,7 +1062,7 @@ void srandmemberWithCountCommand(client *c) {
         }
     }
 
-    /* CASE 3 & 4: send the result to the user. */
+    /* CASE 4: send the result to the user. */
     {
         dictIterator di;
         dictEntry *de;
