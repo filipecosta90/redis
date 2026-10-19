@@ -1011,8 +1011,9 @@ void srandmemberWithCountCommand(client *c) {
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
      * used into CASE 4 is highly inefficient. This strategy costs O(size)
-     * whatever 'count' is, so the crossover is now nearer size/10 than size/3;
-     * MUL stays at 3 as the conservative choice. */
+     * whatever 'count' is, so the crossover is now nearer size/10 than size/3.
+     * MUL is left at 3 here: raising it would re-route a band this change does
+     * not otherwise touch, so it belongs in a separate change. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator si;
         unsigned long remaining = size, needed = count;
@@ -1024,12 +1025,11 @@ void srandmemberWithCountCommand(client *c) {
          * early would leave needed > 0 and trip the assertion below. */
         while (needed && setTypeNext(&si, &str, &len, &llele) != -1) {
             /* Guards the modulo: a setTypeSize()/iterator disagreement would
-             * divide by zero, which traps on x86 but yields 0 silently on
-             * aarch64. */
+             * divide by zero. That is undefined behaviour, and it does not
+             * fail the same way everywhere: x86 traps with SIGFPE, aarch64
+             * does not trap and returns garbage. */
             serverAssert(remaining > 0);
             if (randomULong() % remaining < needed) {
-                /* addReplyBulkCBuffer() copies, so 'str' only has to stay
-                 * valid until the next setTypeNext(). */
                 if (str == NULL) {
                     addReplyBulkLongLong(c,llele);
                 } else {

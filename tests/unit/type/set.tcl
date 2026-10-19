@@ -1175,8 +1175,9 @@ foreach type {single multiple single_multiple} {
             }
 
             # PATH 3: Ask almost as elements as there are in the set.
-            # In this case the implementation walks the set once and selects
-            # each element with probability needed/remaining.
+            # For non-listpack encodings the implementation walks the set once
+            # and selects each element with probability needed/remaining;
+            # listpack sets are served by a separate single-pass path.
             #
             # PATH 4: Ask a number of elements definitely smaller than
             # the set size.
@@ -1278,6 +1279,7 @@ foreach type {single multiple single_multiple} {
         for {set i 0} {$i < 2000} {incr i} {
             set res [r srandmember myset 120]
             assert_equal 120 [llength $res]
+            assert_equal 120 [llength [lsort -unique $res]]
             foreach ele $res { incr counts($ele) }
         }
 
