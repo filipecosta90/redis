@@ -1258,6 +1258,42 @@ foreach type {single multiple single_multiple} {
         }
     }
 
+    test "SRANDMEMBER with <count> is uniform on a large hashtable set" {
+        # The histogram test above uses a 10 element set, which is small
+        # enough that the sampler's window covers the whole table, so it
+        # cannot tell a uniform sampler from a biased one. Use a set large
+        # enough for the table's empty-bucket runs to matter, and ask for a
+        # large fraction of it so the CASE 3 path (count*3 > size) is taken.
+        r del myset
+        set members {}
+        for {set i 0} {$i < 200} {incr i} {
+            lappend members "member:$i"
+        }
+        r sadd myset {*}$members
+        assert_encoding hashtable myset
+
+        unset -nocomplain counts
+        foreach m $members { set counts($m) 0 }
+        for {set i 0} {$i < 2000} {incr i} {
+            set res [r srandmember myset 120]
+            assert_equal 120 [llength $res]
+            assert_equal 120 [llength [lsort -unique $res]]
+            foreach ele $res { incr counts($ele) }
+        }
+
+        # Every member is expected 2000*120/200 = 1200 times. A uniform
+        # sampler keeps the most and least frequent member within ~1.12 of
+        # each other at this sample size; a sampler biased by the table's
+        # bucket layout stays near 1.9, so 1.35 separates the two with room
+        # for the sampling noise of either.
+        set vals {}
+        foreach m $members { lappend vals $counts($m) }
+        set vals [lsort -integer $vals]
+        set lo [lindex $vals 0]
+        set hi [lindex $vals end]
+        assert_lessthan $hi [expr {$lo * 1.35}]
+    }
+
     proc is_rehashing {myset} {
         set htstats [r debug HTSTATS-KEY $myset]
         return [string match {*rehashing target*} $htstats]
