@@ -422,4 +422,33 @@ start_cluster 1 0 {tags {"external:skip cluster sort"}} {
         assert_equal [r sort_ro "{a}mylist" by "{a}by*" get # ] {3 1 2}
         r sort_ro "{a}mylist" by "{a}by*" get "{a}get*" get #
     } {30 3 200 1 100 2}
+
+    test "SORT ALPHA tracks locale-collate across CONFIG SET" {
+        # SORT ALPHA collates with strcoll(). Byte-order locales (C/POSIX) let
+        # us substitute strcmp(), which is why the server caches whether the
+        # active LC_COLLATE is byte-ordered. That cache has to be refreshed by
+        # CONFIG SET, or a language locale would keep sorting by byte value.
+        set saved [lindex [r config get locale-collate] 1]
+
+        r del mylist
+        r rpush mylist Apple banana Zebra apple
+        r config set locale-collate C
+        set c_order [r sort mylist ALPHA]
+        # Byte order puts every uppercase letter before every lowercase one.
+        assert_equal {Apple Zebra apple banana} $c_order
+
+        # en_US collation is case-insensitive-ish and interleaves the two.
+        # Skip rather than fail where the locale is not generated.
+        if {![catch {r config set locale-collate en_US.UTF-8}]} {
+            set en_order [r sort mylist ALPHA]
+            assert_equal {apple Apple banana Zebra} $en_order
+            assert {$c_order ne $en_order}
+
+            # ...and switching back must restore byte order.
+            r config set locale-collate C
+            assert_equal $c_order [r sort mylist ALPHA]
+        }
+
+        r config set locale-collate $saved
+    }
 }

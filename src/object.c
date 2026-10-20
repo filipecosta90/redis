@@ -1054,6 +1054,23 @@ robj *getDecodedObject(robj *o) {
 #define REDIS_COMPARE_BINARY (1<<0)
 #define REDIS_COMPARE_COLL (1<<1)
 
+/* Return 1 if 'canonical_name' -- a locale name as *returned by* setlocale(),
+ * not as requested -- selects collation by byte value. For such locales the C
+ * standard defines strcoll() to order exactly like strcmp(), so the cheaper
+ * call is not merely an approximation but an equivalence.
+ *
+ * "C" and "POSIX" are the two the standard names. "C.UTF-8" is included
+ * because its LC_COLLATE is defined as codepoint order, and UTF-8 is
+ * constructed so that byte order and codepoint order agree. Any other locale
+ * -- including every language-specific one -- falls back to strcoll(). */
+int localeCollateIsBinary(const char *canonical_name) {
+    if (canonical_name == NULL) return 0;
+    return !strcmp(canonical_name,"C") ||
+           !strcmp(canonical_name,"POSIX") ||
+           !strcmp(canonical_name,"C.UTF-8") ||
+           !strcmp(canonical_name,"C.utf8");
+}
+
 int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
     serverAssertWithInfo(NULL,a,a->type == OBJ_STRING && b->type == OBJ_STRING);
     char bufa[128], bufb[128], *astr, *bstr;
@@ -1075,6 +1092,13 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
         bstr = bufb;
     }
     if (flags & REDIS_COMPARE_COLL) {
+        /* Under a byte-order collation strcoll() is equivalent to strcmp(),
+         * but glibc still dispatches every call through __strcoll_l(), which
+         * costs about as much again as the comparison itself. Note strcmp()
+         * -- not the memcmp() branch below -- is the exact substitute: both
+         * stop at the first NUL, so values with embedded NULs keep comparing
+         * exactly as they do today. */
+        if (server.collate_is_binary) return strcmp(astr,bstr);
         return strcoll(astr,bstr);
     } else {
         int cmp;

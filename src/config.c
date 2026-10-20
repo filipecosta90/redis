@@ -2672,6 +2672,7 @@ static int updateLocaleCollate(const char **err) {
         *err = "Invalid locale name";
         return 0;
     }
+    server.collate_is_binary = localeCollateIsBinary(s);
     return 1;
 }
 

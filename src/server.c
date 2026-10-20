@@ -3103,10 +3103,12 @@ void initServer(void) {
     setReplCompression(server.repl_compression);
 
     /* Make sure the locale is set on startup based on the config file. */
-    if (setlocale(LC_COLLATE,server.locale_collate) == NULL) {
+    const char *collate_name = setlocale(LC_COLLATE,server.locale_collate);
+    if (collate_name == NULL) {
         serverLog(LL_WARNING, "Failed to configure LOCALE for invalid locale name.");
         exit(1);
     }
+    server.collate_is_binary = localeCollateIsBinary(collate_name);
 
     hashTemplatesInit();
     createSharedObjects();

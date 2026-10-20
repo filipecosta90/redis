@@ -2777,6 +2777,8 @@ struct redisServer {
     int reply_copy_avoidance_enabled; /* Is reply copy avoidance enabled (1 by default) */
     /* Local environment */
     char *locale_collate;
+    int collate_is_binary;  /* The active LC_COLLATE orders by byte value,
+                               so strcoll() is equivalent to strcmp(). */
     unsigned int dbg_assert_flags; /* Bitmask of debug assertions to run after each command */
 };
 

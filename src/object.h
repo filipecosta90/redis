@@ -200,6 +200,7 @@ int getLongDoubleFromObjectOrReply(struct client *c, robj *o, long double *targe
 int getIntFromObjectOrReply(struct client *c, robj *o, int *target, const char *msg);
 char *strEncoding(int encoding);
 int compareStringObjects(const robj *a, const robj *b);
+int localeCollateIsBinary(const char *canonical_name);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
