@@ -201,6 +201,7 @@ int getIntFromObjectOrReply(struct client *c, robj *o, int *target, const char *
 char *strEncoding(int encoding);
 int compareStringObjects(const robj *a, const robj *b);
 int localeCollateIsBinary(const char *canonical_name);
+int collateStrings(const char *a, const char *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);

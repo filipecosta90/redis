@@ -1059,10 +1059,19 @@ robj *getDecodedObject(robj *o) {
  * standard defines strcoll() to order exactly like strcmp(), so the cheaper
  * call is not merely an approximation but an equivalence.
  *
- * "C" and "POSIX" are the two the standard names. "C.UTF-8" is included
+ * "C" and "POSIX" are the two standard names. "C.UTF-8" is included
  * because its LC_COLLATE is defined as codepoint order, and UTF-8 is
  * constructed so that byte order and codepoint order agree. Any other locale
  * -- including every language-specific one -- falls back to strcoll(). */
+/* strcoll(), or strcmp() where the active LC_COLLATE orders by byte value and
+ * the two are therefore equivalent. Both stop at the first NUL, so callers
+ * keep the comparison semantics they had. Single home for the policy, so the
+ * two collating call sites cannot drift apart. */
+int collateStrings(const char *a, const char *b) {
+    if (server.collate_is_binary) return strcmp(a,b);
+    return strcoll(a,b);
+}
+
 int localeCollateIsBinary(const char *canonical_name) {
     if (canonical_name == NULL) return 0;
     return !strcmp(canonical_name,"C") ||
@@ -1098,8 +1107,7 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
          * -- not the memcmp() branch below -- is the exact substitute: both
          * stop at the first NUL, so values with embedded NULs keep comparing
          * exactly as they do today. */
-        if (server.collate_is_binary) return strcmp(astr,bstr);
-        return strcoll(astr,bstr);
+        return collateStrings(astr,bstr);
     } else {
         int cmp;
 
