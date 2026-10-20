@@ -1098,8 +1098,7 @@ int compareStringObjectsWithFlags(const robj *a, const robj *b, int flags) {
          * -- not the memcmp() branch below -- is the exact substitute: both
          * stop at the first NUL, so values with embedded NULs keep comparing
          * exactly as they do today. */
-        if (server.collate_is_binary) return strcmp(astr,bstr);
-        return strcoll(astr,bstr);
+        return collateStrings(astr,bstr);
     } else {
         int cmp;
 

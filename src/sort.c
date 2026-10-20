@@ -156,9 +156,9 @@ int sortCompare(const void *s1, const void *s2) {
                 if (server.sort_store) {
                     cmp = compareStringObjects(so1->u.cmpobj,so2->u.cmpobj);
                 } else {
-                    /* Here we can use strcoll() directly as we are sure that
-                     * the objects are decoded string objects. */
-                    cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
+                    /* We can collate the raw buffers directly here, as we
+                     * are sure that the objects are decoded string objects. */
+                    cmp = collateStrings(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
                 }
             }
         } else {

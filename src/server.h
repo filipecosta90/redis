@@ -3268,6 +3268,19 @@ typedef struct {
  *----------------------------------------------------------------------------*/
 
 extern struct redisServer server;
+
+/* strcoll(), or strcmp() where the active LC_COLLATE orders by byte value and
+ * the two are therefore equivalent. Both stop at the first NUL, so callers keep
+ * the comparison semantics they had.
+ *
+ * Deliberately `static inline` rather than exported from object.c: a non-static
+ * helper forces LTO to emit an out-of-line copy even when every call site
+ * inlines, and that .text shift measured as a ~1.5% regression on unrelated
+ * commands. */
+static inline int collateStrings(const char *a, const char *b) {
+    if (server.collate_is_binary) return strcmp(a,b);
+    return strcoll(a,b);
+}
 extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern dictType objectKeyNoValueDictType;
