@@ -31,8 +31,9 @@ static int mainThreadNewPushes[IO_THREADS_MAX_NUM]; /* Pushes queued since last 
  * commands and replies of the other clients of the thread wait for the round,
  * so between two rounds the IO thread goes back to its event loop. The clients
  * left keep collecting pushes, that go out in fewer and bigger writes when the
- * thread is busy. */
-#define IO_THREAD_PUSH_ROUND_CLIENTS 4
+ * thread is busy. One client per round makes the busy case coalesce the most;
+ * an idle thread still writes them all right away, one round after another. */
+#define IO_THREAD_PUSH_ROUND_CLIENTS 1
 
 /* Send the clients to the main thread for processing when the number of clients
  * in pending list reaches IO_THREAD_MAX_PENDING_CLIENTS, or check_size is 0. */
