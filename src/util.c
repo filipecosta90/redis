@@ -911,7 +911,7 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
  * bits. That holds for the three radix 2 formats this path is compiled for,
  * and the #if below is what enforces it:
  *
- *     LDBL_MANT_DIG == 53    long double is double (32 bit ARM, macOS arm64)
+ *     LDBL_MANT_DIG == 53    long double is double (macOS arm64)
  *     LDBL_MANT_DIG == 64    x87 80 bit extended (x86, x86_64)
  *     LDBL_MANT_DIG == 113   IEEE binary128 (aarch64, s390x)
  *
@@ -919,7 +919,7 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
  * long double is the sum of two doubles with independent exponents: it has no
  * single contiguous mantissa, frexpl() plus a 128 bit extraction silently
  * drops the tail, and the result disagrees with the C library (verified under
- * qemu: 345 of the inputs in test_ld2string() below format differently). Since
+ * qemu: inputs in test_ld2string() below format differently there). Since
  * this string is the reply AND the replicated and persisted value, a disagreement
  * between two builds is a correctness bug, so that format keeps snprintf().
  * LDBL_MANT_DIG == 106 is why the test below is an explicit list and not <= 128.
@@ -976,8 +976,10 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
 
 static_assert(LD_HUMAN_FRAC_DIGITS == 17,
     "LD_POW5_17, LD_SCALED_MAX, LD_VALUE_MAX and LD_MAX_SCALED_DIGITS are hand computed for 17");
-static_assert(LD_U192_BITS >= LDBL_MANT_DIG + 40,
-    "ld_u192 must hold the mantissa scaled by 5^17");
+/* The mantissa is always assembled as a full 128 bit value, whatever
+ * LDBL_MANT_DIG is, so the requirement is on 128 and not on the format. */
+static_assert(LD_U192_BITS >= 128 + 40,
+    "ld_u192 must hold the 128 bit mantissa scaled by 5^17");
 static_assert(LD_MAX_SCALED_DIGITS >= 2 * 19,
     "the scratch buffers must hold the 19+19 split form");
 static_assert(LD_MAX_SCALED_DIGITS >= LD_HUMAN_FRAC_DIGITS + 1,
@@ -991,6 +993,8 @@ typedef struct {
 /* Return a * b, where a is 128 bit and b is 64 bit, as a 192 bit value. The
  * callers only use this with b = 5^17, so the product cannot overflow. */
 static ld_u192 ldU192Mul128x64(__uint128_t a, uint64_t b) {
+    /* Hand written for exactly LD_U192_LIMBS == 3; the static_assert above is
+     * what keeps that true. */
     uint64_t a0 = (uint64_t)a, a1 = (uint64_t)(a >> 64);
     __uint128_t p0 = (__uint128_t)a0 * b;
     __uint128_t p1 = (__uint128_t)a1 * b + (uint64_t)(p0 >> 64);
@@ -1116,7 +1120,9 @@ static void ldU64ToDigits19(uint64_t n, char *dst) {
     }
 }
 
-/* Write the decimal digits of a value below 10^38 and return their count.
+/* Write the decimal digits of a value below 10^38 and return their count, or
+ * 0 if they do not fit. Writes at most dstlen bytes and, unlike ull2string(),
+ * does not null terminate.
  * Splitting at 10^19 keeps the per digit work on 64 bit operands. Dividing a
  * 128 bit value is a libgcc call either way (gcc emits __udivmodti4 for the
  * single division below), but this way there is one such call instead of one
@@ -1140,8 +1146,9 @@ static int ldU128ToDigits(__uint128_t n, char *dst, size_t dstlen) {
  * snprintf(). 'value' must be finite. */
 static int ld2stringHumanFast(char *buf, size_t len, long double value, size_t *outlen) {
     __uint128_t scaled;
-    /* scaled is below 10^38, so it has at most 38 digits; ull2string() also
-     * wants room for a null terminator it writes and we then overwrite. */
+    /* scaled is below 10^38, so it has at most 38 digits. The spare byte is
+     * slack: ull2string() is only ever called here with a 19 digit half, so
+     * it needs 20 of these bytes and the split form touches at most 38. */
     char digits[LD_MAX_SCALED_DIGITS + 1];
     /* The same digits, left padded so that the integer part is at least one
      * digit long. Padding and digits do not both peak at once: the length
@@ -1155,7 +1162,9 @@ static int ld2stringHumanFast(char *buf, size_t len, long double value, size_t *
     /* Bound against padded[], which is what the memcpy below fills: digits[]
      * has a spare byte for ull2string()'s terminator and padded[] does not,
      * so checking the producer's buffer rather than the consumer's would be
-     * off by one. */
+     * off by one. This covers the ndigits side; the pad side is covered by
+     * the LD_HUMAN_FRAC_DIGITS + 1 static_assert above, since the length
+     * written is max(LD_HUMAN_FRAC_DIGITS + 1, ndigits). */
     if (ndigits <= 0 || (size_t)ndigits > sizeof(padded)) return 0;
     int pad = ndigits < LD_HUMAN_FRAC_DIGITS + 1 ? LD_HUMAN_FRAC_DIGITS + 1 - ndigits : 0;
     memset(padded, '0', (size_t)pad);
@@ -2078,6 +2087,8 @@ static int referenceHumanLd2string(char *buf, size_t len, long double value) {
 static void checkHumanLd2stringLen(long double v, size_t len) {
     char got[MAX_LONG_DOUBLE_CHARS], want[MAX_LONG_DOUBLE_CHARS];
     assert(len <= sizeof(got));
+    /* Both paths may legitimately write nothing -- len 0 in particular -- so
+     * clear both buffers rather than strcmp()ing uninitialised stack. */
     memset(got, 0, sizeof(got));
     memset(want, 0, sizeof(want));
     int glen = ld2string(got, len, v, LD_STR_HUMAN);
