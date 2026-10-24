@@ -945,8 +945,9 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
     (LDBL_MANT_DIG == 53 || LDBL_MANT_DIG == 64 || LDBL_MANT_DIG == 113)
 #define LD2STRING_HUMAN_FAST 1
 
-/* Number of fractional digits LD_STR_HUMAN asks snprintf() for. Everything
- * below is derived from it, so the three constants stay consistent. */
+/* Number of fractional digits LD_STR_HUMAN asks snprintf() for. The constants
+ * below are hand computed for this value rather than derived from it; the
+ * static_assert keeps them from drifting apart silently. */
 #define LD_HUMAN_FRAC_DIGITS 17
 #define LD_POW5_17 762939453125ULL   /* 5^17, fits in 40 bits */
 #define LD_POW10_19 10000000000000000000ULL
@@ -965,15 +966,23 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
  * read better still but it has errno semantics, so neither gcc nor clang can
  * fold it and it puts two libm calls on this path. */
 #define LD_TWO_POW_64 0x1p64L
+/* Limbs in ld_u192 below. */
+#define LD_U192_LIMBS 3
+#define LD_U192_BITS (LD_U192_LIMBS * 64)
+
+static_assert(LD_HUMAN_FRAC_DIGITS == 17,
+    "LD_POW5_17, LD_SCALED_MAX, LD_VALUE_MAX and LD_MAX_SCALED_DIGITS are hand computed for 17");
+static_assert(LD_U192_BITS >= LDBL_MANT_DIG + 40,
+    "ld_u192 must hold the mantissa scaled by 5^17");
 
 /* A 192 bit unsigned integer, least significant limb first. */
 typedef struct {
-    uint64_t l[3];
+    uint64_t l[LD_U192_LIMBS];
 } ld_u192;
 
 /* Return a * b, where a is 128 bit and b is 64 bit, as a 192 bit value. The
  * callers only use this with b = 5^17, so the product cannot overflow. */
-static inline ld_u192 ldU192FromMul(__uint128_t a, uint64_t b) {
+static ld_u192 ldU192Mul128x64(__uint128_t a, uint64_t b) {
     uint64_t a0 = (uint64_t)a, a1 = (uint64_t)(a >> 64);
     __uint128_t p0 = (__uint128_t)a0 * b;
     __uint128_t p1 = (__uint128_t)a1 * b + (uint64_t)(p0 >> 64);
@@ -985,22 +994,22 @@ static inline ld_u192 ldU192FromMul(__uint128_t a, uint64_t b) {
 }
 
 /* Index of the most significant set bit of p, or -1 if p is zero. */
-static inline int ldU192HighBit(const ld_u192 *p) {
-    for (int i = 2; i >= 0; i--)
+static int ldU192HighBit(const ld_u192 *p) {
+    for (int i = LD_U192_LIMBS - 1; i >= 0; i--)
         if (p->l[i]) return i * 64 + 63 - __builtin_clzll(p->l[i]);
     return -1;
 }
 
 /* Bit number 'bit' of p, or 0 if it is outside of p. */
-static inline int ldU192GetBit(const ld_u192 *p, int bit) {
-    if (bit < 0 || bit >= 192) return 0;
+static int ldU192GetBit(const ld_u192 *p, int bit) {
+    if (bit < 0 || bit >= LD_U192_BITS) return 0;
     return (int)((p->l[bit >> 6] >> (bit & 63)) & 1);
 }
 
 /* True if any bit of p strictly below bit number 'bit' is set. */
-static inline int ldU192AnyBitBelow(const ld_u192 *p, int bit) {
+static int ldU192AnyBitBelow(const ld_u192 *p, int bit) {
     if (bit <= 0) return 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < LD_U192_LIMBS; i++) {
         int low = i * 64;
         if (bit >= low + 64) {
             if (p->l[i]) return 1;
@@ -1013,9 +1022,9 @@ static inline int ldU192AnyBitBelow(const ld_u192 *p, int bit) {
 
 /* The 128 bits of p starting at bit number 'shift', that is p >> shift
  * truncated. The caller checks beforehand that nothing above is lost. */
-static inline __uint128_t ldU192Shr(const ld_u192 *p, int shift) {
+static __uint128_t ldU192Shr(const ld_u192 *p, int shift) {
     __uint128_t r = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < LD_U192_LIMBS; i++) {
         int off = i * 64 - shift;
         if (off >= 128 || off <= -64) continue;
         if (off >= 0)
@@ -1055,7 +1064,7 @@ static int ldScaleBy1e17(long double av, __uint128_t *scaled) {
     /* av * 10^17 = (mantissa * 5^17) * 2^(e+17). frexpl() guarantees f >= 0.5,
      * hence hi >= 2^63 and product != 0, so ldU192HighBit() cannot return the
      * -1 that would let the shift below become undefined behaviour. */
-    ld_u192 product = ldU192FromMul(mantissa, LD_POW5_17);
+    ld_u192 product = ldU192Mul128x64(mantissa, LD_POW5_17);
     int shift = e + LD_HUMAN_FRAC_DIGITS;
     int high_bit = ldU192HighBit(&product);
     __uint128_t result;
@@ -1107,6 +1116,7 @@ static int ldU128ToDigits(__uint128_t n, char *dst, size_t dstlen) {
     uint64_t high = (uint64_t)(n / LD_POW10_19);
     uint64_t low = (uint64_t)(n % LD_POW10_19);
     int len = ull2string(dst, dstlen, high);
+    if (len == 0 || (size_t)len + 19 > dstlen) return 0;
     /* Overwrites the null terminator ull2string() left at dst[len]. */
     ldU64ToDigits19(low, dst + len);
     return len + 19;
@@ -1123,12 +1133,15 @@ static int ld2stringHumanFast(char *buf, size_t len, long double value, size_t *
      * wants room for a null terminator it writes and we then overwrite. */
     char digits[LD_MAX_SCALED_DIGITS + 1];
     /* The same digits, left padded so that the integer part is at least one
-     * digit long. The padding adds at most LD_HUMAN_FRAC_DIGITS + 1 bytes. */
-    char padded[LD_MAX_SCALED_DIGITS + LD_HUMAN_FRAC_DIGITS + 1];
+     * digit long. Padding and digits do not both peak at once: the length
+     * written is pad + ndigits = max(LD_HUMAN_FRAC_DIGITS + 1, ndigits), and
+     * ndigits is at most LD_MAX_SCALED_DIGITS. */
+    char padded[LD_MAX_SCALED_DIGITS];
 
     if (!ldScaleBy1e17(fabsl(value), &scaled)) return 0;
 
     int ndigits = ldU128ToDigits(scaled, digits, sizeof(digits));
+    if (ndigits <= 0) return 0;
     int pad = ndigits < LD_HUMAN_FRAC_DIGITS + 1 ? LD_HUMAN_FRAC_DIGITS + 1 - ndigits : 0;
     memset(padded, '0', (size_t)pad);
     memcpy(padded + pad, digits, (size_t)ndigits);
@@ -2141,8 +2154,16 @@ static void test_ld2string(void) {
         assert(ld2stringHumanFast(b, sizeof(b), 1234.56789L, &fl) == 1);
         referenceHumanLd2string(r, sizeof(r), 1234.56789L);
         assert(!strcmp(b, r));
-        /* Out of range: must decline, and ld2string() must still be right
-         * via the snprintf() fallback. */
+        /* A tight buffer with a negative value. This fails unless signbit()'s
+         * return value is normalized: glibc returns 512 for a long double, and
+         * an unnormalized 512 in the size budget refuses everything here. */
+        assert(ld2stringHumanFast(b, 21, -0.5L, &fl) == 1);
+        assert(fl == 4 && !strcmp(b, "-0.5"));
+
+        /* The top of the supported range must still be accepted, so that the
+         * refusal threshold cannot be quietly narrowed, and just past it must
+         * decline. ld2string() stays correct either way via the fallback. */
+        assert(ld2stringHumanFast(b, sizeof(b), 9.99e20L, &fl) == 1);
         assert(ld2stringHumanFast(b, sizeof(b), 1e21L, &fl) == 0);
         assert(ld2stringHumanFast(b, sizeof(b), -1e21L, &fl) == 0);
         checkHumanLd2string(1e21L);
