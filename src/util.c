@@ -878,9 +878,11 @@ int trimDoubleString(char *buf, size_t len) {
  * and normalize the "-0" that a negative value rounding to zero produces.
  * Returns the new length; 'buf' stays null terminated. */
 static size_t ld2stringHumanTrim(char *buf, size_t l) {
-    if (strchr(buf,'.') != NULL) {
+    if (l > 0 && strchr(buf,'.') != NULL) {
         char *p = buf+l-1;
-        while(*p == '0') {
+        /* The '.' terminates this scan for any well formed input; the
+         * explicit bound keeps it from walking off a malformed one. */
+        while(p > buf && *p == '0') {
             p--;
             l--;
         }
@@ -929,8 +931,10 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
  * and M * 5^17 needs at most 128+40 bits, i.e. three 64 bit limbs. Scaling by
  * 2^(E+17) is a shift, and the rounding is decided by the bits the shift
  * discards, using round-half-to-even. That matches the C library under the
- * default rounding mode, which is the only mode Redis itself ever sets; a
- * module calling fesetround() would make snprintf() disagree with this path.
+ * default rounding mode. Redis never calls fesetround(), but a module or a
+ * linked library that does would make snprintf() disagree with this path --
+ * as it already would with d2string()/fpconv, which is equally mode
+ * independent.
  * The decimal point is then placed 17 digits from the right of the integer.
  *
  * This is exact, not an approximation: it produces the same bytes snprintf()
@@ -974,6 +978,10 @@ static_assert(LD_HUMAN_FRAC_DIGITS == 17,
     "LD_POW5_17, LD_SCALED_MAX, LD_VALUE_MAX and LD_MAX_SCALED_DIGITS are hand computed for 17");
 static_assert(LD_U192_BITS >= LDBL_MANT_DIG + 40,
     "ld_u192 must hold the mantissa scaled by 5^17");
+static_assert(LD_MAX_SCALED_DIGITS >= 2 * 19,
+    "the scratch buffers must hold the 19+19 split form");
+static_assert(LD_MAX_SCALED_DIGITS >= LD_HUMAN_FRAC_DIGITS + 1,
+    "the scratch buffers must hold the left padded form");
 
 /* A 192 bit unsigned integer, least significant limb first. */
 typedef struct {
@@ -1036,8 +1044,9 @@ static __uint128_t ldU192Shr(const ld_u192 *p, int shift) {
 }
 
 /* Set *scaled to round-half-to-even(av * 10^17) and return 1, or return 0 if
- * the result does not fit in 128 bits. 'av' must be a finite, non negative
- * long double. */
+ * the result would exceed LD_SCALED_MAX, i.e. would not decimalise into the
+ * scratch buffers of ld2stringHumanFast(). 'av' must be a finite, non
+ * negative long double. */
 static int ldScaleBy1e17(long double av, __uint128_t *scaled) {
     /* Refuse the out of range values up front. Without this the whole
      * decomposition runs and is then thrown away, which made formatting a
@@ -1108,15 +1117,17 @@ static void ldU64ToDigits19(uint64_t n, char *dst) {
 }
 
 /* Write the decimal digits of a value below 10^38 and return their count.
- * Splitting at 10^19 keeps the per digit divisions on 64 bit operands: a
- * division of a 128 bit value by a 128 bit constant is a libgcc call, while
- * the single division by 10^19 below is turned into multiplications. */
+ * Splitting at 10^19 keeps the per digit work on 64 bit operands. Dividing a
+ * 128 bit value is a libgcc call either way (gcc emits __udivmodti4 for the
+ * single division below), but this way there is one such call instead of one
+ * per digit, and ull2string() then runs on plain 64 bit words. */
 static int ldU128ToDigits(__uint128_t n, char *dst, size_t dstlen) {
     if (n < (__uint128_t)LD_POW10_19) return ull2string(dst, dstlen, (uint64_t)n);
     uint64_t high = (uint64_t)(n / LD_POW10_19);
     uint64_t low = (uint64_t)(n % LD_POW10_19);
     int len = ull2string(dst, dstlen, high);
     if (len == 0 || (size_t)len + 19 > dstlen) return 0;
+    /* high < 10^19 bounds len at 19, so this is 38 digits at most. */
     /* Overwrites the null terminator ull2string() left at dst[len]. */
     ldU64ToDigits19(low, dst + len);
     return len + 19;
@@ -1141,7 +1152,11 @@ static int ld2stringHumanFast(char *buf, size_t len, long double value, size_t *
     if (!ldScaleBy1e17(fabsl(value), &scaled)) return 0;
 
     int ndigits = ldU128ToDigits(scaled, digits, sizeof(digits));
-    if (ndigits <= 0) return 0;
+    /* Bound against padded[], which is what the memcpy below fills: digits[]
+     * has a spare byte for ull2string()'s terminator and padded[] does not,
+     * so checking the producer's buffer rather than the consumer's would be
+     * off by one. */
+    if (ndigits <= 0 || (size_t)ndigits > sizeof(padded)) return 0;
     int pad = ndigits < LD_HUMAN_FRAC_DIGITS + 1 ? LD_HUMAN_FRAC_DIGITS + 1 - ndigits : 0;
     memset(padded, '0', (size_t)pad);
     memcpy(padded + pad, digits, (size_t)ndigits);
@@ -2048,7 +2063,9 @@ static void test_ll2string(void) {
 /* The reference LD_STR_HUMAN formatting: snprintf() plus the shared trimming,
  * i.e. exactly what ld2string() does when no faster path applies. It calls
  * ld2stringHumanTrim() rather than restating it, so that editing the trimming
- * rule cannot leave this test asserting the old contract. */
+ * rule cannot leave this test asserting the old contract. The snprintf() call
+ * and the l+1 > len refusal below are still a copy of ld2string()'s own, and
+ * have to be kept in step with it by hand. */
 static int referenceHumanLd2string(char *buf, size_t len, long double value) {
     size_t l = snprintf(buf, len, "%.17Lf", value);
     if (l + 1 > len) {
@@ -2061,6 +2078,8 @@ static int referenceHumanLd2string(char *buf, size_t len, long double value) {
 static void checkHumanLd2stringLen(long double v, size_t len) {
     char got[MAX_LONG_DOUBLE_CHARS], want[MAX_LONG_DOUBLE_CHARS];
     assert(len <= sizeof(got));
+    memset(got, 0, sizeof(got));
+    memset(want, 0, sizeof(want));
     int glen = ld2string(got, len, v, LD_STR_HUMAN);
     int wlen = referenceHumanLd2string(want, len, v);
     if (glen != wlen || strcmp(got, want)) {
@@ -2132,9 +2151,19 @@ static void test_ld2string(void) {
      * before trimming, so the two only agree if the fast path budgets for
      * the untrimmed form. Negative values are included because signbit() is
      * not required to return 1. */
-    static const long double sizecases[] = {0.5L, -0.5L, 1234.56789L, -1.0L, 0.0L, -0.0L, 100.0L};
+    static const long double sizecases[] = {
+        0.5L, -0.5L, 1234.56789L, -1.0L, 0.0L, -0.0L, 100.0L,
+        /* The widest output the fast path can produce: 21 integer digits,
+         * a sign, a point and 17 fractional digits. This is the only class
+         * where an off by one in the size check would actually overrun. */
+        9.99e20L, -9.99e20L,
+        /* Negative values that reach scaled == 0 through the rounding branch
+         * rather than the av == 0 short circuit, which is the path the "-0"
+         * rule actually depends on. */
+        -1e-30L, -4.9e-18L,
+    };
     for (size_t i = 0; i < sizeof(sizecases) / sizeof(sizecases[0]); i++)
-        for (size_t len = 1; len <= 32; len++)
+        for (size_t len = 0; len <= 48; len++)
             checkHumanLd2stringLen(sizecases[i], len);
 
 #ifdef LD2STRING_HUMAN_FAST
