@@ -878,11 +878,14 @@ int trimDoubleString(char *buf, size_t len) {
  * and normalize the "-0" that a negative value rounding to zero produces.
  * Returns the new length; 'buf' stays null terminated. */
 static size_t ld2stringHumanTrim(char *buf, size_t l) {
-    if (l > 0 && strchr(buf,'.') != NULL) {
+    if (strchr(buf,'.') != NULL) {
         char *p = buf+l-1;
-        /* The '.' terminates this scan for any well formed input; the
-         * explicit bound keeps it from walking off a malformed one. */
-        while(p > buf && *p == '0') {
+        /* The '.' is the sentinel: both callers pass snprintf("%.17Lf")
+         * output, which always has at least one integer digit, so the '.'
+         * strchr() just found is at index 1 or later and stops the scan
+         * before buf. A bound here would be a per iteration cost for a
+         * caller that does not exist. */
+        while(*p == '0') {
             p--;
             l--;
         }
