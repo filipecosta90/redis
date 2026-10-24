@@ -959,6 +959,12 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
 #define LD_VALUE_MAX 1e21L
 /* Decimal digits in the largest scaled value, i.e. in 10^38 - 1. */
 #define LD_MAX_SCALED_DIGITS 38
+/* 2^64, used to split the mantissa into two 64 bit halves. Written as a hex
+ * float so that it is exact by construction in every format below, and so
+ * that the compiler folds the scalings into a single multiply: ldexpl() would
+ * read better still but it has errno semantics, so neither gcc nor clang can
+ * fold it and it puts two libm calls on this path. */
+#define LD_TWO_POW_64 0x1p64L
 
 /* A 192 bit unsigned integer, least significant limb first. */
 typedef struct {
@@ -1039,10 +1045,10 @@ static int ldScaleBy1e17(long double av, __uint128_t *scaled) {
      * halves because no integer type can hold it in one piece. */
     int bexp;
     long double f = frexpl(av, &bexp);
-    long double scaled_f = ldexpl(f, 64);                  /* f * 2^64 */
+    long double scaled_f = f * LD_TWO_POW_64;              /* f * 2^64 */
     uint64_t hi = (uint64_t)scaled_f;
     long double rest = scaled_f - (long double)hi;
-    uint64_t lo = (uint64_t)ldexpl(rest, 64);
+    uint64_t lo = (uint64_t)(rest * LD_TWO_POW_64);
     __uint128_t mantissa = ((__uint128_t)hi << 64) | lo;
     int e = bexp - 128;                                    /* av = mantissa * 2^e */
 
