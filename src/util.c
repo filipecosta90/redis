@@ -1216,6 +1216,18 @@ static int ld2stringHumanFast(char *buf, size_t len, long double value, size_t *
 }
 #endif /* LD2STRING_HUMAN_FAST supported */
 
+/* A build for x86-64 or aarch64 that does not get the fast path has almost
+ * certainly lost it to a typo in the condition above rather than on purpose,
+ * and the loss would be silent: the output is identical either way. */
+#if !defined(LD2STRING_HUMAN_FAST) && !defined(NO_LD2STRING_FAST) && \
+    (defined(__x86_64__) || defined(__aarch64__))
+#error "the ld2string(LD_STR_HUMAN) fast path is unexpectedly disabled"
+#endif
+
+#if defined(LD2STRING_HUMAN_FAST) && defined(REDIS_TEST)
+static long long ld2stringHumanFastAnswers = 0;
+#endif
+
 /* Create a string object from a long double.
  * If mode is humanfriendly it does not use exponential format and trims trailing
  * zeroes at the end (may result in loss of precision).
@@ -1265,7 +1277,15 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
 #ifdef LD2STRING_HUMAN_FAST
             /* Same bytes, computed with integer arithmetic. Falls through to
              * snprintf() for the values it does not cover. */
-            if (ld2stringHumanFast(buf,len,value,&l)) break;
+            if (ld2stringHumanFast(buf,len,value,&l)) {
+#ifdef REDIS_TEST
+                /* Both paths emit the same bytes, so nothing observable tells
+                 * a test which one ran; without this counter the fast path
+                 * can be disabled right here and every test stays green. */
+                ld2stringHumanFastAnswers++;
+#endif
+                break;
+            }
 #endif
             l = snprintf(buf,len,"%.17Lf",value);
             if (l+1 > len) goto err; /* No room. */
@@ -2240,6 +2260,13 @@ static void test_ld2string(void) {
         assert(ld2stringHumanFast(b, sizeof(b), -1e21L, &fl) == 0);
         checkHumanLd2string(1e21L);
         checkHumanLd2string(-1e21L);
+
+        /* Everything above exercises ld2stringHumanFast() directly, which
+         * proves the callee but not that ld2string() dispatches to it. Pin
+         * the edge itself. */
+        long long answers = ld2stringHumanFastAnswers;
+        assert(ld2string(b, sizeof(b), 0.5L, LD_STR_HUMAN) == 3);
+        assert(ld2stringHumanFastAnswers == answers + 1);
     }
 #endif
 }
