@@ -934,7 +934,10 @@ static size_t ld2stringHumanTrim(char *buf, size_t l) {
  * default rounding mode. Redis never calls fesetround(), but a module or a
  * linked library that does would make snprintf() disagree with this path --
  * as it already would with d2string()/fpconv, which is equally mode
- * independent.
+ * independent. Likewise a module that sets LC_NUMERIC would make snprintf()
+ * emit a different decimal separator, where this path always emits '.' -- as
+ * d2string()/fpconv already does, so this moves long double towards the
+ * existing double behaviour rather than away from it.
  * The decimal point is then placed 17 digits from the right of the integer.
  *
  * This is exact, not an approximation: it produces the same bytes snprintf()
@@ -2106,6 +2109,21 @@ static void checkHumanLd2string(long double v) {
     checkHumanLd2stringLen(v, MAX_LONG_DOUBLE_CHARS);
 }
 
+/* The checks above compare ld2string() against a reference that shares
+ * ld2stringHumanTrim() with it, which is what keeps the two from drifting --
+ * but it also means that where the fast path is compiled out the comparison
+ * is f(x) == f(x). These literals are the independent oracle for that case. */
+static void checkHumanLd2stringLiteral(long double v, const char *want) {
+    char got[MAX_LONG_DOUBLE_CHARS];
+    int glen = ld2string(got, sizeof(got), v, LD_STR_HUMAN);
+    if (glen != (int)strlen(want) || strcmp(got, want)) {
+        printf("ld2string(LD_STR_HUMAN) for %.21Le: got '%s', want '%s'\n", v, got, want);
+        fflush(stdout);
+    }
+    assert(glen == (int)strlen(want));
+    assert(!strcmp(got, want));
+}
+
 static void test_ld2string(void) {
     char buf[32];
     long double v;
@@ -2128,6 +2146,17 @@ static void test_ld2string(void) {
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         checkHumanLd2string(strtold(cases[i], NULL));
+
+    /* Independent of the shared reference, so these still discriminate where
+     * the fast path is compiled out: trimming, the dangling '.', the "-0"
+     * rule, and a value past the fast path's range. */
+    checkHumanLd2stringLiteral(0.0L, "0");
+    checkHumanLd2stringLiteral(-0.0L, "0");
+    checkHumanLd2stringLiteral(1.0L, "1");
+    checkHumanLd2stringLiteral(-1.5L, "-1.5");
+    checkHumanLd2stringLiteral(215.5L, "215.5");
+    checkHumanLd2stringLiteral(1e21L, "1000000000000000000000");
+    checkHumanLd2stringLiteral(-1e21L, "-1000000000000000000000");
 
     /* k / 2^18 with k odd scales to an exact half at the 17th fractional
      * digit, which is the only input class where the rounding of the last
