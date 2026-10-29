@@ -4188,7 +4188,12 @@ unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
      * predicates as the seek above, so it includes that element and is
      * greater than its rank. Only a tree whose inner max scores disagree
      * with its leaves could break this, which the debug assertion catches.
-     * A release build deletes nothing for an inconsistent range. */
+     * A release build deletes nothing for an inconsistent range.
+     *
+     * A non-empty range with a finite lower bound costs about 1% more per
+     * call than seeking both bounds did, measured when deleting a single
+     * element. Seeking the upper bound here, as before, measured no better
+     * for those ranges and worse for -inf trims, so the count stays. */
     unsigned long first_rank = zbtScoreRank(first.leaf, first.pos);
     unsigned long end_rank = zbtScoreRankAfterMax(zs, max, maxex);
     debugServerAssert(end_rank > first_rank);
