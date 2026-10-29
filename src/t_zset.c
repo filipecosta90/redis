@@ -2666,17 +2666,27 @@ typedef struct {
 #define OPVAL_DIRTY_SDS 1
 #define OPVAL_DIRTY_LL 2
 #define OPVAL_VALID_LL 4
+/* Set once "ehash" holds the member hash of the bytes in estr[0..elen). */
+#define OPVAL_VALID_HASH 8
 
 /* Store value retrieved from the iterator. */
 typedef struct {
     int flags;
     unsigned char _buf[32]; /* Private buffer. */
+    /* Deliberately placed here rather than at the end: this is the padding
+     * that the following pointer needs anyway, so the member hash is free.
+     * zuiNext() clears the whole value once per iterated member, and growing
+     * it instead costs more than the hash saves. */
+    uint32_t ehash; /* Valid only with OPVAL_VALID_HASH, see zuiHashFromValue. */
     sds ele;
     unsigned char *estr;
     size_t elen;
     long long ell;
     double score;
 } zsetopval;
+
+static_assert(sizeof(zsetopval) == 32 + 6 * 8,
+              "zsetopval grew; zuiNext() clears it once per member");
 
 typedef union _iterset iterset;
 typedef union _iterzset iterzset;
@@ -2943,8 +2953,25 @@ int zuiBufferFromValue(zsetopval *val) {
     return 1;
 }
 
+/* Hash of the member bytes, computed once per iterated member. ZINTER, ZDIFF
+ * and their cardinality-only forms look the same member up in each of the
+ * other inputs, and the hash is a property of the bytes rather than of the
+ * set being searched, so the remaining probes can reuse it. zuiNext() clears
+ * the whole value, which clears the valid flag with it. */
+static uint32_t zuiHashFromValue(zsetopval *val) {
+    if (!(val->flags & OPVAL_VALID_HASH)) {
+        val->ehash = (uint32_t)dictGenHashFunction(val->estr, val->elen);
+        val->flags |= OPVAL_VALID_HASH;
+    }
+    return val->ehash;
+}
+
 /* Find value pointed to by val in the source pointer to by op. When found,
- * return 1 and store its score in target. Return 0 otherwise. */
+ * return 1 and store its score in target. Return 0 otherwise.
+ *
+ * 'score' may be NULL for a caller that only needs to know whether the member
+ * is there. ZINTERCARD and ZDIFF do, and the B+tree encoding then skips
+ * decoding a packed score that would have been thrown away. */
 int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
     if (op->subject == NULL)
         return 0;
@@ -2953,7 +2980,7 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         char *str = val->ele ? val->ele : (char *)val->estr;
         size_t len = val->ele ? sdslen(val->ele) : val->elen;
         if (setTypeIsMemberAux(op->subject, str, len, val->ell, val->ele != NULL)) {
-            *score = 1.0;
+            if (score) *score = 1.0;
             return 1;
         } else {
             return 0;
@@ -2961,7 +2988,9 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
     } else if (op->type == OBJ_ZSET) {
         if (op->encoding == OBJ_ENCODING_BTREE) {
             zuiBufferFromValue(val);
-            return zbtreeScoreRaw(op->subject->ptr, val->estr, val->elen, score);
+            return zbtreeScoreRawWithHash(op->subject->ptr, val->estr,
+                                          val->elen, zuiHashFromValue(val),
+                                          score);
         }
 
         zuiSdsFromValue(val);
@@ -2978,7 +3007,7 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
             dictEntry *de;
             if ((de = dictFind(zs->dict,val->ele)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
-                *score = znode->score;
+                if (score) *score = znode->score;
                 return 1;
             } else {
                 return 0;
@@ -3107,7 +3136,6 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     memset(&zval, 0, sizeof(zval));
     zuiInitIterator(&src[0]);
     while (zuiNext(&src[0],&zval)) {
-        double value;
         int exists = 0;
 
         for (j = 1; j < setnum; j++) {
@@ -3117,7 +3145,7 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
              * check for a duplicate set in the zsetChooseDiffAlgorithm
              * function, but we're leaving it for future-proofing. */
             if (src[j].subject == src[0].subject ||
-                zuiFind(&src[j],&zval,&value)) {
+                zuiFind(&src[j],&zval,NULL)) {
                 exists = 1;
                 break;
             }
@@ -3416,18 +3444,27 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
              * by size, all src[i > 0] are non-empty too. */
             zuiInitIterator(&src[0]);
             while (zuiNext(&src[0],&zval)) {
-                double score, value;
+                double score = 0, value = 0;
 
-                score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
-                if (isnan(score)) score = 0;
+                /* ZINTERCARD reports a count and never a score, so none of
+                 * the weighting and aggregation below is observable. Tell
+                 * the probes not to produce a score either. */
+                double *valuep = cardinality_only ? NULL : &value;
+
+                if (!cardinality_only) {
+                    score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
+                    if (isnan(score)) score = 0;
+                }
 
                 for (j = 1; j < setnum; j++) {
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
                     if (src[j].subject == src[0].subject) {
+                        if (cardinality_only) continue;
                         value = zuiWeightedScore(zval.score, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
-                    } else if (zuiFind(&src[j],&zval,&value)) {
+                    } else if (zuiFind(&src[j],&zval,valuep)) {
+                        if (cardinality_only) continue;
                         value = zuiWeightedScore(value, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
                     } else {

@@ -1296,6 +1296,41 @@ static unsigned int zbtScoreLeafLowerBound(zbtScoreLeaf *leaf, double score,
     return lo;
 }
 
+/* Compare two members of the same length for equality. Sorted set members are
+ * usually short, and at those lengths the call and dispatch of the libc
+ * routine cost more than the comparison itself, so compare up to sixteen
+ * bytes with a pair of overlapping fixed width loads instead.
+ *
+ * Both windows together cover every byte of a buffer in their length range,
+ * and no load reads outside it, so this never touches a byte that memcmp()
+ * would not have touched. */
+static inline int zbtMemberEqual(const unsigned char *a,
+                                 const unsigned char *b, size_t len)
+{
+    if (len >= 8) {
+        if (len > 16) return memcmp(a, b, len) == 0;
+        uint64_t a0, a1, b0, b1;
+        memcpy(&a0, a, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&a1, a + len - 8, 8);
+        memcpy(&b1, b + len - 8, 8);
+        return a0 == b0 && a1 == b1;
+    }
+    if (len >= 4) {
+        uint32_t a0, a1, b0, b1;
+        memcpy(&a0, a, 4);
+        memcpy(&b0, b, 4);
+        memcpy(&a1, a + len - 4, 4);
+        memcpy(&b1, b + len - 4, 4);
+        return a0 == b0 && a1 == b1;
+    }
+    if (len == 0) return 1;
+    /* One, two and three bytes: the three indexes below repeat a byte rather
+     * than read past the end, which is harmless for an equality test. */
+    return a[0] == b[0] && a[len >> 1] == b[len >> 1] &&
+           a[len - 1] == b[len - 1];
+}
+
 /* Look for an exact member in one score leaf. The byte tags are contiguous,
  * so memchr rejects almost every unrelated member before its packed bytes
  * are touched. */
@@ -1326,7 +1361,7 @@ static int zbtScoreLeafFindMember(zbtScoreLeaf *leaf, uint32_t hash,
 
         size_t len;
         const unsigned char *stored = zbtPackedData(record, &len);
-        if (len == elelen && memcmp(stored, ele, len) == 0)
+        if (len == elelen && zbtMemberEqual(stored, ele, len))
         {
             unsigned int logical =
                 zbtScoreLeafPhysicalPos(leaf, physical);
@@ -3254,6 +3289,17 @@ int zbtreeScoreRaw(zbtreeSet *zs, const unsigned char *ele,
                    size_t elelen, double *score)
 {
     uint32_t hash = (uint32_t)dictGenHashFunction(ele, elelen);
+    return zbtIndexFind(zs, hash, ele, elelen, score,
+                        NULL, NULL, NULL, NULL);
+}
+
+/* Same, for a caller that already holds the member hash. ZINTER and its
+ * relatives look the same member up in every one of their remaining inputs,
+ * and the hash does not depend on which set is being searched. */
+int zbtreeScoreRawWithHash(zbtreeSet *zs, const unsigned char *ele,
+                           size_t elelen, uint32_t hash, double *score)
+{
+    debugServerAssert(hash == (uint32_t)dictGenHashFunction(ele, elelen));
     return zbtIndexFind(zs, hash, ele, elelen, score,
                         NULL, NULL, NULL, NULL);
 }

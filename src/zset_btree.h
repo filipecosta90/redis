@@ -77,6 +77,8 @@ int zbtreeDefragStep(zbtreeSet *zs, zbtreeDefragState *state,
 int zbtreeScore(zbtreeSet *zs, sds ele, double *score);
 int zbtreeScoreRaw(zbtreeSet *zs, const unsigned char *ele,
                    size_t elelen, double *score);
+int zbtreeScoreRawWithHash(zbtreeSet *zs, const unsigned char *ele,
+                           size_t elelen, uint32_t hash, double *score);
 /* Look up up to 16 scores. Bit i of the result says whether scores[i] exists. */
 #define ZBT_SCORE_BATCH_SIZE 16
 unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
