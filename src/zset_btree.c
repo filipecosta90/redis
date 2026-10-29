@@ -1298,11 +1298,13 @@ static unsigned int zbtScoreLeafLowerBound(zbtScoreLeaf *leaf, double score,
 
 /* Look for an exact member in one score leaf. The byte tags are contiguous,
  * so memchr rejects almost every unrelated member before its packed bytes
- * are touched. */
-static int zbtScoreLeafFindMember(zbtScoreLeaf *leaf, uint32_t hash,
-                                  const unsigned char *ele, size_t elelen,
-                                  double *score,
-                                  unsigned int *position)
+ * are touched. Always inlined: see zbtScoreLeafFindMember() for the copy
+ * that callers which update the index use. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
+                                 const unsigned char *ele, size_t elelen,
+                                 double *score,
+                                 unsigned int *position)
 {
     uint8_t tag = hash >> 24;
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
@@ -1337,6 +1339,18 @@ static int zbtScoreLeafFindMember(zbtScoreLeaf *leaf, uint32_t hash,
         next = found + 1;
     }
     return 0;
+}
+
+/* Out of line copy for the index update paths (insert, delete, resize). Only
+ * the read-only lookups get the inlined body, to keep the extra code where a
+ * lookup is the whole operation. */
+static __attribute__((noinline))
+int zbtScoreLeafFindMember(zbtScoreLeaf *leaf, uint32_t hash,
+                           const unsigned char *ele, size_t elelen,
+                           double *score, unsigned int *position)
+{
+    return zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen, score,
+                                        position);
 }
 
 /* Choose a score-leaf split that balances bytes, not just element count.
@@ -2005,8 +2019,20 @@ int zbtIndexTableFind(zbtreeSet *zs, zbtIndexTable *table,
                         continue;
                     }
                 }
-                if (zbtScoreLeafFindMember(leaf, hash, ele, elelen, score,
-                                           score_pos))
+                /* A read-only lookup (no bucket or insertion slot wanted;
+                 * both are compile time NULLs once this function is
+                 * inlined) is a single chain of dependent loads from the
+                 * bucket to the member bytes. As a call, the probe state
+                 * above is spilled and reloaded around it, about twenty
+                 * extra memory operations per lookup on that chain, which
+                 * cores that run ZINTER-style probe loops at high IPC (such
+                 * as Neoverse V2) feel the most. So inline it there. */
+                int hit = (found_bucket == NULL && insert_bucket == NULL) ?
+                    zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen,
+                                                 score, score_pos) :
+                    zbtScoreLeafFindMember(leaf, hash, ele, elelen, score,
+                                           score_pos);
+                if (hit)
                 {
                     if (score_leaf) *score_leaf = leaf;
                     if (found_bucket) *found_bucket = bucket;
