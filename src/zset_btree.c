@@ -3867,19 +3867,38 @@ unsigned long zbtreeDeleteRangeByRank(zbtreeSet *zs, unsigned long start,
     return deleted;
 }
 
+static unsigned long zbtScoreRankForBound(const zbtreeSet *zs, double score,
+                                          int after_equal);
+
 /* Delete all elements inside a score interval. Convert its two bounds to
- * ranks and use the rank deletion path above. */
+ * ranks and use the rank deletion path above.
+ *
+ * Callers often pass intervals that hold no element at all: an inverted
+ * interval, or one that falls between two members or past the greatest score.
+ * The skiplist settles such a call with a single walk; so does this function.
+ * An inverted interval is rejected from the bounds alone, and the first
+ * member at or above the lower bound tells whether anything is in range
+ * before the upper bound is searched. Only a non-empty range pays for both
+ * rank computations. */
 unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
                                        double max, int maxex)
 {
-    zbtreeIterator first, last;
-    unsigned long first_rank, last_rank;
-    if (!zbtreeIteratorSeekScore(zs, min, minex, 0, &first, &first_rank))
+    if (min > max || (min == max && (minex || maxex))) return 0;
+
+    zbtreeIterator first;
+    if (!zbtreeIteratorSeekScore(zs, min, minex, 0, &first, NULL))
         return 0;
-    if (!zbtreeIteratorSeekScore(zs, max, maxex, 1, &last, &last_rank))
-        return 0;
-    if (last_rank < first_rank) return 0;
-    return zbtreeDeleteRangeByRank(zs, first_rank, last_rank);
+    double score = zbtScoreLeafScore(first.leaf, first.pos);
+    if (maxex ? score >= max : score > max) return 0;
+
+    /* The range is not empty. Its end rank is the number of members not
+     * above the upper bound, which the bound walk counts on its way down. An
+     * inclusive +inf bound is the whole set and needs no walk. */
+    unsigned long first_rank = zbtScoreRank(first.leaf, first.pos);
+    unsigned long end_rank = (!maxex && isinf(max) && max > 0) ? zs->length :
+        zbtScoreRankForBound(zs, max, !maxex);
+    serverAssert(end_rank > first_rank);
+    return zbtreeDeleteRangeByRank(zs, first_rank, end_rank - 1);
 }
 
 /* ------------------------------ Iterators ------------------------------- */
