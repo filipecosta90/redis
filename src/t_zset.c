@@ -3945,6 +3945,29 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
         return;
     }
     if (end >= llen) end = llen-1;
+
+    /* ZRANGESTORE builds a sorted set, whose contents do not record the order
+     * the elements arrived in -- only ZRANGE's reply does. A reverse rank
+     * window [start, end] selects exactly the members of the forward window
+     * [llen-1-end, llen-1-start], so for a store the walk can be turned
+     * around and emit ascending, which is the precondition the bulk append in
+     * zrangeResultEmitCBufferForStore() needs. REV otherwise falls back to a
+     * generic zsetAdd() per element.
+     *
+     * Only the plain-rank range can do this: BYSCORE and BYLEX accept LIMIT,
+     * whose offset counts from whichever end the walk starts at, so there the
+     * direction does change which members are selected.
+     *
+     * The destination key, not handler->type, is what distinguishes a store:
+     * zrangeResultHandlerInit() only ever zeroes that field. */
+    if (reverse && handler->dstkey != NULL) {
+        long rev_start = start;
+        start = llen - 1 - end;
+        end = llen - 1 - rev_start;
+        reverse = 0;
+        zrangeResultHandlerDirectionSet(handler, 0);
+    }
+
     rangelen = (end-start)+1;
     result_cardinality = rangelen;
 
