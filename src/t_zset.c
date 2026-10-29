@@ -2620,6 +2620,7 @@ typedef struct {
     int encoding;
     double weight;
     size_t oldsize;
+    int noscore; /* Iterate members only; the caller ignores scores. */
 
     union {
         /* Set iterators. */
@@ -2671,13 +2672,17 @@ typedef struct {
 /* Store value retrieved from the iterator. */
 typedef struct {
     int flags;
+    /* Member index hash, valid with OPVAL_VALID_HASH. It sits in the padding
+     * after 'flags': zuiNext() clears the whole struct for every member, and
+     * growing it past 80 bytes turns that clear into a much slower
+     * 'rep stos' on x86. */
+    uint32_t hash;
     unsigned char _buf[32]; /* Private buffer. */
     sds ele;
     unsigned char *estr;
     size_t elen;
     long long ell;
     double score;
-    uint32_t hash; /* Member index hash, valid with OPVAL_VALID_HASH. */
 } zsetopval;
 
 typedef union _iterset iterset;
@@ -2871,7 +2876,10 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
         } else if (op->encoding == OBJ_ENCODING_BTREE) {
             const unsigned char *ele;
             size_t len;
-            if (!zbtreeIteratorNext(&it->bt.iter, 1, &ele, &len, &val->score))
+            /* A caller that only counts members skips the packed score
+             * decode, which is the costly part of stepping the leaf. */
+            if (!zbtreeIteratorNext(&it->bt.iter, 1, &ele, &len,
+                                    op->noscore ? NULL : &val->score))
                 return 0;
             val->estr = (unsigned char *)ele;
             val->elen = len;
@@ -3440,6 +3448,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         if (zuiLength(&src[0]) > 0) {
             /* Precondition: as src[0] is non-empty and the inputs are ordered
              * by size, all src[i > 0] are non-empty too. */
+            src[0].noscore = cardinality_only;
             zuiInitIterator(&src[0]);
             while (zuiNext(&src[0],&zval)) {
                 double score, value;
@@ -5274,7 +5283,8 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         goto out;
     }
 
-    zsetopsrc src;
+    /* Zero the fields this caller does not set, such as 'noscore'. */
+    zsetopsrc src = {0};
     zsetopval zval;
     src.subject = zsetobj;
     src.type = zsetobj->type;
