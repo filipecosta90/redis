@@ -188,11 +188,14 @@
     (ZBT_EXTERNAL_POINTER_OFFSET + sizeof(void *))
 
 /* ZSCAN visits groups of this many adjacent buckets, which share one walk of
- * the probe run that follows them. At the usual table fill a group already
- * holds more members than the default COUNT. It must be a power of two no
- * larger than ZBT_INDEX_INITIAL_BUCKETS. Member hashes have 32 bits, so no
- * home bucket lies beyond ZBT_SCAN_MAX_GROUPS groups. */
-#define ZBT_SCAN_BUCKETS_PER_STEP 4
+ * the probe run that follows them, and only tests COUNT between groups. One
+ * bucket per group keeps replies close to COUNT: a bucket holds about six
+ * members at the usual table fill, so a default COUNT 10 gets two buckets
+ * rather than the two dozen members that groups of four buckets returned.
+ * Larger groups would only save part of the probe-run walk. It must be a
+ * power of two no larger than ZBT_INDEX_INITIAL_BUCKETS. Member hashes have
+ * 32 bits, so no home bucket lies beyond ZBT_SCAN_MAX_GROUPS groups. */
+#define ZBT_SCAN_BUCKETS_PER_STEP 1
 #define ZBT_SCAN_MAX_GROUPS \
     ((UINT64_C(1) << 32) / ZBT_SCAN_BUCKETS_PER_STEP)
 
@@ -4224,8 +4227,16 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     uint8_t tag = zbtIndexTags(bucket) >> (slot_pos * 8);
     uint32_t id = zbtIndexGetId(table, bucket, slot_pos);
     if (tag == 0 || id == ZBT_INDEX_DELETED_ID) return 0;
-    if (home_end) {
-        uint64_t bits = zbtIndexTagBits(tag);
+    uint64_t bits = zbtIndexTagBits(tag);
+    if (home_end == 0) {
+        /* A slot of the group's own bucket may hold a member displaced from
+         * an earlier home, which the probe-run walk of that home returns as
+         * well. The bucket's home filter has no false negatives, so when it
+         * lacks this tag no member the slot can stand for lives here: leave
+         * it to its home. A false positive only repeats a member, which SCAN
+         * allows, and costs no hashing here. */
+        if ((bucket->narrow.home_tags & bits) != bits) return 0;
+    } else {
         unsigned long home;
         for (home = home_start; home < home_end; home++) {
             if ((*zbtIndexHomeTagsAt(table, home) & bits) == bits) break;
@@ -4292,13 +4303,15 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
 
 /* Return every member represented in 'table' whose home bucket is one of the
  * buckets of scan group 'group'. Slots in the group's own buckets are returned
- * without rehashing their members. That may repeat a member displaced from an
- * earlier home, which SCAN allows. Members whose home is here but which were
- * displaced further are in the probe run after the group. Same-tag references
- * can exchange slots when a member changes score, but the slot standing for a
- * member is always reachable from its home. A zero tag never returns to a
- * table, so a run that was full when such a member was added is still full
- * and the walk below cannot stop before reaching it. */
+ * without rehashing their members, unless the bucket's home filter shows the
+ * slot holds a member displaced from an earlier home. A displaced member the
+ * filter cannot rule out is repeated, which SCAN allows. Members whose home
+ * is here but which were displaced further are in the probe run after the
+ * group. Same-tag references can exchange slots when a member changes score,
+ * but the slot standing for a member is always reachable from its home. A
+ * zero tag never returns to a table, so a run that was full when such a
+ * member was added is still full and the walk below cannot stop before
+ * reaching it. */
 static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
                                        zbtIndexTable *table, uint64_t group,
                                        zbtreeScanFunction *fn,
@@ -4370,13 +4383,14 @@ static uint64_t zbtScanGroupMask(const zbtIndexTable *table) {
  * members move between leaves and tables. Its value stays below the number
  * of groups.
  *
- * Group g of a table with S buckets holds the members whose home bucket is in
- * [4g, 4g+4), that is, whose H = hash >> 2 has H & (S/4 - 1) == g. Tables are
- * powers of two, so groups nest like dictionary buckets: group g of size S
- * becomes groups g and g + S/4 of size 2S. During a resize, each live member
- * is represented in exactly one table: the new one if its leaf was copied. A
- * step visits group 'cursor & m0' of the smaller table and, as dictScan()
- * does, the groups of the larger table that expand it.
+ * With B = ZBT_SCAN_BUCKETS_PER_STEP, group g of a table with S buckets holds
+ * the members whose home bucket is in [Bg, Bg+B), that is, whose H = hash / B
+ * has H & (S/B - 1) == g. Tables are powers of two, so groups nest like
+ * dictionary buckets: group g of size S becomes groups g and g + S/B of size
+ * 2S. During a resize, each live member is represented in exactly one table:
+ * the new one if its leaf was copied. A step visits group 'cursor & m0' of
+ * the smaller table and, as dictScan() does, the groups of the larger table
+ * that expand it.
  *
  * Let R() reverse 64 bits, and let k0 and k1 be the bits of m0 and m1. A
  * group of the smaller table holds the members with R(H) in [P, P + 2^(64-k0)),
@@ -6142,15 +6156,24 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         }
         test_cond("ZSCAN accepts any cursor and still finishes", ok);
 
-        /* The smallest table has a single group: one call returns all. */
+        /* The smallest table has ZBT_INDEX_INITIAL_BUCKETS buckets, so a
+         * COUNT 1 scan returns all its members within one call per group. */
         zbtreeSet *tiny = zbtreeCreate();
         zbtTestPopulate(tiny, 3);
         int *seen = zcalloc(sizeof(int) * 3);
         zbtScanTestPrivdata pd = {seen, 3};
-        uint64_t cursor = zbtreeScan(tiny, 0, 1, zbtScanTestMarkSeen, &pd);
-        test_cond("ZSCAN of a one-group table finishes in one call",
+        unsigned long tiny_groups =
+            ZBT_INDEX_INITIAL_BUCKETS / ZBT_SCAN_BUCKETS_PER_STEP;
+        unsigned long tiny_calls = 0;
+        uint64_t cursor = 0;
+        do {
+            cursor = zbtreeScan(tiny, cursor, 1, zbtScanTestMarkSeen, &pd);
+            tiny_calls++;
+        } while (cursor != 0 && tiny_calls <= tiny_groups);
+        test_cond("ZSCAN of the smallest table finishes within its groups",
                   tiny->member_index.size == ZBT_INDEX_INITIAL_BUCKETS &&
-                  cursor == 0 && seen[0] && seen[1] && seen[2]);
+                  cursor == 0 && tiny_calls <= tiny_groups &&
+                  seen[0] && seen[1] && seen[2]);
         zfree(seen);
         zbtreeFree(tiny);
 
