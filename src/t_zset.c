@@ -2976,6 +2976,22 @@ static void zuiPrefetchFind(zsetopsrc *op, zsetopval *val) {
         zbtreePrefetchMember(op->subject->ptr, zuiMemberHash(val));
 }
 
+/* zuiFind() in two steps for a B+ tree input, see zbtreeLookupStart(). */
+static void zuiLookupStart(zsetopsrc *op, zsetopval *val,
+                           zbtreeLookup *lookup)
+{
+    zbtreeLookupStart(op->subject->ptr, zuiMemberHash(val), lookup);
+}
+
+/* Finish the lookup zuiLookupStart() began for the same value. */
+static int zuiLookupFinish(zsetopsrc *op, zsetopval *val,
+                           const zbtreeLookup *lookup, double *score)
+{
+    debugServerAssert(val->flags & OPVAL_VALID_HASH);
+    return zbtreeLookupFinish(op->subject->ptr, lookup, val->estr, val->elen,
+                              score);
+}
+
 /* Find value pointed to by val in the source pointer to by op. When found,
  * return 1 and store its score in target. Return 0 otherwise. A NULL target
  * asks for membership only, which lets a packed encoding skip decoding the
@@ -3457,10 +3473,29 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             /* Whether the previous member was found in src[1]. */
             int prev_in_first = 1;
             zuiInitIterator(&src[0]);
-            while (zuiNext(&src[0],&zval)) {
+            /* A B+ tree lookup is a long chain of dependent loads, and with
+             * few inputs nothing else overlaps it. So read one member of
+             * src[0] ahead and start its lookup in src[1] before finishing
+             * the current one (see zbtreeLookupStart()). zuiNext() values
+             * point into the iterated object or into their own _buf, never
+             * into the iterator, so the value read ahead stays valid. */
+            int ahead = setnum > 1 && src[1].type == OBJ_ZSET &&
+                        src[1].encoding == OBJ_ENCODING_BTREE &&
+                        src[1].subject != src[0].subject;
+            zsetopval vals[2];
+            zbtreeLookup lookups[2];
+            zsetopval *cur = &vals[0], *next = &vals[1];
+            zbtreeLookup *curlookup = &lookups[0], *nextlookup = &lookups[1];
+            memset(vals, 0, sizeof(vals));
+            int more = zuiNext(&src[0], cur);
+            if (more && ahead) zuiLookupStart(&src[1], cur, curlookup);
+            while (more) {
                 double score, value;
 
-                score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
+                more = zuiNext(&src[0], next);
+                if (more && ahead) zuiLookupStart(&src[1], next, nextlookup);
+
+                score = zuiWeightedScore(cur->score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
 
                 /* Keep one input ahead of the probes below: the first
@@ -3470,24 +3505,27 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                  * src[1], that is most of the work spent here, so skip it
                  * for src[2] unless the previous member was in src[1]. */
                 if (setnum > 2 && prev_in_first)
-                    zuiPrefetchFind(&src[2],&zval);
+                    zuiPrefetchFind(&src[2],cur);
                 for (j = 1; j < setnum; j++) {
                     if (j > 1 && j + 1 < setnum)
-                        zuiPrefetchFind(&src[j+1],&zval);
+                        zuiPrefetchFind(&src[j+1],cur);
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
                     if (src[j].subject == src[0].subject) {
-                        value = zuiWeightedScore(zval.score, src[j].weight, aggregate);
+                        value = zuiWeightedScore(cur->score, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
-                    } else if (cardinality_only) {
-                        /* ZINTERCARD needs membership only, so do not ask
-                         * the input to produce the score. */
-                        if (!zuiFind(&src[j],&zval,NULL)) break;
-                    } else if (zuiFind(&src[j],&zval,&value)) {
+                        continue;
+                    }
+                    /* ZINTERCARD needs membership only, so do not ask the
+                     * input to produce the score. */
+                    double *target = cardinality_only ? NULL : &value;
+                    int found = (j == 1 && ahead) ?
+                        zuiLookupFinish(&src[1], cur, curlookup, target) :
+                        zuiFind(&src[j], cur, target);
+                    if (!found) break;
+                    if (!cardinality_only) {
                         value = zuiWeightedScore(value, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
-                    } else {
-                        break;
                     }
                 }
 
@@ -3497,21 +3535,27 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (j == setnum && cardinality_only) {
                     cardinality++;
 
-                    /* We stop the searching after reaching the limit. */
-                    if (limit && cardinality >= (unsigned long)limit) {
-                        /* Cleanup before we break the zuiNext loop. */
-                        zuiDiscardDirtyValue(&zval);
-                        break;
-                    }
+                    /* We stop the searching after reaching the limit. The
+                     * value read ahead is released below. */
+                    if (limit && cardinality >= (unsigned long)limit) break;
                 } else if (j == setnum) {
-                    tmp = zuiNewSdsFromValue(&zval);
+                    tmp = zuiNewSdsFromValue(cur);
                     znode = zslInsert(dstzset->zsl,score,tmp);
                     dictAdd(dstzset->dict, znode, NULL);
                     totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
                     sdsfree(tmp); /* zslInsert copied it, we can free our copy */
                 }
+
+                zsetopval *swap = cur;
+                cur = next;
+                next = swap;
+                zbtreeLookup *swaplookup = curlookup;
+                curlookup = nextlookup;
+                nextlookup = swaplookup;
             }
+            zuiDiscardDirtyValue(&vals[0]);
+            zuiDiscardDirtyValue(&vals[1]);
             zuiClearIterator(&src[0]);
         }
     } else if (op == SET_OP_UNION) {
