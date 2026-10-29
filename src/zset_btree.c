@@ -3311,6 +3311,57 @@ void zbtreePrefetchMember(zbtreeSet *zs, uint32_t hash) {
             hash & (zs->member_rehash->table.size - 1)));
 }
 
+/* First half of a two step lookup: read the member's home bucket and keep
+ * the leaf of its first matching slot. A lookup is a chain of dependent loads
+ * (bucket, leaf ID, leaf, tags, record), so a caller that probes one set for a
+ * run of members starts the next member's lookup before it finishes the
+ * current one, and the two chains overlap. Nothing here moves entries, and
+ * lookups never start a resize, so 'lookup' stays valid until the set is
+ * modified. During a resize zbtreeLookupFinish() does the whole search, which
+ * also advances the resize like any other lookup. */
+void zbtreeLookupStart(zbtreeSet *zs, uint32_t hash, zbtreeLookup *lookup) {
+    zbtIndexTable *table = &zs->member_index;
+    lookup->hash = hash;
+    lookup->leaf = NULL;
+    lookup->absent = 0;
+    if (zs->member_rehash || table->size == 0) return;
+
+    uint8_t tag = zbtIndexTag(hash);
+    zbtIndexBucket *bucket = zbtIndexBucketAt(table, hash & (table->size - 1));
+    uint64_t tags = zbtIndexTags(bucket);
+    uint64_t matches = zbtIndexTagMask(tags, tag);
+    while (matches) {
+        unsigned int pos = zbtIndexFirstTag(matches);
+        matches &= matches - 1;
+        if ((uint8_t)(tags >> (pos * 8)) != tag) continue;
+        uint32_t id = zbtIndexGetId(table, bucket, pos);
+        if (id == ZBT_INDEX_DELETED_ID) continue;
+        /* Without a resize every live slot names a live leaf. */
+        lookup->leaf = zs->score_leaf_by_id[id];
+        debugServerAssert(!ZBT_IS_FREE_LEAF_ID(lookup->leaf) &&
+                          lookup->leaf->id == id);
+        return;
+    }
+    /* Same early exit as zbtIndexTableFind() for a home bucket without a
+     * usable candidate. */
+    lookup->absent = !zbtIndexHomeMayContain(table, hash);
+}
+
+/* Second half: confirm the member in the leaf found by zbtreeLookupStart().
+ * Anything else (no candidate in the home bucket, a tag shared with another
+ * member, a resize) falls back to the full search, so the result is always
+ * that of zbtreeScoreRawWithHash(). */
+int zbtreeLookupFinish(zbtreeSet *zs, zbtreeLookup *lookup,
+                       const unsigned char *ele, size_t elelen, double *score)
+{
+    if (lookup->absent) return 0;
+    if (lookup->leaf &&
+        zbtScoreLeafFindMemberInline(lookup->leaf, lookup->hash, ele, elelen,
+                                     score, NULL))
+        return 1;
+    return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen, score);
+}
+
 /* Find an sds member and optionally return its score. */
 int zbtreeScore(zbtreeSet *zs, sds ele, double *score) {
     return zbtreeScoreRaw(zs, (unsigned char *)ele, sdslen(ele), score);
