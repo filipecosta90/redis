@@ -635,6 +635,69 @@ proc test_scan {type} {
         assert_equal 5000 [llength [lsort -unique $seen]]
     }
 
+    test "{$type} ZSCAN returns every member of densely filled B+ tree sets" {
+        # The sizes are chosen to fill the B+ tree member table to about 0.5
+        # (1000 members) and to about 0.85-0.87 (3500 and up), where many
+        # members sit outside their home bucket. 300 members give a small
+        # table, where a displaced member can wrap around the table end into
+        # an earlier bucket of its own group. A quarter of the members is
+        # deleted while the scan runs, leaving tombstones in the probe runs it
+        # walks.
+        foreach size {300 1000 3500 7100 14000} {
+            foreach count {1 10 1000} {
+                r del zset
+                set elements {}
+                set anchors 0
+                for {set j 0} {$j < $size} {incr j} {
+                    if {$j % 4 == 0} {
+                        lappend elements $j churn:$j
+                    } else {
+                        lappend elements $j anchor:$j
+                        incr anchors
+                    }
+                }
+                r zadd zset {*}$elements
+                assert_encoding btree zset
+
+                set cursor 0
+                set seen {}
+                set next 0
+                while 1 {
+                    lassign [r zscan zset $cursor count $count] cursor items
+                    foreach {member score} $items {
+                        if {[string match "anchor:*" $member]} {
+                            lappend seen $member
+                        }
+                    }
+                    if {$cursor == 0} break
+                    for {set j 0} {$j < 8 && $next < $size} {incr j} {
+                        r zrem zset churn:$next
+                        incr next 4
+                    }
+                }
+                assert_equal $anchors [llength [lsort -unique $seen]]
+            }
+
+            # Without writes, a complete scan repeats only the few members
+            # that a home filter false positive cannot rule out, about 1% at
+            # the higher loads. The 5% bound leaves room for any hash seed.
+            set cursor 0
+            set emitted 0
+            set seen {}
+            while 1 {
+                lassign [r zscan zset $cursor count 10] cursor items
+                foreach {member score} $items {
+                    lappend seen $member
+                    incr emitted
+                }
+                if {$cursor == 0} break
+            }
+            set distinct [llength [lsort -unique $seen]]
+            assert_equal [r zcard zset] $distinct
+            assert {($emitted - $distinct) * 20 < $distinct}
+        }
+    }
+
     test "{$type} SCAN guarantees check under write load" {
         r flushdb
         populate 100
