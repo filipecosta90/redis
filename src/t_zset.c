@@ -2666,6 +2666,7 @@ typedef struct {
 #define OPVAL_DIRTY_SDS 1
 #define OPVAL_DIRTY_LL 2
 #define OPVAL_VALID_LL 4
+#define OPVAL_VALID_HASH 8
 
 /* Store value retrieved from the iterator. */
 typedef struct {
@@ -2676,6 +2677,7 @@ typedef struct {
     size_t elen;
     long long ell;
     double score;
+    uint32_t hash; /* Member index hash, valid with OPVAL_VALID_HASH. */
 } zsetopval;
 
 typedef union _iterset iterset;
@@ -2943,8 +2945,31 @@ int zuiBufferFromValue(zsetopval *val) {
     return 1;
 }
 
+/* Return the member index hash of the current value, computing it on first
+ * use. ZINTER probes every input for the same member, so this makes the hash
+ * a per-member cost instead of a per-input one. */
+static uint32_t zuiMemberHash(zsetopval *val) {
+    if (!(val->flags & OPVAL_VALID_HASH)) {
+        zuiBufferFromValue(val);
+        val->hash = zbtreeMemberHash(val->estr, val->elen);
+        val->flags |= OPVAL_VALID_HASH;
+    }
+    return val->hash;
+}
+
+/* Start fetching what zuiFind(op,val) will read first, for inputs whose
+ * lookup begins with a hash-addressed load. Called for the next input while
+ * the current one is probed, so the two overlap instead of serializing. */
+static void zuiPrefetchFind(zsetopsrc *op, zsetopval *val) {
+    if (op->subject == NULL) return;
+    if (op->type == OBJ_ZSET && op->encoding == OBJ_ENCODING_BTREE)
+        zbtreePrefetchMember(op->subject->ptr, zuiMemberHash(val));
+}
+
 /* Find value pointed to by val in the source pointer to by op. When found,
- * return 1 and store its score in target. Return 0 otherwise. */
+ * return 1 and store its score in target. Return 0 otherwise. A NULL target
+ * asks for membership only, which lets a packed encoding skip decoding the
+ * score. */
 int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
     if (op->subject == NULL)
         return 0;
@@ -2953,15 +2978,16 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         char *str = val->ele ? val->ele : (char *)val->estr;
         size_t len = val->ele ? sdslen(val->ele) : val->elen;
         if (setTypeIsMemberAux(op->subject, str, len, val->ell, val->ele != NULL)) {
-            *score = 1.0;
+            if (score) *score = 1.0;
             return 1;
         } else {
             return 0;
         }
     } else if (op->type == OBJ_ZSET) {
         if (op->encoding == OBJ_ENCODING_BTREE) {
-            zuiBufferFromValue(val);
-            return zbtreeScoreRaw(op->subject->ptr, val->estr, val->elen, score);
+            uint32_t hash = zuiMemberHash(val);
+            return zbtreeScoreRawWithHash(op->subject->ptr, hash,
+                                          val->estr, val->elen, score);
         }
 
         zuiSdsFromValue(val);
@@ -2978,7 +3004,7 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
             dictEntry *de;
             if ((de = dictFind(zs->dict,val->ele)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
-                *score = znode->score;
+                if (score) *score = znode->score;
                 return 1;
             } else {
                 return 0;
@@ -3422,11 +3448,20 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (isnan(score)) score = 0;
 
                 for (j = 1; j < setnum; j++) {
+                    /* Keep one input ahead of the probe below: the first
+                     * memory access of a lookup in src[j+1] is issued
+                     * while src[j] is still being searched. With a
+                     * single other input there is nothing to overlap. */
+                    if (j + 1 < setnum) zuiPrefetchFind(&src[j+1],&zval);
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
                     if (src[j].subject == src[0].subject) {
                         value = zuiWeightedScore(zval.score, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
+                    } else if (cardinality_only) {
+                        /* ZINTERCARD needs membership only, so do not ask
+                         * the input to produce the score. */
+                        if (!zuiFind(&src[j],&zval,NULL)) break;
                     } else if (zuiFind(&src[j],&zval,&value)) {
                         value = zuiWeightedScore(value, src[j].weight, aggregate);
                         zunionInterAggregate(&score,value,aggregate);
