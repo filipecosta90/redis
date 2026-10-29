@@ -384,6 +384,22 @@ static inline uint8_t *zbtScoreLeafHashTags(zbtScoreLeaf *leaf) {
     return zbtScoreLeafTagsAfter(zbtScoreLeafOffsets(leaf), leaf->n.count);
 }
 
+/* Searching a leaf reads the header, then the hash tags, then one offset,
+ * then one member record and one packed score, each load waiting for the
+ * previous one. zbtreeLookupStart() requests the first
+ * ZBT_SCORE_LEAF_PREFETCH bytes of the leaf as soon as it knows it: the
+ * header and the start of the packed scores, offsets and tags that follow
+ * it. How much of those arrays this covers depends on the member count and
+ * the score width; a leaf whose arrays extend further only loses part of
+ * the overlap. Prefetches never fault, so lines past a small leaf's
+ * allocation are harmless. */
+#define ZBT_SCORE_LEAF_PREFETCH 256
+static inline void zbtScoreLeafPrefetchFront(const zbtScoreLeaf *leaf) {
+    for (unsigned int off = 0; off < ZBT_SCORE_LEAF_PREFETCH;
+         off += CACHE_LINE_SIZE)
+        redis_prefetch_read((const unsigned char *)leaf + off);
+}
+
 /* Left-edge leaves keep their arrays in reverse physical order. Logical
  * positions remain sorted, but prepending then inserts at the physical end
  * and does not move the existing packed scores or offsets. */
@@ -3518,9 +3534,11 @@ void zbtreeLookupStart(zbtreeSet *zs, uint32_t hash, zbtreeLookup *lookup) {
         uint32_t id = zbtIndexGetId(table, bucket, pos);
         if (id == ZBT_INDEX_DELETED_ID) continue;
         /* Without a resize every live slot names a live leaf. */
-        lookup->leaf = zbtIndexSlotLeaf(zs, id);
+        zbtScoreLeaf *leaf = zbtIndexSlotLeaf(zs, id);
+        debugServerAssert(leaf != NULL);
+        zbtScoreLeafPrefetchFront(leaf);
+        lookup->leaf = leaf;
         lookup->leaf_id = id;
-        debugServerAssert(lookup->leaf != NULL);
         return;
     }
     lookup->absent = !zbtIndexHomeMayContain(table, hash);
@@ -3603,22 +3621,28 @@ int zbtreeScore(zbtreeSet *zs, sds ele, double *score) {
     return zbtreeScoreRaw(zs, (unsigned char *)ele, sdslen(ele), score);
 }
 
-/* ZMSCORE can bring several independent index buckets into cache before it
- * reads any of their members. Hash once, then reuse the normal lookup. */
+/* ZMSCORE looks up independent members, so their chains of dependent loads
+ * can overlap. Hash all members and request their index buckets, then read
+ * every bucket and request the candidate leaves (zbtreeLookupStart), and only
+ * then search the leaves. The set does not change in between, which is what
+ * the two step lookup requires. */
 unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
                           double *scores)
 {
     serverAssert(count <= ZBT_SCORE_BATCH_SIZE);
+    zbtreeLookup lookups[ZBT_SCORE_BATCH_SIZE];
     uint32_t hashes[ZBT_SCORE_BATCH_SIZE];
     for (unsigned int i = 0; i < count; i++) {
         hashes[i] = zbtreeMemberHash((unsigned char *)members[i],
                                      sdslen(members[i]));
         zbtreePrefetchMember(zs, hashes[i]);
     }
+    for (unsigned int i = 0; i < count; i++)
+        zbtreeLookupStart(zs, hashes[i], &lookups[i]);
     unsigned int found = 0;
     for (unsigned int i = 0; i < count; i++) {
-        if (zbtIndexFind(zs, hashes[i], (unsigned char *)members[i],
-                         sdslen(members[i]), &scores[i], NULL, NULL, NULL, NULL))
+        if (zbtreeLookupFinish(zs, &lookups[i], (unsigned char *)members[i],
+                               sdslen(members[i]), &scores[i]))
             found |= 1U << i;
     }
     return found;
