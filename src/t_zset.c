@@ -3884,6 +3884,9 @@ static void zrangeResultHandlerInit(zrange_result_handler *handler,
     memset(handler, 0, sizeof(*handler));
 
     handler->client = client;
+    /* Previously never recorded (only the method pointers were), which left
+     * ->type always reading as ZRANGE_CONSUMER_TYPE_CLIENT. */
+    handler->type = type;
 
     switch (type) {
     case ZRANGE_CONSUMER_TYPE_CLIENT:
@@ -3921,6 +3924,31 @@ static void zrangeResultHandlerDirectionSet(zrange_result_handler *handler, int 
     handler->reverse = reverse;
 }
 
+/* ZRANGESTORE's destination is itself a sorted set, so the order in which the
+ * source range is visited is unobservable: the stored result depends only on
+ * WHICH elements the range selects, never on the visiting order. A REV range
+ * therefore stores exactly the same set as its mirrored forward range -- but
+ * visiting it ascending lets the STORE handler take the descent-free B+tree
+ * append fast path (see zrangeResultEmitCBufferForStore()), whereas
+ * descending emission falls back to one generic zsetAdd() per element, each
+ * landing at the leftmost leaf: the worst case for an append-optimised tree.
+ *
+ * Returns 1 (and records the handler as forward) when a REV range may be
+ * iterated forward instead. Not allowed once a LIMIT is in effect: LIMIT
+ * counts its offset from the end the iteration starts at, so with REV it
+ * selects a different slice than the forward walk would. A negative count
+ * means "unlimited" in genericZrangebyscoreCommand()/genericZrangebylexCommand(),
+ * and plain rank ranges have no LIMIT at all (callers pass 0, -1). */
+static int zrangeResultHandlerStoreForwardable(zrange_result_handler *handler,
+    long offset, long limit)
+{
+    if (handler->type != ZRANGE_CONSUMER_TYPE_INTERNAL || !handler->reverse)
+        return 0;
+    if (offset != 0 || limit >= 0) return 0;
+    handler->reverse = 0;
+    return 1;
+}
+
 /* This command implements ZRANGE, ZREVRANGE. */
 void genericZrangebyrankCommand(zrange_result_handler *handler,
     robj *zobj, long start, long end, int withscores, int reverse) {
@@ -3947,6 +3975,16 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     if (end >= llen) end = llen-1;
     rangelen = (end-start)+1;
     result_cardinality = rangelen;
+
+    /* STORE of a REV rank range: mirror the (already sanitised) range and
+     * walk it forward -- REV rank i is forward rank llen-1-i, and the
+     * destination zset is identical either way. */
+    if (reverse && zrangeResultHandlerStoreForwardable(handler, 0, -1)) {
+        long tmp = start;
+        start = llen - 1 - end;
+        end = llen - 1 - tmp;
+        reverse = 0;
+    }
 
     handler->beginResultEmission(handler, rangelen);
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
@@ -4049,9 +4087,15 @@ void zrevrangeCommand(client *c) {
 
 /* This command implements ZRANGEBYSCORE, ZREVRANGEBYSCORE. */
 void genericZrangebyscoreCommand(zrange_result_handler *handler,
-    zrangespec *range, robj *zobj, long offset, long limit, 
+    zrangespec *range, robj *zobj, long offset, long limit,
     int reverse) {
     unsigned long rangelen = 0;
+
+    /* STORE of an un-LIMITed REV score range selects the same elements as
+     * the forward walk over [min,max] (the range is already normalised to
+     * min <= max by the caller), so walk it forward for the append fast path. */
+    if (reverse && zrangeResultHandlerStoreForwardable(handler, offset, limit))
+        reverse = 0;
 
     handler->beginResultEmission(handler, -1);
 
@@ -4369,6 +4413,11 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
     int reverse)
 {
     unsigned long rangelen = 0;
+
+    /* Same as genericZrangebyscoreCommand(): an un-LIMITed REV lex range
+     * stored into a zset is the forward walk over the same [min,max]. */
+    if (reverse && zrangeResultHandlerStoreForwardable(handler, offset, limit))
+        reverse = 0;
 
     handler->beginResultEmission(handler, -1);
 
