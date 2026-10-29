@@ -4219,9 +4219,11 @@ static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
 
 /* Return the members represented by one physical table slot, for the scan
  * of the group whose home buckets start at home_start. 'home_tags' holds the
- * home filters of its ZBT_SCAN_BUCKETS_PER_STEP buckets. A slot is skipped at
- * once when none of them holds its tag: the filters have no false negatives,
- * so none of its members has a home in the group.
+ * home filters of its ZBT_SCAN_BUCKETS_PER_STEP buckets, or is NULL when the
+ * caller knows that the slot cannot hold a member displaced from another
+ * group. A slot is skipped at once when none of the filters holds its tag:
+ * the filters have no false negatives, so none of its members has a home in
+ * the group.
  *
  * For a slot in the probe run after the group ('walk' nonzero), members are
  * also rehashed and only returned when their home bucket is in the group. A
@@ -4235,26 +4237,29 @@ static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
  *
  * When several members of a leaf share the slot's tag, their slots look alike,
  * so each such member is returned only by the first of them on its probe
- * path. Otherwise every slot would return all of them. */
-static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
-                                      zbtIndexTable *table,
-                                      zbtIndexBucket *bucket,
-                                      unsigned int slot_pos,
-                                      unsigned long home_start,
-                                      const uint64_t *home_tags,
-                                      int walk,
-                                      zbtreeScanFunction *fn,
-                                      void *privdata)
+ * path. Otherwise every slot would return all of them.
+ *
+ * Inlined so that each own-bucket loop gets a copy specialized for its
+ * constant arguments and most empty slots cost no call; the probe-run walk
+ * uses the out-of-line zbtIndexScanRunSlot(). */
+static inline __attribute__((always_inline))
+unsigned long zbtIndexScanSlot(const zbtreeSet *zs, zbtIndexTable *table,
+                               zbtIndexBucket *bucket, unsigned int slot_pos,
+                               unsigned long home_start,
+                               const uint64_t *home_tags, int walk,
+                               zbtreeScanFunction *fn, void *privdata)
 {
     uint8_t tag = zbtIndexTags(bucket) >> (slot_pos * 8);
     uint32_t id = zbtIndexGetId(table, bucket, slot_pos);
     if (tag == 0 || id == ZBT_INDEX_DELETED_ID) return 0;
-    uint64_t bits = zbtIndexTagBits(tag);
-    unsigned int h;
-    for (h = 0; h < ZBT_SCAN_BUCKETS_PER_STEP; h++) {
-        if ((home_tags[h] & bits) == bits) break;
+    if (home_tags) {
+        uint64_t bits = zbtIndexTagBits(tag);
+        unsigned int h;
+        for (h = 0; h < ZBT_SCAN_BUCKETS_PER_STEP; h++) {
+            if ((home_tags[h] & bits) == bits) break;
+        }
+        if (h == ZBT_SCAN_BUCKETS_PER_STEP) return 0;
     }
-    if (h == ZBT_SCAN_BUCKETS_PER_STEP) return 0;
     zbtScoreLeaf *leaf = id < zs->next_score_leaf_id ?
         zs->score_leaf_by_id[id] : NULL;
     if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) {
@@ -4314,6 +4319,19 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     return emitted;
 }
 
+/* zbtIndexScanSlot() for a slot in the probe run after a group. */
+static __attribute__((noinline))
+unsigned long zbtIndexScanRunSlot(const zbtreeSet *zs, zbtIndexTable *table,
+                                  zbtIndexBucket *bucket,
+                                  unsigned int slot_pos,
+                                  unsigned long home_start,
+                                  const uint64_t *home_tags,
+                                  zbtreeScanFunction *fn, void *privdata)
+{
+    return zbtIndexScanSlot(zs, table, bucket, slot_pos, home_start,
+                            home_tags, 1, fn, privdata);
+}
+
 /* Return every member represented in 'table' whose home bucket is one of the
  * buckets of scan group 'group'. Slots in the group's own buckets are returned
  * without rehashing their members, unless the group's home filters show that
@@ -4324,7 +4342,19 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
  * changes score, but the slot standing for a member is always reachable from
  * its home. A zero tag never returns to a table, so a run that was full when
  * such a member was added is still full and the walk below cannot stop before
- * reaching it. */
+ * reaching it.
+ *
+ * The same rule tells when the filter test can be left out. An insertion
+ * takes the first unused or deleted slot on the path from the member's home,
+ * so every bucket it passed had no unused slot then, and still has none. A
+ * member displaced into one of the group's buckets from another group passed
+ * the bucket just before the group, and every bucket of the group before its
+ * own. Once one of those buckets has an unused slot, no slot from there to
+ * the end of the group can hold such a member, and the test cannot skip
+ * anything. That is the usual case at low table fill. A deleted slot keeps
+ * its tag, so a tombstone never makes a bucket look less full than it was,
+ * and both tables of a resize are filled this way, so the rule holds for
+ * each of them. */
 static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
                                        zbtIndexTable *table, uint64_t group,
                                        zbtreeScanFunction *fn,
@@ -4352,14 +4382,25 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
         }
     }
 
+    unsigned long mask = table->size - 1;
+    int path_full = !zbtIndexTagMask(
+        zbtIndexTags(zbtIndexBucketAt(table, (home_start - 1) & mask)), 0);
     for (unsigned long index = home_start; index < home_end; index++) {
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
-        for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
-            emitted += zbtIndexScanSlot(zs, table, bucket, pos, home_start,
-                                        home_tags, 0, fn, privdata);
+        if (path_full) {
+            for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
+                emitted += zbtIndexScanSlot(zs, table, bucket, pos,
+                                            home_start, home_tags, 0, fn,
+                                            privdata);
+        } else {
+            for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
+                emitted += zbtIndexScanSlot(zs, table, bucket, pos,
+                                            home_start, NULL, 0, fn,
+                                            privdata);
+        }
+        if (zbtIndexTagMask(zbtIndexTags(bucket), 0)) path_full = 0;
     }
 
-    unsigned long mask = table->size - 1;
     unsigned long index = home_end - 1;
     unsigned long remaining = table->size - ZBT_SCAN_BUCKETS_PER_STEP;
     while (remaining-- &&
@@ -4368,9 +4409,9 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
         index = (index + 1) & mask;
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
         for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
-            emitted += zbtIndexScanSlot(zs, table, bucket, pos,
-                                        home_start, home_tags, 1, fn,
-                                        privdata);
+            emitted += zbtIndexScanRunSlot(zs, table, bucket, pos,
+                                           home_start, home_tags, fn,
+                                           privdata);
     }
     return emitted;
 }
