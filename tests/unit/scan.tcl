@@ -635,6 +635,67 @@ proc test_scan {type} {
         assert_equal 5000 [llength [lsort -unique $seen]]
     }
 
+    test "{$type} ZSCAN returns every member of densely filled B+ tree sets" {
+        # Member tables hold 8 slots per bucket and grow at 7/8 of their
+        # slots, so 3500, 7100 and 14000 members fill 512, 1024 and 2048
+        # buckets to 0.85-0.87, where many members sit outside their home
+        # bucket. 1000 members fill 256 buckets to about 0.5. A quarter of the
+        # members is deleted while the scan runs, leaving tombstones in the
+        # probe runs it walks.
+        foreach size {1000 3500 7100 14000} {
+            foreach count {1 10 1000} {
+                r del zset
+                set elements {}
+                set anchors 0
+                for {set j 0} {$j < $size} {incr j} {
+                    if {$j % 4 == 0} {
+                        lappend elements $j churn:$j
+                    } else {
+                        lappend elements $j anchor:$j
+                        incr anchors
+                    }
+                }
+                r zadd zset {*}$elements
+                assert_encoding btree zset
+
+                set cursor 0
+                set seen {}
+                set next 0
+                while 1 {
+                    lassign [r zscan zset $cursor count $count] cursor items
+                    foreach {member score} $items {
+                        if {[string match "anchor:*" $member]} {
+                            lappend seen $member
+                        }
+                    }
+                    if {$cursor == 0} break
+                    for {set j 0} {$j < 8 && $next < $size} {incr j} {
+                        r zrem zset churn:$next
+                        incr next 4
+                    }
+                }
+                assert_equal $anchors [llength [lsort -unique $seen]]
+            }
+
+            # Without writes, a complete scan repeats only the few members
+            # that a home filter false positive cannot rule out.
+            set cursor 0
+            set emitted 0
+            set seen {}
+            while 1 {
+                lassign [r zscan zset $cursor count 10] cursor items
+                foreach {member score} $items {
+                    lappend seen $member
+                    incr emitted
+                }
+                if {$cursor == 0} break
+            }
+            set distinct [llength [lsort -unique $seen]]
+            assert_equal [r zcard zset] $distinct
+            assert {($emitted - $distinct) * 40 < $distinct}
+        }
+    }
+
     test "{$type} SCAN guarantees check under write load" {
         r flushdb
         populate 100

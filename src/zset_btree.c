@@ -191,7 +191,9 @@
  * the probe run that follows them. At the usual table fill a group already
  * holds more members than the default COUNT. It must be a power of two no
  * larger than ZBT_INDEX_INITIAL_BUCKETS. Member hashes have 32 bits, so no
- * home bucket lies beyond ZBT_SCAN_MAX_GROUPS groups. */
+ * home bucket lies beyond ZBT_SCAN_MAX_GROUPS groups. zbtIndexScanSlot()
+ * tests the home filters of the whole group, not of one bucket, before it
+ * skips a slot as displaced from elsewhere, so any such value is safe. */
 #define ZBT_SCAN_BUCKETS_PER_STEP 4
 #define ZBT_SCAN_MAX_GROUPS \
     ((UINT64_C(1) << 32) / ZBT_SCAN_BUCKETS_PER_STEP)
@@ -1837,7 +1839,9 @@ static inline uint64_t zbtIndexTagBits(uint8_t tag) {
            (UINT64_C(1) << ((mixed >> 36) & 63));
 }
 
-/* Record one member in the missing-member filter of its home bucket. */
+/* Record one member in the missing-member filter of its home bucket. Bits are
+ * only ever added, until the table is replaced: lookups and ZSCAN rely on the
+ * filter having no false negatives. */
 static inline void zbtIndexRecordHomeTag(zbtIndexTable *table, uint32_t hash) {
     unsigned long home = hash & (table->size - 1);
     *zbtIndexHomeTagsAt(table, home) |= zbtIndexTagBits(zbtIndexTag(hash));
@@ -4207,8 +4211,22 @@ static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
     return found;
 }
 
-/* Return the members represented by one physical table slot. If home_end is
- * nonzero, only return members whose home bucket is in [home_start,home_end).
+/* Return the members represented by one physical table slot, for the scan
+ * of the group whose home buckets start at home_start. 'home_tags' holds the
+ * home filters of its ZBT_SCAN_BUCKETS_PER_STEP buckets. A slot is skipped at
+ * once when none of them holds its tag: the filters have no false negatives,
+ * so none of its members has a home in the group.
+ *
+ * For a slot in the probe run after the group ('walk' nonzero), members are
+ * also rehashed and only returned when their home bucket is in the group. A
+ * slot in the group's own buckets ('walk' zero) is returned without rehashing.
+ * Every member it can stand for lives in the group's buckets, so it has its
+ * home in the group, or was displaced from another group and is also returned
+ * by that group's walk. The filter test leaves only the latter out, except on
+ * a false positive, and SCAN allows repeating a member. Testing only the
+ * slot's own bucket would not do: a member displaced inside the group, or
+ * wrapped around the table into it, is returned by no walk.
+ *
  * When several members of a leaf share the slot's tag, their slots look alike,
  * so each such member is returned only by the first of them on its probe
  * path. Otherwise every slot would return all of them. */
@@ -4217,21 +4235,20 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
                                       zbtIndexBucket *bucket,
                                       unsigned int slot_pos,
                                       unsigned long home_start,
-                                      unsigned long home_end,
+                                      const uint64_t *home_tags,
+                                      int walk,
                                       zbtreeScanFunction *fn,
                                       void *privdata)
 {
     uint8_t tag = zbtIndexTags(bucket) >> (slot_pos * 8);
     uint32_t id = zbtIndexGetId(table, bucket, slot_pos);
     if (tag == 0 || id == ZBT_INDEX_DELETED_ID) return 0;
-    if (home_end) {
-        uint64_t bits = zbtIndexTagBits(tag);
-        unsigned long home;
-        for (home = home_start; home < home_end; home++) {
-            if ((*zbtIndexHomeTagsAt(table, home) & bits) == bits) break;
-        }
-        if (home == home_end) return 0;
+    uint64_t bits = zbtIndexTagBits(tag);
+    unsigned int h;
+    for (h = 0; h < ZBT_SCAN_BUCKETS_PER_STEP; h++) {
+        if ((home_tags[h] & bits) == bits) break;
     }
+    if (h == ZBT_SCAN_BUCKETS_PER_STEP) return 0;
     zbtScoreLeaf *leaf = id < zs->next_score_leaf_id ?
         zs->score_leaf_by_id[id] : NULL;
     if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) {
@@ -4262,10 +4279,11 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
          * which the scan of their home group always visits, since the table
          * does not change during a scan call. A single match needs no such
          * check. */
-        if (count > 1 || home_end) {
+        if (count > 1 || walk) {
             uint32_t hash = zbtScoreLeafHash(leaf, positions[i]);
             unsigned long home = hash & (table->size - 1);
-            if (home_end && (home < home_start || home >= home_end))
+            if (walk && (home < home_start ||
+                         home >= home_start + ZBT_SCAN_BUCKETS_PER_STEP))
                 continue;
             if (count > 1) {
                 zbtIndexBucket *first;
@@ -4286,19 +4304,21 @@ static unsigned long zbtIndexScanSlot(const zbtreeSet *zs,
     }
     /* With alike slots, one may return nothing: several members can share
      * the same first slot. */
-    serverAssert(home_end || count > 1 || emitted != 0);
+    serverAssert(walk || count > 1 || emitted != 0);
     return emitted;
 }
 
 /* Return every member represented in 'table' whose home bucket is one of the
  * buckets of scan group 'group'. Slots in the group's own buckets are returned
- * without rehashing their members. That may repeat a member displaced from an
- * earlier home, which SCAN allows. Members whose home is here but which were
- * displaced further are in the probe run after the group. Same-tag references
- * can exchange slots when a member changes score, but the slot standing for a
- * member is always reachable from its home. A zero tag never returns to a
- * table, so a run that was full when such a member was added is still full
- * and the walk below cannot stop before reaching it. */
+ * without rehashing their members, unless the group's home filters show that
+ * the slot holds a member displaced from another group, whose walk returns
+ * it. One the filters cannot rule out is repeated, which SCAN allows. Members
+ * whose home is here but which were displaced further are in the probe run
+ * after the group. Same-tag references can exchange slots when a member
+ * changes score, but the slot standing for a member is always reachable from
+ * its home. A zero tag never returns to a table, so a run that was full when
+ * such a member was added is still full and the walk below cannot stop before
+ * reaching it. */
 static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
                                        zbtIndexTable *table, uint64_t group,
                                        zbtreeScanFunction *fn,
@@ -4307,6 +4327,9 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
     unsigned long home_start = group * ZBT_SCAN_BUCKETS_PER_STEP;
     unsigned long home_end = home_start + ZBT_SCAN_BUCKETS_PER_STEP;
     unsigned long emitted = 0;
+    uint64_t home_tags[ZBT_SCAN_BUCKETS_PER_STEP];
+    for (unsigned long i = 0; i < ZBT_SCAN_BUCKETS_PER_STEP; i++)
+        home_tags[i] = *zbtIndexHomeTagsAt(table, home_start + i);
 
     /* Groups are visited in an order unrelated to memory, and each slot names
      * a different leaf. Start loading those leaves before reading them. */
@@ -4326,8 +4349,8 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
     for (unsigned long index = home_start; index < home_end; index++) {
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
         for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
-            emitted += zbtIndexScanSlot(zs, table, bucket, pos, 0, 0,
-                                        fn, privdata);
+            emitted += zbtIndexScanSlot(zs, table, bucket, pos, home_start,
+                                        home_tags, 0, fn, privdata);
     }
 
     unsigned long mask = table->size - 1;
@@ -4340,7 +4363,8 @@ static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
         for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
             emitted += zbtIndexScanSlot(zs, table, bucket, pos,
-                                        home_start, home_end, fn, privdata);
+                                        home_start, home_tags, 1, fn,
+                                        privdata);
     }
     return emitted;
 }
@@ -5038,6 +5062,58 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             if (seen[i] == 0) missed++;
         test_cond("Cursor-driven scan visits every live member at least once",
             missed == 0);
+        zfree(seen);
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree ZSCAN of a densely filled member table\n");
+
+    /* Near the maximum load many members are displaced from their home
+     * bucket, also within one scan group and around the end of the table.
+     * Own-bucket slots of such members are skipped only when the group's
+     * home filters rule them out, so every live member is still returned,
+     * and repeats stay rare. Deleting every fourth member leaves tombstones
+     * inside the probe runs that the walks have to cross. */
+    {
+        const int N = 7100;
+        zbtreeSet *zs = zbtreeCreate();
+        zbtTestPopulate(zs, N);
+        test_cond("Dense ZSCAN table holds 1024 buckets (fill above 0.86)",
+                  zs->member_index.size == 1024 && zs->member_rehash == NULL);
+        char buf[32];
+        int live = 0;
+        for (int i = 0; i < N; i++) {
+            if (i % 4 != 0) {
+                live++;
+                continue;
+            }
+            snprintf(buf, sizeof(buf), "member:%d", i);
+            sds ele = sdsnew(buf);
+            serverAssert(zbtreeDelete(zs, ele));
+            sdsfree(ele);
+        }
+
+        int *seen = zcalloc(sizeof(int) * N);
+        zbtScanTestPrivdata pd = {seen, N};
+        uint64_t cursor = 0;
+        unsigned long calls = 0;
+        do {
+            cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
+            serverAssert(++calls < 100000);
+        } while (cursor != 0);
+
+        int missed = 0, emitted = 0, wrong = 0;
+        for (int i = 0; i < N; i++) {
+            emitted += seen[i];
+            if (i % 4 == 0) wrong += seen[i] != 0;
+            else missed += seen[i] == 0;
+        }
+        test_cond("Dense ZSCAN returns every live member",
+                  missed == 0 && wrong == 0);
+        /* Without the filter test about 5% of the members are returned
+         * twice at this load; filter false positives repeat about 1%. */
+        test_cond("Dense ZSCAN rarely repeats a member",
+                  (emitted - live) * 40 < live);
         zfree(seen);
         zbtreeFree(zs);
     }
