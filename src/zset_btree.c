@@ -4159,14 +4159,8 @@ unsigned long zbtreeCountByScore(const zbtreeSet *zs, double min, int minex,
     return last > first ? last - first : 0;
 }
 
-/* Delete all elements inside a score interval.
- *
- * Empty intervals are common: inverted ones, ones that fall between two
- * members or past either end, and sliding-window trims such as
- * ZREMRANGEBYSCORE key -inf (cutoff when nothing has expired yet. Reject
- * them from the bounds, or from the first member inside the lower bound,
- * before computing any rank. Otherwise convert both bounds to ranks and use
- * the rank deletion path. */
+/* Delete a score range. Reject empty ranges from the bounds or the first
+ * matching member before computing ranks. Non-empty ranges use rank deletion. */
 unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
                                        double max, int maxex)
 {
@@ -4183,17 +4177,9 @@ unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
     double score = zbtScoreLeafScore(first.leaf, first.pos);
     if (maxex ? score >= max : score > max) return 0;
 
-    /* The range holds at least the first element. end_rank counts the
-     * elements not above the upper bound, using the same descent and score
-     * predicates as the seek above, so it includes that element and is
-     * greater than its rank. Only a tree whose inner max scores disagree
-     * with its leaves could break this, which the debug assertion catches.
-     * A release build deletes nothing for an inconsistent range.
-     *
-     * A non-empty range with a finite lower bound costs about 1% more per
-     * call than seeking both bounds did, measured when deleting a single
-     * element. Seeking the upper bound here, as before, measured no better
-     * for those ranges and worse for -inf trims, so the count stays. */
+    /* The first member is in range, so the upper insertion rank must be
+     * greater than its rank. Keep the guard in release builds too. Counting
+     * the upper rank favors -inf trims over seeking both bounds. */
     unsigned long first_rank = zbtScoreRank(first.leaf, first.pos);
     unsigned long end_rank = zbtScoreRankAfterMax(zs, max, maxex);
     debugServerAssert(end_rank > first_rank);
@@ -4201,16 +4187,10 @@ unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
     return zbtreeDeleteRangeByRank(zs, first_rank, end_rank - 1);
 }
 
-/* Delete the elements between the results of the two bound seeks of a
- * lexical interval (see zbtreeIteratorSeekLex()).
- *
- * As with scores, check the first member inside the lower bound against the
- * upper bound before seeking it. Both seeks search at the lowest score of
- * the set, so the upper seek can only stop at a member of that score or at
- * the first member after them. When the first member is above the upper
- * bound (or equal to an exclusive one), the upper seek's result therefore
- * has a lower rank, so the early return gives the same result as comparing
- * the two ranks, mixed scores included. */
+/* Delete a lexical range, preserving the two-seek behavior on mixed scores.
+ * Both seeks search at the set's lowest score. If the first lower-bound
+ * member is outside the upper bound, the upper seek would stop before it, so
+ * the range is empty without a second seek. */
 unsigned long zbtreeDeleteRangeByLex(zbtreeSet *zs, sds min, int minex,
                                      sds max, int maxex)
 {
