@@ -4354,7 +4354,10 @@ unsigned long zbtIndexScanRunSlot(const zbtreeSet *zs, zbtIndexTable *table,
  * anything. That is the usual case at low table fill. A deleted slot keeps
  * its tag, so a tombstone never makes a bucket look less full than it was,
  * and both tables of a resize are filled this way, so the rule holds for
- * each of them. */
+ * each of them. Leaving the test in where it was not needed only costs
+ * repeats, never a member: completeness rests on the probe-run walk below.
+ * In a table of one group the bucket before the group is its own last one,
+ * which only keeps the test on more often. */
 static unsigned long zbtIndexScanGroup(const zbtreeSet *zs,
                                        zbtIndexTable *table, uint64_t group,
                                        zbtreeScanFunction *fn,
