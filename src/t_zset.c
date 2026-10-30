@@ -2620,7 +2620,7 @@ typedef struct {
     int encoding;
     double weight;
     size_t oldsize;
-    int noscore; /* zuiNext() leaves val->score at 0. */
+    int noscore; /* Skip B+ tree score decoding in zuiNext(). */
 
     union {
         /* Set iterators. */

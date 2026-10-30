@@ -1410,9 +1410,9 @@ static_assert(ZBT_SHORT_MEMBER_MAX < ZBT_PACKED_SHORT,
               "short members must use the one byte length form");
 
 #ifdef ZBT_TAG_SIMD
-/* Return a mask with bit (i << ZBT_TAG_MATCH_SHIFT) set, possibly offset by
- * a constant smaller than that shift, for every p[i] equal to 'tag'. Callers
- * only use ctz(mask) >> ZBT_TAG_MATCH_SHIFT. */
+/* Return a mask for the lanes where p[i] equals 'tag'. Shifting the index
+ * of its lowest set bit right by ZBT_TAG_MATCH_SHIFT gives the first
+ * matching lane. */
 #if defined(ZBT_TAG_SIMD_NEON)
 #define ZBT_TAG_MATCH_SHIFT 2
 static inline uint64_t zbtTagMatch(const uint8_t *p, uint8_t tag) {
@@ -3544,6 +3544,7 @@ void zbtreeLookupStart(zbtreeSet *zs, uint32_t hash, zbtreeLookup *lookup) {
     lookup->absent = !zbtIndexHomeMayContain(table, hash);
 }
 
+#if defined(DEBUG_ASSERTIONS) || defined(REDIS_TEST)
 /* Return 0 if 'lookup' is known to be stale: the member index moved entries
  * since zbtreeLookupStart() (its revision changed), or the saved leaf was
  * freed or replaced, which deletions and leaf splits and merges do without
@@ -3558,6 +3559,7 @@ static inline int zbtreeLookupIsCurrent(zbtreeSet *zs,
            (lookup->leaf_id < zs->next_score_leaf_id &&
             zs->score_leaf_by_id[lookup->leaf_id] == lookup->leaf);
 }
+#endif
 
 #ifdef ZBT_TAG_SIMD
 /* Store the score at logical position 'pos' of a leaf in *score and return
@@ -6616,8 +6618,8 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
          * present and absent members along the way. Lengths 0 to 23 cover
          * the short member search and the general one. */
         zbtreeSet *zs = zbtreeCreate();
-        char probes[16][32];
-        size_t lens[16];
+        char probes[ZBT_SCORE_BATCH_SIZE][32];
+        size_t lens[ZBT_SCORE_BATCH_SIZE];
         uint64_t r = 0xabc;
         long bad = 0, in_resize = 0, saved = 0, hits = 0, reversed = 0;
         const int n = 6000;
@@ -6642,13 +6644,13 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
                     sdsfree(ele);
                 }
                 if (i % 7) continue;
-                for (int k = 0; k < 16; k++) {
+                for (int k = 0; k < ZBT_SCORE_BATCH_SIZE; k++) {
                     int m = (int)(zbtTestRand(&r) % (uint64_t)(n + n / 4));
                     lens[k] = zbtTestMember(probes[k], m, m % 24);
                 }
                 if (zs->member_rehash) in_resize++;
-                bad += zbtTestSplitLookups(zs, probes, lens, 16, &saved,
-                                           &hits);
+                bad += zbtTestSplitLookups(zs, probes, lens, ZBT_SCORE_BATCH_SIZE,
+                                           &saved, &hits);
             }
         }
         test_cond("Two step lookups match zbtreeScoreRawWithHash()",
