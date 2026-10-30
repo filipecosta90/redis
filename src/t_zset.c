@@ -1440,6 +1440,7 @@ size_t zsetAllocSize(const robj *o) {
  * If the hints are not known, and underestimation or 0 is suitable. 
  * We should never pass a negative value because it will convert to a very large unsigned number. */
 robj *zsetTypeCreate(size_t size_hint, size_t val_len_hint) {
+    /* zrangeRankRangeExceedsListpack() predicts this test for ZRANGESTORE. */
     if (size_hint <= server.zset_max_listpack_entries &&
         val_len_hint <= server.zset_max_listpack_value)
     {
@@ -3793,6 +3794,9 @@ static void zrangeResultFinalizeClient(zrange_result_handler *handler,
 static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
 {
     handler->dstobj = zsetTypeCreate(length >= 0 ? length : 0, 0);
+    /* zrangeGenericCommand() mirrors REV rank ranges relying on this. */
+    debugServerAssert(length <= (long)server.zset_max_listpack_entries ||
+                      handler->dstobj->encoding == OBJ_ENCODING_BTREE);
     /* The plain-rank ZRANGESTORE path (genericZrangebyrankCommand) computes
      * an exact result count here; BYSCORE/BYLEX pass length<0 and this is a
      * no-op, same as before this reserve existed. This length is
@@ -3817,7 +3821,9 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
      * reverse-order emission both keep the original, always-correct path.
      * The batch is created lazily on the first fast-path emit (the
      * destination may start as LISTPACK and convert mid-stream) and flushed
-     * once in zrangeResultFinalizeStore(). */
+     * once in zrangeResultFinalizeStore(). A REV rank range whose result
+     * does not fit in a listpack arrives here in forward order too, see
+     * zrangeGenericCommand(); REV score and lex ranges never do. */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
         if (!handler->append_batch)
             handler->append_batch = zbtreeAppendBatchCreate(handler->dstobj->ptr);
@@ -3921,6 +3927,21 @@ static void zrangeResultHandlerDirectionSet(zrange_result_handler *handler, int 
     handler->reverse = reverse;
 }
 
+/* Clamp the rank range [*start,*end] of a zset of llen elements, where
+ * negative indexes count from the end, and return its length, or 0 when the
+ * range is empty. */
+static long zsetSanitizeRankRange(long llen, long *start, long *end) {
+    if (*start < 0) *start = llen+*start;
+    if (*end < 0) *end = llen+*end;
+    if (*start < 0) *start = 0;
+
+    /* Invariant: start >= 0, so this test will be true when end < 0.
+     * The range is empty when start > end or start >= length. */
+    if (*start > *end || *start >= llen) return 0;
+    if (*end >= llen) *end = llen-1;
+    return (*end-*start)+1;
+}
+
 /* This command implements ZRANGE, ZREVRANGE. */
 void genericZrangebyrankCommand(zrange_result_handler *handler,
     robj *zobj, long start, long end, int withscores, int reverse) {
@@ -3930,22 +3951,13 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     long rangelen;
     size_t result_cardinality;
 
-    /* Sanitize indexes. */
     llen = zsetLength(zobj);
-    if (start < 0) start = llen+start;
-    if (end < 0) end = llen+end;
-    if (start < 0) start = 0;
-
-
-    /* Invariant: start >= 0, so this test will be true when end < 0.
-     * The range is empty when start > end or start >= length. */
-    if (start > end || start >= llen) {
+    rangelen = zsetSanitizeRankRange(llen, &start, &end);
+    if (rangelen == 0) {
         handler->beginResultEmission(handler, 0);
         handler->finalizeResultEmission(handler, 0);
         return;
     }
-    if (end >= llen) end = llen-1;
-    rangelen = (end-start)+1;
     result_cardinality = rangelen;
 
     handler->beginResultEmission(handler, rangelen);
@@ -4516,6 +4528,16 @@ void zrevrangebylexCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_LEX, ZRANGE_DIRECTION_REVERSE);
 }
 
+/* Return 1 if the rank range [start,end] of zobj has more elements than a
+ * listpack may hold, so a ZRANGESTORE destination for it is created as a
+ * B+ tree. zrangeResultBeginStore() passes the result length to
+ * zsetTypeCreate() with a value length hint of 0, so this must match the
+ * size test there. */
+static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start, long end) {
+    long len = zsetSanitizeRankRange(zsetLength(zobj), &start, &end);
+    return (unsigned long)len > server.zset_max_listpack_entries;
+}
+
 /**
  * This function handles ZRANGE and ZRANGESTORE, and also the deprecated
  * Z[REV]RANGE[BYSCORE|BYLEX] commands.
@@ -4630,7 +4652,6 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
     if (opt_withscores || store) {
         zrangeResultHandlerScoreEmissionEnable(handler);
     }
-    zrangeResultHandlerDirectionSet(handler, direction == ZRANGE_DIRECTION_REVERSE);
 
     /* Step 3: Lookup the key and get the range. */
     kvobj *zobj = lookupKeyRead(c->db, key);
@@ -4645,6 +4666,22 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
     }
 
     if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
+
+    /* Step 3b: ZRANGESTORE of a REV rank range stores the same elements as
+     * the mirrored forward range. When the destination will be a B+ tree,
+     * walk forward so it is filled through the append path. Smaller results
+     * keep the REV walk into a listpack destination. Score and lex ranges
+     * are never mirrored. */
+    if (store && rangetype == ZRANGE_RANK &&
+        direction == ZRANGE_DIRECTION_REVERSE &&
+        zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end)) {
+        /* REV index i is forward index -1-i, which cannot overflow. */
+        long tmp = opt_start;
+        opt_start = -1 - opt_end;
+        opt_end = -1 - tmp;
+        direction = ZRANGE_DIRECTION_FORWARD;
+    }
+    zrangeResultHandlerDirectionSet(handler, direction == ZRANGE_DIRECTION_REVERSE);
 
     /* Step 4: Pass this to the command-specific handler. The listpack and
      * B+tree range readers never resize zobj (no member index lookup or rehash
