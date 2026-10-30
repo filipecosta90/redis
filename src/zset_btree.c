@@ -2034,9 +2034,11 @@ static inline void zbtIndexRecordHomeTag(zbtIndexTable *table, uint32_t hash) {
     *zbtIndexHomeTagsAt(table, home) |= zbtIndexTagBits(zbtIndexTag(hash));
 }
 
-/* Return zero only when the home bucket proves that a hash is absent. */
-static inline int zbtIndexHomeMayContain(const zbtIndexTable *table,
-                                         uint32_t hash)
+/* Return zero only when the home bucket proves that a hash is absent.
+ * Always inlined, so that zbtreeLookupStart() makes no call except on the
+ * assertion path. */
+static inline __attribute__((always_inline))
+int zbtIndexHomeMayContain(const zbtIndexTable *table, uint32_t hash)
 {
     unsigned long home = hash & (table->size - 1);
     uint64_t bits = zbtIndexTagBits(zbtIndexTag(hash));
@@ -3533,6 +3535,17 @@ void zbtreeLookupStart(zbtreeSet *zs, uint32_t hash, zbtreeLookup *lookup) {
     lookup->absent = !zbtIndexHomeMayContain(table, hash);
 }
 
+/* Store the score at logical position 'pos' of a leaf in *score and return
+ * 1. Out of line, so that zbtreeLookupFinish() makes only tail calls and a
+ * hit that wants no score (ZINTERCARD) does not touch the stack. */
+static __attribute__((noinline))
+int zbtScoreLeafStoreScore(zbtScoreLeaf *leaf, unsigned int pos,
+                           double *score)
+{
+    *score = zbtScoreLeafScore(leaf, pos);
+    return 1;
+}
+
 /* zbtreeLookupFinish() for the members and leaves the short search does not
  * take: check the saved leaf, then fall back to the full search. */
 static __attribute__((noinline))
@@ -3561,9 +3574,13 @@ int zbtreeLookupFinish(zbtreeSet *zs, const zbtreeLookup *lookup,
 #ifdef ZBT_TAG_SIMD
     zbtScoreLeaf *leaf = lookup->leaf;
     if (leaf) {
+        unsigned int pos;
         int found = zbtScoreLeafFindShort(leaf, zbtLeafTag(lookup->hash),
-                                          ele, elelen, score, NULL);
-        if (found > 0) return 1;
+                                          ele, elelen, NULL, &pos);
+        if (found > 0) {
+            if (score == NULL) return 1;
+            return zbtScoreLeafStoreScore(leaf, pos, score);
+        }
         if (found == 0)
             return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen,
                                           score);
