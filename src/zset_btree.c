@@ -372,9 +372,16 @@ static inline uint16_t *zbtScoreLeafOffsets(zbtScoreLeaf *leaf) {
         zbtScoreLeafScoreBytes(leaf->n.count, leaf->score_bits));
 }
 
+/* Return the hash-tag array that follows the 'count' offsets at 'offsets'. */
+static inline uint8_t *zbtScoreLeafTagsAfter(uint16_t *offsets,
+                                             unsigned int count)
+{
+    return (uint8_t *)(offsets + count);
+}
+
 /* Return the hash-tag array that follows the offsets. */
 static inline uint8_t *zbtScoreLeafHashTags(zbtScoreLeaf *leaf) {
-    return (uint8_t *)(zbtScoreLeafOffsets(leaf) + leaf->n.count);
+    return zbtScoreLeafTagsAfter(zbtScoreLeafOffsets(leaf), leaf->n.count);
 }
 
 /* Searching a leaf reads the header, then the hash tags, then one offset,
@@ -1465,8 +1472,10 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
     if (elelen > ZBT_SHORT_MEMBER_MAX || count < ZBT_TAG_SCAN_MIN_COUNT)
         return -1;
 
+    /* Derive the tags from 'offsets', which the loop needs anyway, instead
+     * of recomputing the leaf layout. */
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
-    uint8_t *tags = zbtScoreLeafHashTags(leaf);
+    uint8_t *tags = zbtScoreLeafTagsAfter(offsets, count);
     unsigned int start = 0, last = count - ZBT_TAG_SCAN_WIDTH;
     for (;;) {
         uint64_t matches = zbtTagMatch(tags + start, tag);
