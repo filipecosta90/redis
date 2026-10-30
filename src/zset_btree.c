@@ -3610,6 +3610,9 @@ int zbtreeLookupFinish(zbtreeSet *zs, const zbtreeLookup *lookup,
                        const unsigned char *ele, size_t elelen, double *score)
 {
     debugServerAssert(zbtreeLookupIsCurrent(zs, lookup));
+    /* Index entries moved since Start: do not trust what it saved. */
+    if (lookup->revision != zs->member_revision)
+        return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen, score);
     if (lookup->absent) return 0;
 #ifdef ZBT_TAG_SIMD
     zbtScoreLeaf *leaf = lookup->leaf;

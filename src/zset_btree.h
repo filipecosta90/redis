@@ -89,8 +89,9 @@ void zbtreePrefetchMember(zbtreeSet *zs, uint32_t hash);
 /* The same lookup in two steps, so that consecutive lookups in one set can
  * overlap: zbtreeLookupStart() only reads the member index, and
  * zbtreeLookupFinish() returns what zbtreeScoreRawWithHash() would. The set
- * must not change in between; builds with debug assertions check that the
- * member index did not move entries and the saved leaf is still in place.
+ * must not change in between. Finish does the full lookup if the member
+ * index moved entries; builds with debug assertions also check that the
+ * saved leaf is still in place.
  * Callers must not read the fields, which belong to zset_btree.c. */
 typedef struct {
     void *leaf;
