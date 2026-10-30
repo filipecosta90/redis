@@ -3536,8 +3536,8 @@ void zbtreeLookupStart(zbtreeSet *zs, uint32_t hash, zbtreeLookup *lookup) {
 }
 
 /* Store the score at logical position 'pos' of a leaf in *score and return
- * 1. Out of line, so that zbtreeLookupFinish() makes only tail calls and a
- * hit that wants no score (ZINTERCARD) does not touch the stack. */
+ * 1. Out of line, so a hit that wants no score (ZINTERCARD) skips the score
+ * decode and the hit path stays small enough to need no stack frame. */
 static __attribute__((noinline))
 int zbtScoreLeafStoreScore(zbtScoreLeaf *leaf, unsigned int pos,
                            double *score)
