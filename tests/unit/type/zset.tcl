@@ -1080,6 +1080,46 @@ start_server {tags {"zset"}} {
             r del zintercardset{t} zintercardstr{t}
         }
 
+        test "ZINTER/ZINTERCARD probing a hashtable set - $encoding" {
+            # Short and integer members (kept in a listpack with that
+            # encoding), and members around the size of the stack buffer
+            # of the set lookup and past it (always a B+ tree here).
+            set short {a 12345 -3 abcdefgh}
+            set long {}
+            foreach len {123 124 125 300} {
+                lappend long [string repeat x $len]
+            }
+            r del zprobes{t} zprobel{t} sprobe{t}
+            set i 0
+            foreach m $short {
+                r zadd zprobes{t} [incr i] $m
+                r zadd zprobes{t} [incr i] "$m-miss"
+            }
+            set i 0
+            foreach m $long {
+                r zadd zprobel{t} [incr i] $m
+                r zadd zprobel{t} [incr i] "$m-miss"
+            }
+            r sadd sprobe{t} {*}$short {*}$long
+            for {set j 0} {$j < 200} {incr j} {r sadd sprobe{t} filler$j}
+            assert_encoding hashtable sprobe{t}
+
+            assert_equal 4 [r zintercard 2 zprobes{t} sprobe{t}]
+            assert_equal 2 [r zintercard 2 zprobes{t} sprobe{t} limit 2]
+            assert_equal 4 [r zintercard 2 zprobel{t} sprobe{t}]
+            assert_equal 4 [r zintercard 3 zprobel{t} sprobe{t} zprobel{t}]
+            assert_equal {a 2 12345 4 -3 6 abcdefgh 8} \
+                [r zinter 2 zprobes{t} sprobe{t} withscores]
+            assert_equal {a 1 12345 3 -3 5 abcdefgh 7} \
+                [r zinter 2 zprobes{t} sprobe{t} weights 1 0 withscores]
+            assert_equal [list [lindex $long 0] 3 [lindex $long 1] 5 \
+                               [lindex $long 2] 7 [lindex $long 3] 9] \
+                [r zinter 2 zprobel{t} sprobe{t} weights 1 2 withscores]
+            assert_equal 4 [r zinterstore zprobed{t} 2 sprobe{t} zprobel{t}]
+            assert_equal $long [r zrange zprobed{t} 0 -1]
+            r del zprobes{t} zprobel{t} sprobe{t} zprobed{t}
+        }
+
         test "ZINTER RESP3 - $encoding" {
             r hello 3
             assert_equal {{b 3.0} {c 5.0}} [r zinter 2 zseta{t} zsetb{t} withscores]
