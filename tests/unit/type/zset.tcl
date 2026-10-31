@@ -1780,6 +1780,38 @@ start_server {tags {"zset"}} {
         rename zbt_check {}
     }
 
+    test {ZINTER and ZINTERCARD with a few members read ahead of a B+ tree} {
+        # The lookups in a B+ tree input run up to two members of the
+        # smallest input ahead. Cover inputs that end before, at and after
+        # that depth, with and without a LIMIT that stops early.
+        set old_entries [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del zbtra-big{t}
+        for {set i 0} {$i < 300} {incr i} {r zadd zbtra-big{t} $i m$i}
+        assert_encoding btree zbtra-big{t}
+        foreach n {1 2 3 4} {
+            r del zbtra-small{t}
+            for {set i 0} {$i < $n} {incr i} {
+                # Members m0, m2, ... are in the big set, x1, x3, ... are not.
+                if {$i % 2} {set m x$i} else {set m m$i}
+                r zadd zbtra-small{t} [expr {$i + 1000}] $m
+            }
+            assert_encoding btree zbtra-small{t}
+            set hits [expr {($n + 1) / 2}]
+            assert_equal $hits [r zintercard 2 zbtra-small{t} zbtra-big{t}]
+            assert_equal 1 [r zintercard 2 zbtra-small{t} zbtra-big{t} limit 1]
+            set zbtra_expected {}
+            for {set i 0} {$i < $n} {incr i 2} {
+                lappend zbtra_expected m$i [expr {2 * $i + 1000}]
+            }
+            assert_equal $zbtra_expected \
+                [r zinter 2 zbtra-small{t} zbtra-big{t} withscores]
+        }
+        r del zbtra-big{t} zbtra-small{t}
+        unset zbtra_expected
+        r config set zset-max-listpack-entries $old_entries
+    }
+
     test "ZPOP/ZMPOP against wrong type" {
         r set foo{t} bar
         assert_error "*WRONGTYPE*" {r zpopmin foo{t}}

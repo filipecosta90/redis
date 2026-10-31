@@ -3487,28 +3487,37 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
              * hash to share: hash it once per member only from three. */
             int reuse_hash = setnum > 2;
             zuiInitIterator(&src[0]);
-            /* A B+ tree lookup is a long chain of dependent loads, and with
-             * few inputs nothing else overlaps it. So read one member of
-             * src[0] ahead and start its lookup in src[1] before finishing
-             * the current one (see zbtreeLookupStart()). zuiNext() values
-             * point into the iterated object or into their own _buf, never
-             * into the iterator, so the value read ahead stays valid. */
+            /* A B+ tree lookup is a long chain of dependent loads: the
+             * member hash, its index bucket, the leaf ID, the leaf and the
+             * record. With few inputs nothing else overlaps it, and the
+             * reorder window of a core does not always reach across a whole
+             * iteration. So pipeline the lookups in src[1] over three
+             * members of src[0]: hash the member after next and request its
+             * index bucket, start the lookup of the next member, whose bucket
+             * was requested one iteration earlier, and only then finish the
+             * current one (see zbtreeLookupStart()). zuiNext() values point
+             * into the iterated object or into their own _buf, never into
+             * the iterator, so the values read ahead stay valid. */
             int ahead = setnum > 1 && src[1].type == OBJ_ZSET &&
                         src[1].encoding == OBJ_ENCODING_BTREE &&
                         src[1].subject != src[0].subject;
-            zsetopval vals[2];
+            zsetopval vals[3];
             zbtreeLookup lookups[2];
-            zsetopval *cur = &vals[0], *next = &vals[1];
+            zsetopval *cur = &vals[0], *next = &vals[1], *later = &vals[2];
             zbtreeLookup *curlookup = &lookups[0], *nextlookup = &lookups[1];
             /* zuiNext() reads only 'flags' before it clears a value. */
-            vals[0].flags = vals[1].flags = 0;
+            vals[0].flags = vals[1].flags = vals[2].flags = 0;
             int more = zuiNext(&src[0], cur);
+            int more_next = more && zuiNext(&src[0], next);
             if (more && ahead) zuiLookupStart(&src[1], cur, curlookup);
+            if (more_next && ahead) zuiPrefetchFind(&src[1], next);
             while (more) {
                 double score, value;
 
-                more = zuiNext(&src[0], next);
-                if (more && ahead) zuiLookupStart(&src[1], next, nextlookup);
+                int more_later = more_next && zuiNext(&src[0], later);
+                if (more_later && ahead) zuiPrefetchFind(&src[1], later);
+                if (more_next && ahead)
+                    zuiLookupStart(&src[1], next, nextlookup);
 
                 score = zuiWeightedScore(cur->score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
@@ -3551,7 +3560,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     cardinality++;
 
                     /* We stop the searching after reaching the limit. The
-                     * value read ahead is released below. */
+                     * values read ahead are released below. */
                     if (limit && cardinality >= (unsigned long)limit) break;
                 } else if (j == setnum) {
                     tmp = zuiNewSdsFromValue(cur);
@@ -3562,15 +3571,19 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     sdsfree(tmp); /* zslInsert copied it, we can free our copy */
                 }
 
-                zsetopval *swap = cur;
+                zsetopval *done = cur;
                 cur = next;
-                next = swap;
+                next = later;
+                later = done;
                 zbtreeLookup *swaplookup = curlookup;
                 curlookup = nextlookup;
                 nextlookup = swaplookup;
+                more = more_next;
+                more_next = more_later;
             }
             zuiDiscardDirtyValue(&vals[0]);
             zuiDiscardDirtyValue(&vals[1]);
+            zuiDiscardDirtyValue(&vals[2]);
             zuiClearIterator(&src[0]);
         }
     } else if (op == SET_OP_UNION) {
