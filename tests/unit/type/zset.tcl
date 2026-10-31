@@ -1058,6 +1058,28 @@ start_server {tags {"zset"}} {
             assert_equal 2 [r zintercard 2 zseta{t} zsetb{t} limit 10]
         }
 
+        test "ZINTERCARD with a single distinct input - $encoding" {
+            assert_equal 3 [r zcard zseta{t}]
+            assert_equal 3 [r zintercard 1 zseta{t}]
+            assert_equal 3 [r zintercard 1 zseta{t} limit 0]
+            assert_equal 2 [r zintercard 1 zseta{t} limit 2]
+            assert_equal 3 [r zintercard 1 zseta{t} limit 3]
+            assert_equal 3 [r zintercard 1 zseta{t} limit 10]
+            assert_equal 3 [r zintercard 3 zseta{t} zseta{t} zseta{t}]
+            assert_equal 1 [r zintercard 2 zseta{t} zseta{t} limit 1]
+            assert_equal 0 [r zintercard 1 zsetnokey{t}]
+            assert_equal 0 [r zintercard 2 zsetnokey{t} zsetnokey{t} limit 1]
+
+            r del zintercardset{t}
+            r sadd zintercardset{t} a b c d
+            assert_equal 4 [r zintercard 1 zintercardset{t}]
+            assert_equal 3 [r zintercard 2 zintercardset{t} zintercardset{t} limit 3]
+            r set zintercardstr{t} foo
+            assert_error "WRONGTYPE*" {r zintercard 1 zintercardstr{t}}
+            assert_error "ERR LIMIT*" {r zintercard 1 zseta{t} limit -1}
+            r del zintercardset{t} zintercardstr{t}
+        }
+
         test "ZINTER RESP3 - $encoding" {
             r hello 3
             assert_equal {{b 3.0} {c 5.0}} [r zinter 2 zseta{t} zsetb{t} withscores]
@@ -1662,6 +1684,8 @@ start_server {tags {"zset"}} {
                 {zintercard 2 A B} {zintercard 2 A B limit 1}
                 {zintercard 2 A B limit 7} {zintercard 2 B A limit 0}
                 {zintercard 3 A B C} {zintercard 2 A A} {zintercard 3 A B A}
+                {zintercard 1 A} {zintercard 1 R limit 5} {zintercard 2 R R limit 0}
+                {zintercard 1 zbtx-u{t}} {zinter 1 A withscores}
                 {zintercard 2 zbtx-s{t} B} {zintercard 2 zbtx-u{t} A}
                 {zintercard 3 zbtx-u{t} A B} {zintercard 2 zbtx-i{t} A}
                 {zinter 2 A B withscores} {zinter 2 B A}

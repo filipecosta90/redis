@@ -3465,8 +3465,19 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     }
 
     if (op == SET_OP_INTER) {
-        /* Skip everything if the smallest input is empty. */
-        if (zuiLength(&src[0]) > 0) {
+        /* When every input is the same object (e.g. ZINTERCARD 1 key), the
+         * intersection is that input, so its cardinality is the input's own,
+         * capped by the limit. There is no need to iterate its members. */
+        int single_input = 1;
+        for (j = 1; j < setnum && single_input; j++)
+            single_input = src[j].subject == src[0].subject;
+
+        if (cardinality_only && single_input) {
+            cardinality = zuiLength(&src[0]);
+            if (limit && cardinality > (unsigned long)limit)
+                cardinality = limit;
+        } else if (zuiLength(&src[0]) > 0) {
+            /* Skip everything if the smallest input is empty. */
             /* Precondition: as src[0] is non-empty and the inputs are ordered
              * by size, all src[i > 0] are non-empty too. */
             src[0].noscore = cardinality_only;
