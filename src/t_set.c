@@ -120,6 +120,7 @@ struct _setTypeOps {
 
 /* Returns the ops of the given set encoding (OBJ_ENCODING_*). */
 static inline const setTypeOps *setTypeGetOps(int encoding);
+static int htIsMember(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
 
 /* One instance per encoding, defined in the section of the encoding below. */
 extern const setTypeOps setTypeOpsIntset;
@@ -400,6 +401,13 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
         str = tmpbuf;
         str_is_sds = 0;
     }
+
+    /* A hashtable without member expirations is probed directly rather than
+     * through the ops table: the set intersection commands call this for
+     * every member of the smallest set against each of the other sets, and a
+     * direct call lets the lookup be inlined here. */
+    if (set->encoding == OBJ_ENCODING_HT && !setHashtableHasExpire(set))
+        return htIsMember(set, str, len, llval, str_is_sds);
 
     const setTypeOps *ops = setTypeGetOps(set->encoding);
     if (unlikely(setTypeHasExpireSupport(set))) {
