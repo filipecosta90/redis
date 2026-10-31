@@ -188,11 +188,15 @@
     (ZBT_EXTERNAL_POINTER_OFFSET + sizeof(void *))
 
 /* ZSCAN visits groups of this many adjacent buckets, which share one walk of
- * the probe run that follows them. At the usual table fill a group already
- * holds more members than the default COUNT. It must be a power of two no
- * larger than ZBT_INDEX_INITIAL_BUCKETS. Member hashes have 32 bits, so no
- * home bucket lies beyond ZBT_SCAN_MAX_GROUPS groups. */
-#define ZBT_SCAN_BUCKETS_PER_STEP 4
+ * the probe run that follows them. A call always finishes whole groups, so
+ * the group size is the granularity at which COUNT is honored. Two buckets
+ * hold 7 to 14 members across the table's load range, so the default COUNT
+ * of 10 returns about one group, close to what a dictionary scan returns.
+ * Four buckets would return 14 to 28 members, twice what was asked for.
+ * It must be a power of two no larger than ZBT_INDEX_INITIAL_BUCKETS. Member
+ * hashes have 32 bits, so no home bucket lies beyond ZBT_SCAN_MAX_GROUPS
+ * groups. */
+#define ZBT_SCAN_BUCKETS_PER_STEP 2
 #define ZBT_SCAN_MAX_GROUPS \
     ((UINT64_C(1) << 32) / ZBT_SCAN_BUCKETS_PER_STEP)
 
@@ -6142,15 +6146,50 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         }
         test_cond("ZSCAN accepts any cursor and still finishes", ok);
 
-        /* The smallest table has a single group: one call returns all. */
+        /* COUNT is a hint, but a call finishes whole groups, so the group
+         * size bounds how far a reply overshoots it. A full scan with the
+         * default COUNT must stay near COUNT members per call. */
+        {
+            int *seen = zcalloc(sizeof(int) * 5000);
+            zbtScanTestPrivdata pd = {seen, 5000};
+            uint64_t cursor = 0;
+            unsigned long calls = 0, returned = 0;
+            int missed = 0;
+            do {
+                cursor = zbtreeScan(zs, cursor, 10, zbtScanTestMarkSeen, &pd);
+                calls++;
+            } while (cursor != 0 && calls <= groups);
+            for (int i = 0; i < 5000; i++) {
+                returned += seen[i];
+                if (seen[i] == 0) missed++;
+            }
+            printf("    COUNT 10: %lu calls, %.2f members per call, "
+                   "%.2f%% duplicates\n", calls, (double)returned / calls,
+                   100.0 * (returned - 5000) / 5000);
+            test_cond("ZSCAN COUNT 10 returns about COUNT members per call",
+                      cursor == 0 && missed == 0 &&
+                      returned < calls * 20);
+            zfree(seen);
+        }
+
+        /* The smallest table has a fixed number of groups, and a scan with
+         * COUNT 1 ends after visiting each of them once. */
         zbtreeSet *tiny = zbtreeCreate();
         zbtTestPopulate(tiny, 3);
         int *seen = zcalloc(sizeof(int) * 3);
         zbtScanTestPrivdata pd = {seen, 3};
-        uint64_t cursor = zbtreeScan(tiny, 0, 1, zbtScanTestMarkSeen, &pd);
-        test_cond("ZSCAN of a one-group table finishes in one call",
+        uint64_t cursor = 0;
+        unsigned long tiny_calls = 0;
+        do {
+            cursor = zbtreeScan(tiny, cursor, 1, zbtScanTestMarkSeen, &pd);
+            tiny_calls++;
+        } while (cursor != 0 && tiny_calls <= zbtTestScanGroups(tiny));
+        test_cond("ZSCAN of the smallest table finishes within its groups",
                   tiny->member_index.size == ZBT_INDEX_INITIAL_BUCKETS &&
-                  cursor == 0 && seen[0] && seen[1] && seen[2]);
+                  zbtTestScanGroups(tiny) == ZBT_INDEX_INITIAL_BUCKETS /
+                                             ZBT_SCAN_BUCKETS_PER_STEP &&
+                  cursor == 0 && tiny_calls <= zbtTestScanGroups(tiny) &&
+                  seen[0] && seen[1] && seen[2]);
         zfree(seen);
         zbtreeFree(tiny);
 
