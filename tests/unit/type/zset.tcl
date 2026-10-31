@@ -1120,6 +1120,39 @@ start_server {tags {"zset"}} {
             r del zprobes{t} zprobel{t} sprobe{t} zprobed{t}
         }
 
+        test "ZINTER/ZINTERCARD iterating a large B+ tree input - $encoding" {
+            # More members than fit in one leaf, and than one batch of
+            # members read ahead from it. Members inserted with decreasing
+            # scores make leaves whose arrays are stored in reverse.
+            r del zbig{t} zother{t}
+            for {set i 1} {$i <= 400} {incr i} {
+                set k [expr {$i <= 200 ? 201 - $i : $i}]
+                r zadd zbig{t} $k m$k
+            }
+            set expected {}
+            for {set k 1} {$k <= 400} {incr k} {
+                if {$k % 3 == 0} {
+                    r zadd zother{t} [expr {$k * 10}] m$k
+                    lappend expected m$k [expr {$k * 11}]
+                } else {
+                    r zadd zother{t} $k other$k
+                }
+            }
+            r zadd zother{t} 1000000 extra
+            set n [expr {[llength $expected] / 2}]
+            assert_equal $n [r zintercard 2 zbig{t} zother{t}]
+            foreach limit {1 2 15 16 17 18 32 95 96 97 132 133 134 1000} {
+                assert_equal [expr {min($limit, $n)}] \
+                    [r zintercard 2 zbig{t} zother{t} limit $limit]
+                assert_equal [expr {min($limit, $n)}] \
+                    [r zintercard 3 zbig{t} zother{t} zbig{t} limit $limit]
+            }
+            assert_equal $expected [r zinter 2 zbig{t} zother{t} withscores]
+            assert_equal $n [r zinterstore zbigdst{t} 2 zother{t} zbig{t}]
+            assert_equal $expected [r zrange zbigdst{t} 0 -1 withscores]
+            r del zbig{t} zother{t} zbigdst{t}
+        }
+
         test "ZINTER RESP3 - $encoding" {
             r hello 3
             assert_equal {{b 3.0} {c 5.0}} [r zinter 2 zseta{t} zsetb{t} withscores]

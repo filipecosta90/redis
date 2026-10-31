@@ -2892,6 +2892,53 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
     return 1;
 }
 
+/* Members of a B+ tree input decoded a leaf at a time, see
+ * zbtreeIteratorNextBatch(). */
+#define ZUI_BATCH_SIZE 16
+typedef struct {
+    zbtreeIteratorElement ele[ZUI_BATCH_SIZE];
+    unsigned int pos, len;
+} zuiBatch;
+
+/* zuiNext() for a B+ tree input, taking members from 'batch'. A caller that
+ * stops early (LIMIT) passes in 'remaining' how many more members it can use
+ * besides the one it reads ahead, so a refill does not decode members it
+ * never reads. Zero means no bound. */
+static inline int zuiNextBatched(zsetopsrc *op, zsetopval *val,
+                                 zuiBatch *batch, unsigned long remaining)
+{
+    if (batch->pos == batch->len) {
+        unsigned int want = ZUI_BATCH_SIZE;
+        if (remaining && remaining < ZUI_BATCH_SIZE) want = remaining + 1;
+        batch->len = zbtreeIteratorNextBatch(&op->iter.zset.bt.iter, 1,
+                                             batch->ele, want, !op->noscore);
+        batch->pos = 0;
+        if (batch->len == 0) return 0;
+    }
+    const zbtreeIteratorElement *e = &batch->ele[batch->pos++];
+
+    /* Set what zuiNext() would. The fields it zeroes and that are not set
+     * here are read only once a flag says they are valid. */
+    zuiDiscardDirtyValue(val);
+    val->flags = 0;
+    val->ele = NULL;
+    val->estr = (unsigned char *)e->ele;
+    val->elen = e->len;
+    val->ell = 0;
+    val->score = op->noscore ? 0 : e->score;
+    return 1;
+}
+
+/* zuiNext() for the input ZINTER iterates, using zuiNextBatched() when
+ * 'batch' is not NULL. 'limit' and 'cardinality' are those of ZINTERCARD. */
+static inline int zuiInterNext(zsetopsrc *op, zsetopval *val, zuiBatch *batch,
+                               long limit, unsigned long cardinality)
+{
+    if (batch == NULL) return zuiNext(op, val);
+    return zuiNextBatched(op, val, batch,
+                          limit ? (unsigned long)limit - cardinality : 0);
+}
+
 int zuiLongLongFromValue(zsetopval *val) {
     if (!(val->flags & OPVAL_DIRTY_LL)) {
         val->flags |= OPVAL_DIRTY_LL;
@@ -3500,14 +3547,27 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zbtreeLookup lookups[2];
             zsetopval *cur = &vals[0], *next = &vals[1];
             zbtreeLookup *curlookup = &lookups[0], *nextlookup = &lookups[1];
+            /* Walking a B+ tree one member per zuiNext() call decodes the
+             * leaf layout for every member, so read src[0] a leaf at a time
+             * instead. With LIMIT, decode no further than the members the
+             * limit can still use, plus the one read ahead. */
+            zuiBatch batchbuf;
+            zuiBatch *batch = NULL;
+            if (src[0].type == OBJ_ZSET &&
+                src[0].encoding == OBJ_ENCODING_BTREE)
+            {
+                batch = &batchbuf;
+                batch->pos = batch->len = 0;
+            }
             /* zuiNext() reads only 'flags' before it clears a value. */
             vals[0].flags = vals[1].flags = 0;
-            int more = zuiNext(&src[0], cur);
+            int more = zuiInterNext(&src[0], cur, batch, limit, cardinality);
             if (more && ahead) zuiLookupStart(&src[1], cur, curlookup);
             while (more) {
                 double score, value;
 
-                more = zuiNext(&src[0], next);
+                more = zuiInterNext(&src[0], next, batch, limit,
+                                    cardinality);
                 if (more && ahead) zuiLookupStart(&src[1], next, nextlookup);
 
                 score = zuiWeightedScore(cur->score, src[0].weight, aggregate);

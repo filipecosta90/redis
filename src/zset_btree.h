@@ -153,6 +153,18 @@ int zbtreeIteratorStart(const zbtreeSet *zs, int reverse,
                         zbtreeIterator *iter);
 int zbtreeIteratorNext(zbtreeIterator *iter, int reverse,
                        const unsigned char **ele, size_t *len, double *score);
+/* Return up to 'max' consecutive elements of the iterator's current leaf,
+ * as zbtreeIteratorNext() would one at a time, and advance past them. Fewer
+ * are returned at the end of a leaf, and zero at the end of the set. With a
+ * zero 'withscores' the scores are not decoded and are left unset. */
+typedef struct {
+    const unsigned char *ele;
+    size_t len;
+    double score;
+} zbtreeIteratorElement;
+unsigned int zbtreeIteratorNextBatch(zbtreeIterator *iter, int reverse,
+                                     zbtreeIteratorElement *out,
+                                     unsigned int max, int withscores);
 unsigned long zbtreeCountByScore(const zbtreeSet *zs, double min, int minex,
                                  double max, int maxex);
 

@@ -4502,6 +4502,52 @@ int zbtreeIteratorNext(zbtreeIterator *iter, int reverse,
     return 1;
 }
 
+/* See zbtreeIteratorNext(). Iterating one element per call decodes the leaf
+ * layout again for every element, a large part of the cost of walking a set
+ * whose members are then only probed elsewhere, as ZINTER does. Here the
+ * offset array is located once per call. */
+unsigned int zbtreeIteratorNextBatch(zbtreeIterator *iter, int reverse,
+                                     zbtreeIteratorElement *out,
+                                     unsigned int max, int withscores)
+{
+    zbtScoreLeaf *leaf = iter->leaf;
+    if (leaf == NULL || max == 0) return 0;
+
+    unsigned int pos = iter->pos, count = leaf->n.count, n;
+    const uint16_t *offsets = zbtScoreLeafOffsets(leaf);
+    if (reverse) {
+        n = pos + 1 < max ? pos + 1 : max;
+    } else {
+        n = count - pos < max ? count - pos : max;
+    }
+
+    for (unsigned int i = 0; i < n; i++) {
+        unsigned int lpos = reverse ? pos - i : pos + i;
+        unsigned int ppos = zbtScoreLeafPhysicalPos(leaf, lpos);
+        out[i].ele = zbtPackedData((unsigned char *)leaf + offsets[ppos],
+                                   &out[i].len);
+        if (withscores) out[i].score = zbtScoreLeafScore(leaf, lpos);
+    }
+
+    if (reverse) {
+        if (pos >= n) {
+            iter->pos = pos - n;
+        } else {
+            leaf = leaf->prev;
+            iter->leaf = leaf;
+            iter->pos = leaf ? leaf->n.count - 1 : 0;
+        }
+    } else {
+        if (pos + n < count) {
+            iter->pos = pos + n;
+        } else {
+            iter->leaf = leaf->next;
+            iter->pos = 0;
+        }
+    }
+    return n;
+}
+
 /* Return the rank where a score bound would be inserted. Complete children
  * are counted on the way down, so there is no second walk back to the root. */
 static unsigned long zbtScoreRankForBound(const zbtreeSet *zs, double score,
@@ -5874,6 +5920,75 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zbtreeFree(zs);
         zfree(order);
         zfree(gone);
+    }
+
+    printf("Testing B+ tree batched iteration matches single steps\n");
+    {
+        /* Descending inserts build left-edge leaves with reversed arrays,
+         * ascending ones normal leaves. Mix in members needing the long
+         * inline and the external record forms. */
+        zbtreeSet *zs = zbtreeCreate();
+        char buf[400];
+        for (int i = 0; i < 600; i++) {
+            int k = i < 300 ? 300 - i : i + 1;
+            size_t len = k % 7 == 0 ? 260 : (k % 11 == 0 ? 360 : 0);
+            if (len) {
+                memset(buf, 'a' + k % 26, len);
+                snprintf(buf, 16, "%d:", k);
+                buf[strlen(buf)] = '-';
+            } else {
+                len = snprintf(buf, sizeof(buf), "m:%d", k);
+            }
+            sds ele = sdsnewlen(buf, len);
+            double score;
+            zbtreeInsertPosition position;
+            serverAssert(!zbtreeFindForAdd(zs, ele, &score, &position));
+            zbtreeInsertNew(zs, k * 0.5, ele, &position);
+            sdsfree(ele);
+        }
+        int same = 1;
+        for (int reverse = 0; reverse <= 1; reverse++) {
+            for (unsigned int max = 1; max <= 20; max++) {
+                for (int withscores = 0; withscores <= 1; withscores++) {
+                    zbtreeIterator one, many;
+                    zbtreeIteratorElement out[20];
+                    unsigned long seen = 0;
+                    zbtreeIteratorStart(zs, reverse, &one);
+                    zbtreeIteratorStart(zs, reverse, &many);
+                    unsigned int n;
+                    while ((n = zbtreeIteratorNextBatch(&many, reverse, out,
+                                                        max, withscores)))
+                    {
+                        same = same && n <= max;
+                        for (unsigned int i = 0; i < n; i++) {
+                            const unsigned char *e;
+                            size_t len;
+                            double score;
+                            same = same && zbtreeIteratorNext(&one, reverse,
+                                                              &e, &len,
+                                                              &score) &&
+                                   e == out[i].ele && len == out[i].len &&
+                                   (!withscores || score == out[i].score);
+                        }
+                        seen += n;
+                    }
+                    same = same && seen == zbtreeLength(zs) &&
+                           !zbtreeIteratorNext(&one, reverse, NULL, NULL,
+                                               NULL) &&
+                           zbtreeIteratorNextBatch(&many, reverse, out, max,
+                                                   withscores) == 0;
+                }
+            }
+        }
+        int reversed = 0, forward = 0;
+        for (zbtScoreLeaf *l = zs->score_first; l; l = l->next) {
+            if (l->reversed) reversed++;
+            else forward++;
+        }
+        test_cond("Batched iteration covers both leaf layouts",
+                  reversed > 0 && forward > 0);
+        test_cond("Batched iteration returns the single-step sequence", same);
+        zbtreeFree(zs);
     }
 
     printf("Testing B+ tree memory when end deletions stop at one member\n");
