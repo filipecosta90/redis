@@ -83,6 +83,12 @@ unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
                           double *scores);
 int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
                      zbtreeInsertPosition *position);
+int zbtreeFindForAddWithHash(zbtreeSet *zs, sds ele, uint32_t hash,
+                             double *score, zbtreeInsertPosition *position);
+/* Hashing and prefetching for callers that look up many members in a row. */
+uint32_t zbtreeMemberHash(const unsigned char *ele, size_t elelen);
+void zbtreePrefetchIndex(const zbtreeSet *zs, uint32_t hash);
+void zbtreePrefetchMember(const zbtreeSet *zs, uint32_t hash);
 long zbtreeRank(zbtreeSet *zs, sds ele, int reverse, double *score);
 void zbtreeInsertNew(zbtreeSet *zs, double score, sds ele,
                      const zbtreeInsertPosition *position);

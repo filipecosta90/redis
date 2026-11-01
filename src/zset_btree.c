@@ -3296,7 +3296,16 @@ unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
 int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
                      zbtreeInsertPosition *position)
 {
-    uint32_t hash = (uint32_t)dictGenHashFunction(ele, sdslen(ele));
+    return zbtreeFindForAddWithHash(zs, ele, zbtreeMemberHash((unsigned char *)ele, sdslen(ele)),
+                                    score, position);
+}
+
+/* Same as zbtreeFindForAdd(), for a caller that already has the member hash
+ * from zbtreeMemberHash(). */
+int zbtreeFindForAddWithHash(zbtreeSet *zs, sds ele, uint32_t hash,
+                             double *score, zbtreeInsertPosition *position)
+{
+    debugServerAssert(hash == zbtreeMemberHash((unsigned char *)ele, sdslen(ele)));
     zbtIndexBucket *bucket = NULL;
     zbtScoreLeaf *score_leaf = NULL;
     unsigned int pos = 0;
@@ -3311,6 +3320,73 @@ int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
     position->hash = hash;
     position->revision = zs->member_revision;
     return found;
+}
+
+/* Hash used by the member index. */
+uint32_t zbtreeMemberHash(const unsigned char *ele, size_t elelen) {
+    return (uint32_t)dictGenHashFunction(ele, elelen);
+}
+
+/* A ZADD with many members looks them up one after another, and each lookup
+ * is a chain of dependent loads: index bucket, score leaf, member record and
+ * packed score. One lookup is long enough to fill the out-of-order window,
+ * so the chains of different members barely overlap and every miss is paid
+ * in full. The two functions below let such a caller start loading the data
+ * of later members while it works on the current one. They only issue
+ * prefetches and read the current structure; the lookup that follows is the
+ * normal one, so a hint that a modification made stale costs nothing but the
+ * wasted load. */
+
+/* First stage: load the home bucket of 'hash' in each active table. */
+void zbtreePrefetchIndex(const zbtreeSet *zs, uint32_t hash) {
+    const zbtIndexTable *table = &zs->member_index;
+    if (table->size)
+        redis_prefetch_read(zbtIndexBucketAt(table, hash & (table->size - 1)));
+    if (zs->member_rehash) {
+        table = &zs->member_rehash->table;
+        redis_prefetch_read(zbtIndexBucketAt(table, hash & (table->size - 1)));
+    }
+}
+
+/* Second stage, once the bucket had time to arrive: follow the first entry of
+ * the home bucket whose score leaf has a matching tag, and load the member
+ * record and packed score that the lookup would read. A member stored outside
+ * its home bucket, or a tag collision, only means a less useful prefetch. */
+void zbtreePrefetchMember(const zbtreeSet *zs, uint32_t hash) {
+    const zbtIndexTable *tables[2] = {
+        zs->member_rehash ? &zs->member_rehash->table : NULL,
+        &zs->member_index
+    };
+    uint8_t tag = zbtIndexTag(hash);
+    uint8_t leaf_tag = hash >> 24;
+
+    for (int t = 0; t < 2; t++) {
+        const zbtIndexTable *table = tables[t];
+        if (table == NULL || table->size == 0) continue;
+        zbtIndexBucket *bucket =
+            zbtIndexBucketAt(table, hash & (table->size - 1));
+        uint64_t tags = zbtIndexTags(bucket);
+        uint64_t matches = zbtIndexTagMask(tags, tag);
+        while (matches) {
+            unsigned int pos = zbtIndexFirstTag(matches);
+            matches &= matches - 1;
+            if ((uint8_t)(tags >> (pos * 8)) != tag) continue;
+            uint32_t id = zbtIndexGetId(table, bucket, pos);
+            if (id >= zs->next_score_leaf_id) continue;
+            zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
+            if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) continue;
+            uint8_t *leaf_tags = zbtScoreLeafHashTags(leaf);
+            uint8_t *found = memchr(leaf_tags, leaf_tag, leaf->n.count);
+            if (found == NULL) continue;
+            unsigned int physical = found - leaf_tags;
+            redis_prefetch_read((unsigned char *)leaf +
+                                zbtScoreLeafOffsets(leaf)[physical]);
+            if (leaf->score_bits)
+                redis_prefetch_read(leaf->data +
+                    (size_t)physical * leaf->score_bits / 8);
+            return;
+        }
+    }
 }
 
 /* Compute a zero-based rank by adding complete left siblings while walking
@@ -4945,6 +5021,44 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         zbtTestPopulate(zs, 10000);
         test_cond("A wide reserved index holds members with small leaf IDs",
             zbtreeLength(zs) == 10000 && zs->member_rehash == NULL &&
+            zbtTestCheck(zs));
+        zbtreeFree(zs);
+    }
+
+    {
+        /* Prefetch hints run on whatever state the tree is in, including an
+         * empty index and a resize in progress, and the reused hash must give
+         * the same answer as a plain lookup. */
+        zbtreeSet *zs = zbtreeCreate();
+        char buf[32];
+        int valid = 1, saw_rehash = 0;
+        zbtreePrefetchIndex(zs, 12345);
+        zbtreePrefetchMember(zs, 12345);
+        for (int i = 0; i < 5000; i++) {
+            int len = snprintf(buf, sizeof(buf), "member:%d", i);
+            uint32_t hash = zbtreeMemberHash((unsigned char *)buf, len);
+            zbtreePrefetchIndex(zs, hash);
+            zbtreePrefetchMember(zs, hash);
+            sds ele = sdsnewlen(buf, len);
+            double score;
+            zbtreeInsertPosition position;
+            valid = valid && !zbtreeFindForAddWithHash(zs, ele, hash, &score,
+                                                       &position);
+            zbtreeInsertNew(zs, i, ele, &position);
+            saw_rehash |= zs->member_rehash != NULL;
+            /* Look up an older member through the hashed path. */
+            len = snprintf(buf, sizeof(buf), "member:%d", i / 2);
+            sdsfree(ele);
+            ele = sdsnewlen(buf, len);
+            hash = zbtreeMemberHash((unsigned char *)buf, len);
+            zbtreePrefetchMember(zs, hash);
+            valid = valid &&
+                    zbtreeFindForAddWithHash(zs, ele, hash, &score, &position) &&
+                    score == i / 2;
+            sdsfree(ele);
+        }
+        test_cond("Prefetch hints and hashed lookups agree with the tree",
+            valid && saw_rehash && zbtreeLength(zs) == 5000 &&
             zbtTestCheck(zs));
         zbtreeFree(zs);
     }

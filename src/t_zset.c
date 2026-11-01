@@ -1790,6 +1790,10 @@ int zsetScore(robj *zobj, sds member, double *score) {
     return C_OK;
 }
 
+static int zsetAddInternal(robj *zobj, double score, sds ele,
+                           const uint32_t *hash, int in_flags,
+                           int *out_flags, double *newscore);
+
 /* Add a new element or update the score of an existing element in a sorted
  * set, regardless of its encoding.
  *
@@ -1836,6 +1840,15 @@ int zsetScore(robj *zobj, sds member, double *score) {
  * The function does not take ownership of the 'ele' SDS string, but copies
  * it if needed. */
 int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore) {
+    return zsetAddInternal(zobj, score, ele, NULL, in_flags, out_flags, newscore);
+}
+
+/* zsetAdd() for a caller that may already have the member hash of a B+ tree
+ * encoded set. 'hash' is ignored by the other encodings and may be NULL. */
+static int zsetAddInternal(robj *zobj, double score, sds ele,
+                           const uint32_t *hash, int in_flags,
+                           int *out_flags, double *newscore)
+{
     /* Turn options into simple to check vars. */
     int incr = (in_flags & ZADD_IN_INCR) != 0;
     int nx = (in_flags & ZADD_IN_NX) != 0;
@@ -1974,7 +1987,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zbtreeSet *zs = zobj->ptr;
         zbtreeInsertPosition position;
-        int exists = zbtreeFindForAdd(zs, ele, &curscore, &position);
+        int exists = hash ?
+            zbtreeFindForAddWithHash(zs, ele, *hash, &curscore, &position) :
+            zbtreeFindForAdd(zs, ele, &curscore, &position);
 
         if (exists) {
             if (nx) {
@@ -2246,6 +2261,11 @@ void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry 
  * Sorted set commands
  *----------------------------------------------------------------------------*/
 
+/* Lookahead distances of the pipelined B+ tree lookups in ZADD. The member
+ * distance must be smaller than the hash distance, whose hashes it reads. */
+#define ZADD_HASH_AHEAD 8
+#define ZADD_MEMBER_AHEAD 4
+
 /* This generic command implements both ZADD and ZINCRBY. */
 void zaddGenericCommand(client *c, int flags) {
     static char *nanerr = "resulting score is not a number (NaN)";
@@ -2342,13 +2362,47 @@ void zaddGenericCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
+
+    /* With a B+ tree and several members, overlap the lookups: hash members
+     * ZADD_HASH_AHEAD positions ahead and prefetch their index buckets, then
+     * ZADD_MEMBER_AHEAD positions ahead follow those buckets and prefetch the
+     * member records. A B+ tree is never converted back while adding, so the
+     * encoding holds for the whole loop. The hashes are reused by the
+     * lookups; the prefetches are only hints. */
+    uint32_t hashes[ZADD_HASH_AHEAD];
+    int pipelined = zobj->encoding == OBJ_ENCODING_BTREE && elements > 1;
+    if (pipelined) {
+        for (j = 0; j < elements && j < ZADD_HASH_AHEAD; j++) {
+            sds m = c->argv[scoreidx+1+j*2]->ptr;
+            hashes[j] = zbtreeMemberHash((unsigned char *)m, sdslen(m));
+            zbtreePrefetchIndex(zobj->ptr, hashes[j]);
+        }
+        for (j = 0; j < elements && j < ZADD_MEMBER_AHEAD; j++)
+            zbtreePrefetchMember(zobj->ptr, hashes[j]);
+    }
+
     for (j = 0; j < elements; j++) {
         double newscore;
         score = scores[j];
         int retflags = 0;
+        uint32_t hash = 0;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
-        int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
+        if (pipelined) {
+            hash = hashes[j % ZADD_HASH_AHEAD];
+            if (j + ZADD_MEMBER_AHEAD < elements)
+                zbtreePrefetchMember(zobj->ptr,
+                    hashes[(j + ZADD_MEMBER_AHEAD) % ZADD_HASH_AHEAD]);
+            if (j + ZADD_HASH_AHEAD < elements) {
+                sds m = c->argv[scoreidx+1+(j+ZADD_HASH_AHEAD)*2]->ptr;
+                uint32_t h = zbtreeMemberHash((unsigned char *)m, sdslen(m));
+                hashes[j % ZADD_HASH_AHEAD] = h;
+                zbtreePrefetchIndex(zobj->ptr, h);
+            }
+        }
+        int retval = zsetAddInternal(zobj, score, ele,
+                                     pipelined ? &hash : NULL,
+                                     flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
             if (server.memory_tracking_enabled)

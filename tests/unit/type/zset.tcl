@@ -1392,6 +1392,67 @@ start_server {tags {"zset"}} {
     }
 
     basics listpack
+    test {ZADD B+tree multi-member lookups keep per-pair order and flags} {
+        r del zadd-pipeline
+        set model [dict create]
+        set init {}
+        for {set i 0} {$i < 200} {incr i} {
+            lappend init $i m:$i
+            dict set model m:$i $i
+        }
+        r zadd zadd-pipeline {*}$init
+        assert_encoding btree zadd-pipeline
+        set long [string repeat x 400]
+        set round 0
+        foreach count {2 3 4 5 7 8 9 15 16 17 40 300} {
+            foreach opts {{} {ch} {nx} {xx ch} {gt ch} {lt}} {
+                incr round
+                set args {}
+                set added 0
+                set changed 0
+                for {set i 0} {$i < $count} {incr i} {
+                    # Mix existing, new, repeated and long members. Repeats
+                    # fall inside the lookahead window and must see the
+                    # result of the earlier pair.
+                    switch [expr {$i % 5}] {
+                        0 {set m m:[expr {($i * 7 + $round) % 220}]}
+                        1 {set m new:$round:$i}
+                        2 {set m [lindex $args end]}
+                        3 {set m $long:[expr {$i % 3}]}
+                        4 {set m m:[expr {$i % 6}]}
+                    }
+                    set score [expr {($i * 13 + $round) % 250 - 20}]
+                    lappend args $score $m
+                    set exists [dict exists $model $m]
+                    if {$exists} {set cur [dict get $model $m]}
+                    if {"nx" in $opts && $exists} continue
+                    if {"xx" in $opts && !$exists} continue
+                    if {$exists && "gt" in $opts && $score <= $cur} continue
+                    if {$exists && "lt" in $opts && $score >= $cur} continue
+                    if {!$exists} {
+                        incr added
+                        incr changed
+                    } elseif {$score != $cur} {
+                        incr changed
+                    }
+                    dict set model $m $score
+                }
+                set reply [expr {"ch" in $opts ? $changed : $added}]
+                assert_equal $reply [r zadd zadd-pipeline {*}$opts {*}$args]
+                assert_equal [dict size $model] [r zcard zadd-pipeline]
+            }
+            set zp_expected {}
+            foreach {m sc} [lsort -stride 2 -index 1 -integer \
+                                [lsort -stride 2 -index 0 $model]] {
+                lappend zp_expected $m $sc
+            }
+            assert_equal $zp_expected [r zrange zadd-pipeline 0 -1 withscores]
+        }
+        assert_encoding btree zadd-pipeline
+        r del zadd-pipeline
+        unset model init args zp_expected
+    }
+
     basics btree
 
     test {ZSET with a large member stays in the B+ tree encoding} {
