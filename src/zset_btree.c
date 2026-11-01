@@ -64,10 +64,12 @@
  * lookup checks these small tags first and normally reads only the requested
  * member.
  *
- * Records grow backwards from the end of the allocation. Scores and offsets
- * grow forwards. Spare space between them lets common inserts modify the leaf
- * without allocating another one. Short members follow a small length prefix
- * inside the record. Members of 320 bytes or more use a separate allocation;
+ * Records grow backwards from the end of the allocation. The tags, offsets
+ * and scores grow forwards, in that order: the tags start right after the
+ * header, so a lookup can load them together with it. Spare space between
+ * the arrays and the records lets common inserts modify the leaf without
+ * allocating another one. Short members follow a small length prefix inside
+ * the record. Members of 320 bytes or more use a separate allocation;
  * their record holds its pointer, length, and hash. This keeps leaves dense
  * and lets a member keep the same allocation when its score changes.
  *
@@ -237,8 +239,8 @@ struct zbtScoreNode {
     uint16_t index_resize;   /* Resize that copied this leaf, zero if none. */
 };
 
-/* The data[] array starts with packed scores and offsets. Member records
- * occupy the end and record_start marks their first used byte. */
+/* The data[] array starts with the hash tags, offsets and packed scores.
+ * Member records occupy the end and record_start marks their first one. */
 struct zbtScoreLeaf {
     zbtScoreNode n;
     zbtScoreLeaf *prev;
@@ -356,43 +358,58 @@ static unsigned int zbtBitsNeeded(uint64_t value) {
     return 64 - __builtin_clzll(value);
 }
 
+/* The packed arrays start with the hash tags, then the record offsets, then
+ * the packed scores. The tags therefore have a fixed address: a member lookup
+ * can load them together with the leaf header, before it knows the count or
+ * the score width. One padding byte after an odd number of tags keeps the
+ * offsets aligned. */
+static inline size_t zbtScoreLeafTagBytes(unsigned int count) {
+    return ((size_t)count + 1) & ~(size_t)1;
+}
+
 /* Eight spare bytes let the bit readers use one unaligned 64 bit load even
- * for the last score. The final rounding keeps the offset array aligned. */
+ * for the last score. Nothing follows the scores in the packed arrays, so
+ * they need no alignment. */
 static size_t zbtScoreLeafScoreBytes(unsigned int count,
                                      unsigned int score_bits)
 {
     if (score_bits == 0) return 0;
     size_t bytes = ((size_t)count * score_bits + 7) / 8;
-    return (bytes + 8 + 1) & ~(size_t)1;
+    return bytes + 8;
 }
 
-/* Return the offset array that follows the packed scores. */
-static inline uint16_t *zbtScoreLeafOffsets(zbtScoreLeaf *leaf) {
-    return (uint16_t *)(leaf->data +
-        zbtScoreLeafScoreBytes(leaf->n.count, leaf->score_bits));
-}
-
-/* Return the hash-tag array that follows the 'count' offsets at 'offsets'. */
-static inline uint8_t *zbtScoreLeafTagsAfter(uint16_t *offsets,
-                                             unsigned int count)
+/* Return the bytes of all packed arrays for 'count' elements. */
+static inline size_t zbtScoreLeafArrayBytes(unsigned int count,
+                                            unsigned int score_bits)
 {
-    return (uint8_t *)(offsets + count);
+    return zbtScoreLeafTagBytes(count) + (size_t)count * sizeof(uint16_t) +
+           zbtScoreLeafScoreBytes(count, score_bits);
 }
 
-/* Return the hash-tag array that follows the offsets. */
+/* Return the hash-tag array at the start of the packed arrays. */
 static inline uint8_t *zbtScoreLeafHashTags(zbtScoreLeaf *leaf) {
-    return zbtScoreLeafTagsAfter(zbtScoreLeafOffsets(leaf), leaf->n.count);
+    return leaf->data;
 }
 
-/* Searching a leaf reads the header, then the hash tags, then one offset,
- * then one member record and one packed score, each load waiting for the
- * previous one. zbtreeLookupStart() requests the first
- * ZBT_SCORE_LEAF_PREFETCH bytes of the leaf as soon as it knows it: the
- * header and the start of the packed scores, offsets and tags that follow
- * it. How much of those arrays this covers depends on the member count and
- * the score width; a leaf whose arrays extend further only loses part of
- * the overlap. Prefetches never fault, so lines past a small leaf's
- * allocation are harmless. */
+/* Return the offset array that follows the hash tags. */
+static inline uint16_t *zbtScoreLeafOffsets(zbtScoreLeaf *leaf) {
+    return (uint16_t *)(leaf->data + zbtScoreLeafTagBytes(leaf->n.count));
+}
+
+/* Return the packed scores that follow the offsets. */
+static inline unsigned char *zbtScoreLeafScores(zbtScoreLeaf *leaf) {
+    return (unsigned char *)(zbtScoreLeafOffsets(leaf) + leaf->n.count);
+}
+
+/* Searching a leaf reads the header and the hash tags, then one offset,
+ * then one member record and one packed score. With the tags at a fixed
+ * address the tag load no longer waits for the header.
+ * zbtreeLookupStart() requests the first ZBT_SCORE_LEAF_PREFETCH bytes of
+ * the leaf as soon as it knows it: the header and the start of the tags,
+ * offsets and scores that follow it. How much of those arrays this covers
+ * depends on the member count and the score width; a leaf whose arrays
+ * extend further only loses part of the overlap. Prefetches never fault,
+ * so lines past a small leaf's allocation are harmless. */
 #define ZBT_SCORE_LEAF_PREFETCH 256
 static inline void zbtScoreLeafPrefetchFront(const zbtScoreLeaf *leaf) {
     for (unsigned int off = 0; off < ZBT_SCORE_LEAF_PREFETCH;
@@ -466,46 +483,50 @@ static void zbtWriteBits(unsigned char *data, size_t bitpos,
     }
 }
 
-/* Insert one field in the packed score stream. Copy backwards because source
- * and destination overlap. leaf->n.count is still the old count. */
-static void zbtInsertScoreBits(zbtScoreLeaf *leaf, unsigned int pos,
+/* Insert one field in the packed score stream 'scores', which holds 'count'
+ * fields of the leaf's width. Copy backwards because source and destination
+ * overlap. */
+static void zbtInsertScoreBits(zbtScoreLeaf *leaf, unsigned char *scores,
+                               unsigned int count, unsigned int pos,
                                uint64_t value)
 {
     unsigned int bits = leaf->score_bits;
     if (bits == 0) return;
 
     size_t insert_at = (size_t)pos * bits;
-    size_t remaining = (size_t)(leaf->n.count - pos) * bits;
+    size_t remaining = (size_t)(count - pos) * bits;
     while (remaining) {
         unsigned int chunk = remaining > 64 ? 64 : remaining;
         size_t source = insert_at + remaining - chunk;
-        uint64_t part = zbtReadBits(leaf->data, source, chunk);
-        zbtWriteBits(leaf->data, source + bits, chunk, part);
+        uint64_t part = zbtReadBits(scores, source, chunk);
+        zbtWriteBits(scores, source + bits, chunk, part);
         remaining -= chunk;
     }
-    zbtWriteBits(leaf->data, insert_at, bits, value);
+    zbtWriteBits(scores, insert_at, bits, value);
 }
 
-/* Delete one field from the packed score stream. Copy forwards because source
- * and destination overlap. The final field is cleared because later writes
- * add bits to a field that is expected to start at zero. */
-static void zbtDeleteScoreBits(zbtScoreLeaf *leaf, unsigned int pos) {
+/* Delete one field from the packed score stream 'scores', which holds
+ * 'count' fields. Copy forwards because source and destination overlap. The
+ * final field is cleared because later writes add bits to a field that is
+ * expected to start at zero. */
+static void zbtDeleteScoreBits(zbtScoreLeaf *leaf, unsigned char *scores,
+                               unsigned int count, unsigned int pos)
+{
     unsigned int bits = leaf->score_bits;
     if (bits == 0) return;
 
     size_t destination = (size_t)pos * bits;
-    size_t remaining = (size_t)(leaf->n.count - pos - 1) * bits;
+    size_t remaining = (size_t)(count - pos - 1) * bits;
     size_t moved = 0;
     while (moved < remaining) {
         unsigned int chunk = remaining - moved > 64 ?
                              64 : remaining - moved;
-        uint64_t part = zbtReadBits(leaf->data,
+        uint64_t part = zbtReadBits(scores,
                                     destination + bits + moved, chunk);
-        zbtWriteBits(leaf->data, destination + moved, chunk, part);
+        zbtWriteBits(scores, destination + moved, chunk, part);
         moved += chunk;
     }
-    zbtWriteBits(leaf->data, (size_t)(leaf->n.count - 1) * bits,
-                 bits, 0);
+    zbtWriteBits(scores, (size_t)(count - 1) * bits, bits, 0);
 }
 
 /* Write one score into a zeroed packed field. The base, shift and width must
@@ -523,13 +544,14 @@ static void zbtScoreLeafWriteScore(zbtScoreLeaf *leaf, unsigned int pos,
     size_t bitpos = (size_t)zbtScoreLeafPhysicalPos(leaf, pos) * bits;
     size_t byte = bitpos / 8;
     unsigned int shift = bitpos & 7;
+    unsigned char *scores = zbtScoreLeafScores(leaf);
     uint64_t word;
 
-    memcpy(&word, leaf->data + byte, sizeof(word));
+    memcpy(&word, scores + byte, sizeof(word));
     word = intrev64ifbe(intrev64ifbe(word) | (delta << shift));
-    memcpy(leaf->data + byte, &word, sizeof(word));
+    memcpy(scores + byte, &word, sizeof(word));
     if (shift && bits > 64 - shift)
-        leaf->data[byte + 8] |= delta >> (64 - shift);
+        scores[byte + 8] |= delta >> (64 - shift);
 }
 
 /* Decode the score at physical position 'physical'. The ninth byte is always
@@ -546,8 +568,9 @@ static inline double zbtScoreLeafScoreAt(zbtScoreLeaf *leaf,
         size_t bitpos = (size_t)physical * bits;
         size_t byte = bitpos / 8;
         unsigned int shift = bitpos & 7;
-        uint64_t high = leaf->data[byte + 8];
-        memcpy(&delta, leaf->data + byte, sizeof(delta));
+        unsigned char *scores = zbtScoreLeafScores(leaf);
+        uint64_t high = scores[byte + 8];
+        memcpy(&delta, scores + byte, sizeof(delta));
         delta = intrev64ifbe(delta) >> shift;
         delta |= (high << 1) << (63 - shift);
         delta &= UINT64_MAX >> (64 - bits);
@@ -1017,8 +1040,7 @@ static size_t zbtScoreLeafRequestBytes(unsigned int count, double *scores,
      * an ascending encoding gives the size of a reversed leaf as well. */
     zbtScoreEncoding(count, scores, 0, &base, &bits, &shift);
     size_t bytes = offsetof(zbtScoreLeaf, data) +
-                   zbtScoreLeafScoreBytes(count, bits) +
-                   count * (sizeof(uint16_t) + sizeof(uint8_t));
+                   zbtScoreLeafArrayBytes(count, bits);
     for (unsigned int i = 0; i < count; i++)
         bytes += zbtElementStorageBytes(&elems[i]);
     return bytes;
@@ -1070,7 +1092,7 @@ static zbtScoreLeaf *zbtScoreLeafBuild(zbtreeSet *zs, unsigned int count,
     leaf->n.score_shift = score_shift;
     leaf->score_base = score_base;
     leaf->score_bits = score_bits;
-    memset(leaf->data, 0, zbtScoreLeafScoreBytes(count, score_bits));
+    memset(leaf->data, 0, zbtScoreLeafArrayBytes(count, score_bits));
     offsets = zbtScoreLeafOffsets(leaf);
     hash_tags = zbtScoreLeafHashTags(leaf);
     size_t capacity = zmalloc_usable_size(leaf);
@@ -1489,10 +1511,11 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
     if (elelen > ZBT_SHORT_MEMBER_MAX || count < ZBT_TAG_SCAN_MIN_COUNT)
         return -1;
 
-    /* Derive the tags from 'offsets', which the loop needs anyway, instead
-     * of recomputing the leaf layout. */
+    /* The tags sit at a fixed address right after the header, so this load
+     * depends only on the leaf address and does not wait for the header
+     * that gives the count. */
+    uint8_t *tags = zbtScoreLeafHashTags(leaf);
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
-    uint8_t *tags = zbtScoreLeafTagsAfter(offsets, count);
     unsigned int start = 0, last = count - ZBT_TAG_SCAN_WIDTH;
     for (;;) {
         uint64_t matches = zbtTagMatch(tags + start, tag);
@@ -1613,9 +1636,8 @@ static int zbtScoreInsertInPlace(zbtreeSet *zs, zbtScoreLeaf *leaf,
     uint8_t score_bits, score_shift;
     zbtScoreEncoding(count, scores, leaf->reversed,
                      &score_base, &score_bits, &score_shift);
-    size_t score_bytes = zbtScoreLeafScoreBytes(count, score_bits);
-    size_t index_end = offsetof(zbtScoreLeaf, data) + score_bytes +
-                       count * (sizeof(uint16_t) + sizeof(uint8_t));
+    size_t index_end = offsetof(zbtScoreLeaf, data) +
+                       zbtScoreLeafArrayBytes(count, score_bits);
     size_t item_bytes = zbtElementStorageBytes(&elems[inserted]);
     if (index_end + item_bytes > leaf->record_start)
         return 0;
@@ -1631,7 +1653,8 @@ static int zbtScoreInsertInPlace(zbtreeSet *zs, zbtScoreLeaf *leaf,
     leaf->score_base = score_base;
     leaf->score_bits = score_bits;
     leaf->record_start = new_offset;
-    memset(leaf->data, 0, score_bytes);
+    memset(zbtScoreLeafScores(leaf), 0,
+           zbtScoreLeafScoreBytes(count, score_bits));
 
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
     uint8_t *hash_tags = zbtScoreLeafHashTags(leaf);
@@ -1686,32 +1709,32 @@ static int zbtScoreInsertFast(zbtreeSet *zs, zbtScoreLeaf *leaf, double score,
 
     unsigned int oldcount = leaf->n.count;
     unsigned int count = oldcount + 1;
-    size_t score_bytes =
-        zbtScoreLeafScoreBytes(count, leaf->score_bits);
     size_t item_bytes = zbtElementStorageBytes(ele);
-    size_t index_end = offsetof(zbtScoreLeaf, data) + score_bytes +
-                       count * (sizeof(uint16_t) + sizeof(uint8_t));
+    size_t index_end = offsetof(zbtScoreLeaf, data) +
+                       zbtScoreLeafArrayBytes(count, leaf->score_bits);
     if (index_end + item_bytes > leaf->record_start)
         return 0;
 
     unsigned int physical = leaf->reversed ? oldcount - pos : pos;
 
-    /* Adding a score can move both arrays that follow the packed bits. Save
-     * the tags, shift the bits while the old offsets are still available,
-     * then rebuild the offsets and tags at their new addresses. */
+    /* Every array grows, so the offsets and the scores both move up. Move the
+     * last array first so that nothing is overwritten before it is copied,
+     * then open the new field in each array. */
     uint16_t *old_offsets = zbtScoreLeafOffsets(leaf);
-    uint8_t old_tags[ZBT_SCORE_LEAF_MAX];
-    memcpy(old_tags, zbtScoreLeafHashTags(leaf), oldcount);
-    zbtInsertScoreBits(leaf, physical, delta);
-    uint16_t *offsets = (uint16_t *)(leaf->data + score_bytes);
+    unsigned char *old_scores = zbtScoreLeafScores(leaf);
+    uint16_t *offsets =
+        (uint16_t *)(leaf->data + zbtScoreLeafTagBytes(count));
+    unsigned char *scores = (unsigned char *)(offsets + count);
+    memmove(scores, old_scores,
+            zbtScoreLeafScoreBytes(oldcount, leaf->score_bits));
+    zbtInsertScoreBits(leaf, scores, oldcount, physical, delta);
     memmove(offsets, old_offsets, oldcount * sizeof(uint16_t));
     memmove(offsets + physical + 1, offsets + physical,
             (oldcount - physical) * sizeof(uint16_t));
-    uint8_t *hash_tags = (uint8_t *)(offsets + count);
-    memcpy(hash_tags, old_tags, physical);
+    uint8_t *hash_tags = zbtScoreLeafHashTags(leaf);
+    memmove(hash_tags + physical + 1, hash_tags + physical,
+            oldcount - physical);
     hash_tags[physical] = tag;
-    memcpy(hash_tags + physical + 1, old_tags + physical,
-           oldcount - physical);
     uint16_t new_offset = leaf->record_start - item_bytes;
     if (zbtBuildElementWrite(zs, (unsigned char *)leaf + new_offset, ele))
         leaf->n.has_external = 1;
@@ -2823,8 +2846,7 @@ static size_t zbtScoreLeafRecordBytes(zbtScoreLeaf *leaf) {
  * fresh encoding never needs more bits. */
 static size_t zbtScoreLeafLiveBytes(zbtScoreLeaf *leaf) {
     return offsetof(zbtScoreLeaf, data) +
-           zbtScoreLeafScoreBytes(leaf->n.count, leaf->score_bits) +
-           leaf->n.count * (sizeof(uint16_t) + sizeof(uint8_t)) +
+           zbtScoreLeafArrayBytes(leaf->n.count, leaf->score_bits) +
            zbtScoreLeafRecordBytes(leaf);
 }
 
@@ -2910,8 +2932,7 @@ static void zbtScoreDeleteInPlace(zbtreeSet *zs, zbtScoreLeaf *leaf,
     serverAssert(count != 0 && pos < oldcount);
     unsigned int physical = zbtScoreLeafPhysicalPos(leaf, pos);
     uint16_t *old_offsets = zbtScoreLeafOffsets(leaf);
-    uint8_t old_tags[ZBT_SCORE_LEAF_MAX];
-    memcpy(old_tags, zbtScoreLeafHashTags(leaf), oldcount);
+    unsigned char *old_scores = zbtScoreLeafScores(leaf);
     uint16_t deleted_offset = old_offsets[physical];
     unsigned char *deleted_record = (unsigned char *)leaf + deleted_offset;
     size_t deleted_bytes = zbtRecordStorageBytes(deleted_record);
@@ -2950,16 +2971,20 @@ static void zbtScoreDeleteInPlace(zbtreeSet *zs, zbtScoreLeaf *leaf,
         leaf->record_start += deleted_bytes;
     }
 
-    zbtDeleteScoreBits(leaf, physical);
+    /* Every array shrinks, so the offsets and the scores both move down.
+     * Close the field in each array, then move the first array first so
+     * that nothing is overwritten before it is copied. */
+    zbtDeleteScoreBits(leaf, old_scores, oldcount, physical);
+    uint8_t *hash_tags = zbtScoreLeafHashTags(leaf);
+    memmove(hash_tags + physical, hash_tags + physical + 1,
+            count - physical);
     memmove(old_offsets + physical, old_offsets + physical + 1,
             (count - physical) * sizeof(uint16_t));
-    size_t score_bytes = zbtScoreLeafScoreBytes(count, leaf->score_bits);
-    uint16_t *offsets = (uint16_t *)(leaf->data + score_bytes);
+    uint16_t *offsets =
+        (uint16_t *)(leaf->data + zbtScoreLeafTagBytes(count));
     memmove(offsets, old_offsets, count * sizeof(uint16_t));
-    uint8_t *hash_tags = (uint8_t *)(offsets + count);
-    memcpy(hash_tags, old_tags, physical);
-    memcpy(hash_tags + physical, old_tags + physical + 1,
-           count - physical);
+    memmove(offsets + count, old_scores,
+            zbtScoreLeafScoreBytes(count, leaf->score_bits));
 
     leaf->n.count = count;
     leaf->n.subtree = count;
@@ -2996,7 +3021,8 @@ static void zbtScoreLeafReverseForPop(zbtScoreLeaf *leaf) {
     }
     leaf->score_base = base;
     leaf->reversed = 1;
-    memset(leaf->data, 0, zbtScoreLeafScoreBytes(count, leaf->score_bits));
+    memset(zbtScoreLeafScores(leaf), 0,
+           zbtScoreLeafScoreBytes(count, leaf->score_bits));
     for (unsigned int i = 0; i < count; i++) {
         zbtScoreLeafWriteScore(leaf, i, scores[i]);
         debugServerAssert(zbtScoreToOrdered(zbtScoreLeafScore(leaf, i)) ==
@@ -4127,7 +4153,8 @@ static int zbtScoreUpdateInPlace(zbtScoreLeaf *leaf, unsigned int pos,
 
     if (leaf->score_bits) {
         unsigned int physical = zbtScoreLeafPhysicalPos(leaf, pos);
-        zbtWriteBits(leaf->data, (size_t)physical * leaf->score_bits,
+        zbtWriteBits(zbtScoreLeafScores(leaf),
+                     (size_t)physical * leaf->score_bits,
                      leaf->score_bits, delta);
     }
     if (pos + 1 == leaf->n.count) zbtScoreUpdatePath(&leaf->n, 0);
@@ -4704,7 +4731,7 @@ static inline uint64_t zbtLeafTagWord(const uint8_t *tags) {
  * reverse order when 'reversed' is set. zbtIndexTag() folds leaf tag zero
  * into one. Eight tags are compared at once. As with bucket tags, a mask bit
  * can be set above a real match, so each candidate is checked against its
- * byte. Only complete words are loaded: member records follow the tags. */
+ * byte. Only complete words are loaded, so no read passes the last tag. */
 static inline unsigned int zbtLeafTagMatches(const uint8_t *tags,
                                              unsigned int count, int reversed,
                                              uint8_t tag,
@@ -5229,6 +5256,14 @@ static int zbtTestCheck(zbtreeSet *zs) {
                        leaf->id);
                 goto done;
             }
+            if (offsetof(zbtScoreLeaf, data) +
+                    zbtScoreLeafArrayBytes(leaf->n.count, leaf->score_bits) >
+                leaf->record_start)
+            {
+                printf("    check failed: arrays overlap records in leaf %u\n",
+                       leaf->id);
+                goto done;
+            }
             int in_new = zs->member_rehash && zbtIndexLeafMigrated(zs, leaf);
             for (unsigned int i = 0; i < leaf->n.count; i++) {
                 size_t len;
@@ -5480,10 +5515,11 @@ static double zbtTestScoreRef(zbtScoreLeaf *leaf, unsigned int pos) {
         size_t bitpos = (size_t)zbtScoreLeafPhysicalPos(leaf, pos) * bits;
         size_t byte = bitpos / 8;
         unsigned int shift = bitpos & 7;
-        memcpy(&delta, leaf->data + byte, sizeof(delta));
+        memcpy(&delta, zbtScoreLeafScores(leaf) + byte, sizeof(delta));
         delta = intrev64ifbe(delta) >> shift;
         if (shift && bits > 64 - shift)
-            delta |= (uint64_t)leaf->data[byte + 8] << (64 - shift);
+            delta |= (uint64_t)zbtScoreLeafScores(leaf)[byte + 8] <<
+                     (64 - shift);
         if (bits < 64)
             delta &= (UINT64_C(1) << bits) - 1;
         delta <<= leaf->n.score_shift;
@@ -7126,6 +7162,43 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
         test_cond("In-leaf search finds every member at its position", ok);
         test_cond("In-leaf search covered members sharing a leaf tag",
                   collisions > 100);
+    }
+
+    printf("Testing B+ tree leaf arrays across in-place edits\n");
+
+    {
+        /* Single inserts and deletes move the offsets and scores that follow
+         * the tags, by two bytes or by none depending on the count parity.
+         * Check every array after random edits of leaves of every count,
+         * with random fractional scores that need wide packed fields. */
+        int ok = 1;
+        unsigned long collisions = 0;
+        uint64_t r = 12345;
+        const int U = 600;
+        char alive[600] = {0};
+        char buf[1024];
+        const size_t lens[] = {0, 20, 300, 400};
+        zbtreeSet *zs = zbtreeCreate();
+        for (int op = 0; op < 20000 && ok; op++) {
+            int i = (int)(zbtTestRand(&r) % U);
+            size_t len = zbtTestMember(buf, i, lens[i % 4]);
+            if (zbtTestRand(&r) % 5 < 2) {
+                sds ele = sdsnewlen(buf, len);
+                ok = zbtreeDelete(zs, ele) == alive[i];
+                sdsfree(ele);
+                alive[i] = 0;
+            } else {
+                double score = (double)(zbtTestRand(&r) % 1000000) / 999983.0;
+                zbtTestSet(zs, buf, len, score);
+                alive[i] = 1;
+            }
+            if (ok && op % 97 == 0)
+                ok = zbtTestCheckLeafSearch(zs, &collisions) &&
+                     zbtTestCheck(zs);
+        }
+        ok = ok && zbtTestCheckLeafSearch(zs, &collisions) && zbtTestCheck(zs);
+        zbtreeFree(zs);
+        test_cond("Leaf arrays stay intact across in-place edits", ok);
     }
 
     return 0;
