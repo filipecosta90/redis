@@ -341,6 +341,50 @@ start_server {tags {"zset"}} {
             assert {[r zadd ztmp ch 12 x 22 y 30 z] == 2}
         }
 
+        test "ZADD of existing members with unchanged scores changes nothing - $encoding" {
+            set n [expr {$encoding eq "listpack" ? 100 : 300}]
+            set pairs {}
+            for {set i 0} {$i < $n} {incr i} {
+                lappend pairs "[expr {$i * 3 - 7}].25" "member:$i:[string repeat x [expr {$i % 40}]]"
+            }
+            r del ztmp
+            assert_equal $n [r zadd ztmp {*}$pairs]
+            assert_encoding $encoding ztmp
+            set expected [r zrange ztmp 0 -1 withscores]
+
+            r config set notify-keyspace-events KEA
+            set rd1 [redis_deferring_client]
+            assert_equal {1} [psubscribe $rd1 __keyevent@*__:z*]
+            set dirty [s rdb_changes_since_last_save]
+
+            assert_equal 0 [r zadd ztmp {*}$pairs]
+            foreach flags {CH XX {XX CH} NX {NX CH} GT {GT CH} LT {LT CH} {GT XX CH} {LT XX CH}} {
+                assert_equal 0 [r zadd ztmp {*}$flags {*}$pairs]
+            }
+            set member [lindex $pairs 1]
+            assert_equal [lindex $pairs 0] [r zadd ztmp INCR 0 $member]
+            assert_equal [lindex $pairs 0] [r zincrby ztmp 0 $member]
+            assert_equal {} [r zadd ztmp INCR GT 0 $member]
+            assert_equal {} [r zadd ztmp INCR LT 0 $member]
+            assert_equal $dirty [s rdb_changes_since_last_save]
+            assert_equal $expected [r zrange ztmp 0 -1 withscores]
+            assert_encoding $encoding ztmp
+
+            # One changed pair among unchanged ones is the only update and
+            # produces the first event.
+            set last [expr {[llength $pairs] - 2}]
+            set changed [lreplace $pairs $last $last 1000]
+            assert_equal 0 [r zadd ztmp {*}$changed]
+            assert_equal 1 [r zadd ztmp CH {*}$pairs]
+            assert_equal [expr {$dirty + 2}] [s rdb_changes_since_last_save]
+            assert_match "pmessage * __keyevent@*__:zadd ztmp" [$rd1 read]
+            assert_match "pmessage * __keyevent@*__:zadd ztmp" [$rd1 read]
+            assert_equal $expected [r zrange ztmp 0 -1 withscores]
+
+            $rd1 close
+            r config set notify-keyspace-events ""
+        }
+
         test "ZINCRBY calls leading to NaN result in error - $encoding" {
             r zincrby myzset +inf abc
             assert_error "*NaN*" {r zincrby myzset -inf abc}
