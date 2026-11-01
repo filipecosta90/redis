@@ -753,8 +753,18 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             }
             break;
         default:
-            s[i++] = *f;
-            sdsinclen(s,1);
+            /* Copy the whole run of literal bytes up to the next '%' (or the
+             * end of the format) at once instead of one byte per iteration:
+             * long formats such as the CLIENT LIST line are mostly literal
+             * text, and the per-byte sdsavail()/sdsinclen() pair dominates. */
+            l = strcspn(f,"%");
+            if (sdsavail(s) < l) {
+                s = sdsMakeRoomFor(s,l);
+            }
+            memcpy(s+i,f,l);
+            sdsinclen(s,l);
+            i += l;
+            f += l-1; /* Point at the last copied byte, skipped by f++ below. */
             break;
         }
         f++;
@@ -1369,6 +1379,23 @@ int sdsTest(int argc, char **argv, int flags) {
         test_cond("sdscatfmt() seems working with unsigned numbers",
             sdslen(x) == 35 &&
             memcmp(x,"--4294967295,18446744073709551615--",35) == 0);
+
+        sdsfree(x);
+        {
+            /* Literal runs: around and between specifiers, '%%', an unknown
+             * specifier, a trailing lone '%', and a literal tail that needs
+             * the buffer to grow after a large %s consumed the free space. */
+            char big[300];
+            memset(big,'a',sizeof(big)-1);
+            big[sizeof(big)-1] = '\0';
+            x = sdsnew("--");
+            x = sdscatfmt(x, "id=%i 100%% %z %s tail-literal-run%", 7, big);
+            sds expected = sdscatprintf(sdsempty(), "--id=7 100%% z %s tail-literal-run", big);
+            test_cond("sdscatfmt() copies literal runs correctly",
+                sdslen(x) == sdslen(expected) &&
+                memcmp(x,expected,sdslen(x)+1) == 0);
+            sdsfree(expected);
+        }
 
         sdsfree(x);
         x = sdsnew(" x ");
