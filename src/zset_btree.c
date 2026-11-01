@@ -16,6 +16,20 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Score leaves compare 16 member hash tags at once. NEON is part of every
+ * AArch64 CPU and SSE2 of every x86-64 CPU, so no runtime check is needed. */
+#if defined(__aarch64__) && defined(__ARM_NEON) && \
+    defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_neon.h>
+#define ZBT_TAG_MATCH_NEON
+#elif defined(__SSE2__)
+/* Define __MM_MALLOC_H to prevent importing the memory aligned
+ * allocation functions, which we don't use. */
+#define __MM_MALLOC_H
+#include <emmintrin.h>
+#define ZBT_TAG_MATCH_SSE2
+#endif
+
 /*-----------------------------------------------------------------------------
  * B+ tree implementation of the low level sorted set API
  *----------------------------------------------------------------------------*/
@@ -495,26 +509,35 @@ static void zbtScoreLeafWriteScore(zbtScoreLeaf *leaf, unsigned int pos,
         leaf->data[byte + 8] |= delta >> (64 - shift);
 }
 
-/* Decode the score at logical position 'pos'. */
-static double zbtScoreLeafScore(zbtScoreLeaf *leaf, unsigned int pos) {
+/* Decode the score at physical position 'physical'. The ninth byte is always
+ * read and merged: the spare bytes keep it inside the score area, and a
+ * shift of zero merges nothing. This keeps the bit position, which differs
+ * for every member, out of the branches. */
+static inline double zbtScoreLeafScoreAt(zbtScoreLeaf *leaf,
+                                         unsigned int physical)
+{
     unsigned int bits = leaf->score_bits;
     uint64_t delta = 0;
 
     if (bits != 0) {
-        size_t bitpos = (size_t)zbtScoreLeafPhysicalPos(leaf, pos) * bits;
+        size_t bitpos = (size_t)physical * bits;
         size_t byte = bitpos / 8;
         unsigned int shift = bitpos & 7;
+        uint64_t high = leaf->data[byte + 8];
         memcpy(&delta, leaf->data + byte, sizeof(delta));
         delta = intrev64ifbe(delta) >> shift;
-        if (shift && bits > 64 - shift)
-            delta |= (uint64_t)leaf->data[byte + 8] << (64 - shift);
-        if (bits < 64)
-            delta &= (UINT64_C(1) << bits) - 1;
+        delta |= (high << 1) << (63 - shift);
+        delta &= UINT64_MAX >> (64 - bits);
         delta <<= leaf->n.score_shift;
     }
     uint64_t ordered = leaf->reversed ? leaf->score_base - delta :
                                          leaf->score_base + delta;
     return zbtOrderedToScore(ordered);
+}
+
+/* Decode the score at logical position 'pos'. */
+static double zbtScoreLeafScore(zbtScoreLeaf *leaf, unsigned int pos) {
+    return zbtScoreLeafScoreAt(leaf, zbtScoreLeafPhysicalPos(leaf, pos));
 }
 
 /* Return the raw hash byte stored with a member. */
@@ -1296,47 +1319,122 @@ static unsigned int zbtScoreLeafLowerBound(zbtScoreLeaf *leaf, double score,
     return lo;
 }
 
+/* Compare 16 hash tags at once and return a mask with ZBT_TAG_LANE_BITS bits
+ * set for every tag equal to 'tag', tag 0 in the lowest bits. Only exact
+ * matches are reported. */
+#if defined(ZBT_TAG_MATCH_NEON)
+#define ZBT_TAG_LANE_SHIFT 2
+static inline uint64_t zbtTagMatch16(const uint8_t *tags, uint8_t tag) {
+    uint8x16_t eq = vceqq_u8(vld1q_u8(tags), vdupq_n_u8(tag));
+    uint8x8_t nibbles = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
+    return vget_lane_u64(vreinterpret_u64_u8(nibbles), 0);
+}
+#elif defined(ZBT_TAG_MATCH_SSE2)
+#define ZBT_TAG_LANE_SHIFT 0
+static inline uint64_t zbtTagMatch16(const uint8_t *tags, uint8_t tag) {
+    __m128i v = _mm_loadu_si128((const __m128i *)tags);
+    return (unsigned)_mm_movemask_epi8(
+        _mm_cmpeq_epi8(v, _mm_set1_epi8((char)tag)));
+}
+#else
+#define ZBT_TAG_LANE_SHIFT 0
+static inline uint64_t zbtTagMatch8(const uint8_t *tags, uint8_t tag) {
+    uint64_t word;
+    memcpy(&word, tags, sizeof(word));
+    uint64_t x = intrev64ifbe(word) ^ (UINT64_C(0x0101010101010101) * tag);
+    /* High bit of each byte of t is set when that byte of x is non-zero. No
+     * carry crosses a byte, so unlike the usual zero-byte test this is exact. */
+    uint64_t t = ((x & UINT64_C(0x7f7f7f7f7f7f7f7f)) +
+                  UINT64_C(0x7f7f7f7f7f7f7f7f)) | x;
+    uint64_t m = (~t & UINT64_C(0x8080808080808080)) >> 7;
+    return (m * UINT64_C(0x0102040810204080)) >> 56;
+}
+static inline uint64_t zbtTagMatch16(const uint8_t *tags, uint8_t tag) {
+    return zbtTagMatch8(tags, tag) | (zbtTagMatch8(tags + 8, tag) << 8);
+}
+#endif
+#define ZBT_TAG_LANE_BITS (1U << ZBT_TAG_LANE_SHIFT)
+#define ZBT_TAG_LANE_MASK ((UINT64_C(1) << ZBT_TAG_LANE_BITS) - 1)
+
+/* Check every candidate in 'mask', a zbtTagMatch16() result whose lane 0 is
+ * physical position 'first'. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafCheckTags(zbtScoreLeaf *leaf, const uint16_t *offsets,
+                          uint64_t mask, unsigned int first, uint32_t hash,
+                          const unsigned char *ele, size_t elelen,
+                          unsigned int *physical)
+{
+    while (mask) {
+        unsigned int lane = __builtin_ctzll(mask) >> ZBT_TAG_LANE_SHIFT;
+        mask &= ~(ZBT_TAG_LANE_MASK << (lane << ZBT_TAG_LANE_SHIFT));
+        unsigned int candidate = first + lane;
+        unsigned char *record = (unsigned char *)leaf + offsets[candidate];
+
+        if (record[0] == ZBT_PACKED_EXTERNAL &&
+            zbtExternalHash(record) != hash)
+            continue;
+
+        size_t len;
+        const unsigned char *stored = zbtPackedData(record, &len);
+        if (len == elelen && memcmp(stored, ele, len) == 0) {
+            *physical = candidate;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Look for an exact member in one score leaf. The byte tags are contiguous,
- * so memchr rejects almost every unrelated member before its packed bytes
- * are touched. */
+ * so 16 of them are compared at once and almost every unrelated member is
+ * rejected before its packed bytes are touched. A partial last group is
+ * loaded so that it ends at the last tag, because the allocation may end
+ * soon after the tags. The offsets and the page header precede the tags,
+ * so such a load stays inside the leaf; its earlier lanes are dropped. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
+                                 const unsigned char *ele, size_t elelen,
+                                 double *score,
+                                 unsigned int *position)
+{
+    uint8_t tag = hash >> 24;
+    unsigned int count = leaf->n.count;
+    uint16_t *offsets = zbtScoreLeafOffsets(leaf);
+    uint8_t *tags = (uint8_t *)(offsets + count);
+    unsigned int base = 0, physical;
+    int found = 0;
+
+    for (; base + 16 <= count; base += 16) {
+        uint64_t mask = zbtTagMatch16(tags + base, tag);
+        if (mask && zbtScoreLeafCheckTags(leaf, offsets, mask, base, hash,
+                                          ele, elelen, &physical))
+        {
+            found = 1;
+            break;
+        }
+    }
+    if (!found && base < count) {
+        unsigned int rest = count - base;
+        uint64_t mask = zbtTagMatch16(tags + count - 16, tag) >>
+                        ((16 - rest) << ZBT_TAG_LANE_SHIFT);
+        found = mask && zbtScoreLeafCheckTags(leaf, offsets, mask, base,
+                                              hash, ele, elelen, &physical);
+    }
+    if (!found) return 0;
+
+    if (score) *score = zbtScoreLeafScoreAt(leaf, physical);
+    if (position) *position = zbtScoreLeafPhysicalPos(leaf, physical);
+    return 1;
+}
+
+/* Out of line copy for the complete index search, which is rarely needed
+ * for a hit. */
 static int zbtScoreLeafFindMember(zbtScoreLeaf *leaf, uint32_t hash,
                                   const unsigned char *ele, size_t elelen,
                                   double *score,
                                   unsigned int *position)
 {
-    uint8_t tag = hash >> 24;
-    uint16_t *offsets = zbtScoreLeafOffsets(leaf);
-    uint8_t *tags = zbtScoreLeafHashTags(leaf);
-    uint8_t *next = tags;
-    uint8_t *end = tags + leaf->n.count;
-
-    while (next < end) {
-        uint8_t *found = memchr(next, tag, end - next);
-        if (found == NULL) break;
-        unsigned int physical = found - tags;
-        uint16_t offset = offsets[physical];
-        unsigned char *record = (unsigned char *)leaf + offset;
-
-        if (record[0] == ZBT_PACKED_EXTERNAL &&
-            zbtExternalHash(record) != hash)
-        {
-            next = found + 1;
-            continue;
-        }
-
-        size_t len;
-        const unsigned char *stored = zbtPackedData(record, &len);
-        if (len == elelen && memcmp(stored, ele, len) == 0)
-        {
-            unsigned int logical =
-                zbtScoreLeafPhysicalPos(leaf, physical);
-            if (score) *score = zbtScoreLeafScore(leaf, logical);
-            if (position) *position = logical;
-            return 1;
-        }
-        next = found + 1;
-    }
-    return 0;
+    return zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen, score,
+                                        position);
 }
 
 /* Choose a score-leaf split that balances bytes, not just element count.
@@ -2306,15 +2404,60 @@ static int zbtIndexOwnsBucket(zbtIndexTable *table,
     return address >= first && address < last;
 }
 
-/* Look in both tables and optionally return score and insertion positions. */
+/* Look for a member among the home bucket entries of a table that is not
+ * being resized. Most members are found there, so this is the lookup used by
+ * every hit: it needs none of the insertion and resize bookkeeping of
+ * zbtIndexTableFind(). Return zero when the member is not in the home
+ * bucket; the caller then runs the complete search, which also finds the
+ * same entry first when it is in the home bucket. */
 static inline __attribute__((always_inline))
-int zbtIndexFind(zbtreeSet *zs, uint32_t hash,
-                        const unsigned char *ele, size_t elelen,
-                        double *score,
-                        zbtScoreLeaf **found_score_leaf,
-                        unsigned int *found_score_position,
-                        zbtIndexBucket **found_bucket,
-                        unsigned int *found_bucket_position)
+int zbtIndexFindHome(zbtreeSet *zs, uint32_t hash,
+                     const unsigned char *ele, size_t elelen,
+                     double *score, zbtScoreLeaf **found_score_leaf,
+                     unsigned int *found_score_position,
+                     zbtIndexBucket **found_bucket,
+                     unsigned int *found_bucket_position)
+{
+    zbtIndexTable *table = &zs->member_index;
+    if (table->size == 0) return 0;
+    uint8_t tag = zbtIndexTag(hash);
+    zbtIndexBucket *bucket = zbtIndexBucketAt(table, hash & (table->size - 1));
+    uint64_t tags = zbtIndexTags(bucket);
+    uint64_t matches = zbtIndexTagMask(tags, tag);
+
+    while (matches) {
+        unsigned int pos = zbtIndexFirstTag(matches);
+        matches &= matches - 1;
+        if ((uint8_t)(tags >> (pos * 8)) != tag) continue;
+        uint32_t id = zbtIndexGetId(table, bucket, pos);
+        if (id >= zs->next_score_leaf_id) continue;
+        zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
+        /* Without a resize every entry names a live leaf. Leave anything
+         * else to the complete search, which checks it. */
+        if (ZBT_IS_FREE_LEAF_ID(leaf) || leaf == NULL || leaf->id != id)
+            continue;
+        if (zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen, score,
+                                         found_score_position))
+        {
+            if (found_score_leaf) *found_score_leaf = leaf;
+            if (found_bucket) *found_bucket = bucket;
+            if (found_bucket_position) *found_bucket_position = pos;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Look in both tables and optionally return score and insertion positions.
+ * This is the complete search; zbtIndexFind() tries the home bucket first. */
+static inline __attribute__((always_inline))
+int zbtIndexFindAll(zbtreeSet *zs, uint32_t hash,
+                    const unsigned char *ele, size_t elelen,
+                    double *score,
+                    zbtScoreLeaf **found_score_leaf,
+                    unsigned int *found_score_position,
+                    zbtIndexBucket **found_bucket,
+                    unsigned int *found_bucket_position)
 {
     zbtIndexBucket *bucket = NULL, *hint_bucket = NULL;
     unsigned int pos = 0, hint_pos = 0;
@@ -2348,6 +2491,27 @@ found:
     if (found_bucket) *found_bucket = bucket;
     if (found_bucket_position) *found_bucket_position = pos;
     return 1;
+}
+
+/* Same as zbtIndexFindAll(), but a member in its home bucket is found
+ * without the bookkeeping of the complete search. */
+static inline __attribute__((always_inline))
+int zbtIndexFind(zbtreeSet *zs, uint32_t hash,
+                 const unsigned char *ele, size_t elelen,
+                 double *score,
+                 zbtScoreLeaf **found_score_leaf,
+                 unsigned int *found_score_position,
+                 zbtIndexBucket **found_bucket,
+                 unsigned int *found_bucket_position)
+{
+    if (!zs->member_rehash &&
+        zbtIndexFindHome(zs, hash, ele, elelen, score, found_score_leaf,
+                         found_score_position, found_bucket,
+                         found_bucket_position))
+        return 1;
+    return zbtIndexFindAll(zs, hash, ele, elelen, score, found_score_leaf,
+                           found_score_position, found_bucket,
+                           found_bucket_position);
 }
 
 /* Find a table entry by hash tag and leaf ID without reading its member. */
@@ -3293,17 +3457,17 @@ unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
  * avoid a second index lookup. The saved revision makes stale positions
  * harmless if score insertion happened to advance a table resize first.
  */
-int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
-                     zbtreeInsertPosition *position)
+static __attribute__((noinline))
+int zbtreeFindForAddAll(zbtreeSet *zs, const unsigned char *ele,
+                        size_t elelen, uint32_t hash, double *score,
+                        zbtreeInsertPosition *position)
 {
-    uint32_t hash = (uint32_t)dictGenHashFunction(ele, sdslen(ele));
     zbtIndexBucket *bucket = NULL;
     zbtScoreLeaf *score_leaf = NULL;
     unsigned int pos = 0;
     unsigned int score_pos = 0;
-    int found = zbtIndexFind(zs, hash, (unsigned char *)ele,
-                             sdslen(ele), score,
-                             &score_leaf, &score_pos, &bucket, &pos);
+    int found = zbtIndexFindAll(zs, hash, ele, elelen, score,
+                                &score_leaf, &score_pos, &bucket, &pos);
     position->bucket = bucket;
     position->pos = pos;
     position->score_leaf = score_leaf;
@@ -3311,6 +3475,34 @@ int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
     position->hash = hash;
     position->revision = zs->member_revision;
     return found;
+}
+
+/* A hit in the home bucket, the usual case for a ZADD that updates or
+ * repeats a score, returns before the complete search, whose insertion and
+ * resize bookkeeping only a miss needs. */
+int zbtreeFindForAdd(zbtreeSet *zs, sds ele, double *score,
+                     zbtreeInsertPosition *position)
+{
+    size_t elelen = sdslen(ele);
+    uint32_t hash = (uint32_t)dictGenHashFunction(ele, elelen);
+    zbtIndexBucket *bucket;
+    zbtScoreLeaf *score_leaf;
+    unsigned int pos, score_pos;
+
+    if (!zs->member_rehash &&
+        zbtIndexFindHome(zs, hash, (unsigned char *)ele, elelen, score,
+                         &score_leaf, &score_pos, &bucket, &pos))
+    {
+        position->bucket = bucket;
+        position->pos = pos;
+        position->score_leaf = score_leaf;
+        position->score_pos = score_pos;
+        position->hash = hash;
+        position->revision = zs->member_revision;
+        return 1;
+    }
+    return zbtreeFindForAddAll(zs, (unsigned char *)ele, elelen, hash, score,
+                               position);
 }
 
 /* Compute a zero-based rank by adding complete left siblings while walking
@@ -4889,6 +5081,65 @@ static uint64_t zbtTestScanMaxGroups(zbtreeSet *zs) {
     return zbtScanGroupMask(t) + 1;
 }
 
+/* The branchy score decoder that zbtScoreLeafScoreAt() replaced. */
+static double zbtTestScoreRef(zbtScoreLeaf *leaf, unsigned int pos) {
+    unsigned int bits = leaf->score_bits;
+    uint64_t delta = 0;
+
+    if (bits != 0) {
+        size_t bitpos = (size_t)zbtScoreLeafPhysicalPos(leaf, pos) * bits;
+        size_t byte = bitpos / 8;
+        unsigned int shift = bitpos & 7;
+        memcpy(&delta, leaf->data + byte, sizeof(delta));
+        delta = intrev64ifbe(delta) >> shift;
+        if (shift && bits > 64 - shift)
+            delta |= (uint64_t)leaf->data[byte + 8] << (64 - shift);
+        if (bits < 64)
+            delta &= (UINT64_C(1) << bits) - 1;
+        delta <<= leaf->n.score_shift;
+    }
+    uint64_t ordered = leaf->reversed ? leaf->score_base - delta :
+                                         leaf->score_base + delta;
+    return zbtOrderedToScore(ordered);
+}
+
+/* Check every member of every leaf: the in-leaf search must return its own
+ * position and score, and the decoded score must match the reference
+ * decoder. Also count members that share their leaf tag with an earlier
+ * member of the same leaf, so a test can make sure it covered them. */
+static int zbtTestCheckLeafSearch(zbtreeSet *zs, unsigned long *collisions) {
+    for (zbtScoreLeaf *leaf = zs->score_first; leaf; leaf = leaf->next) {
+        for (unsigned int pos = 0; pos < leaf->n.count; pos++) {
+            size_t len;
+            const unsigned char *ele = zbtScoreLeafElement(leaf, pos, &len);
+            uint32_t hash = zbtScoreLeafHash(leaf, pos);
+            double score, ref = zbtTestScoreRef(leaf, pos);
+            unsigned int found_pos;
+            if (zbtScoreLeafScore(leaf, pos) != ref) return 0;
+            if (!zbtScoreLeafFindMember(leaf, hash, ele, len, &score,
+                                        &found_pos) ||
+                found_pos != pos || score != ref)
+                return 0;
+            for (unsigned int i = 0; i < pos; i++) {
+                if (zbtScoreLeafTag(leaf, i) == zbtScoreLeafTag(leaf, pos)) {
+                    (*collisions)++;
+                    break;
+                }
+            }
+            /* The same tag with other bytes must not match. */
+            unsigned char other[1024];
+            if (len < sizeof(other)) {
+                memcpy(other, ele, len);
+                other[len] = 'x';
+                if (zbtScoreLeafFindMember(leaf, hash, other, len + 1,
+                                           NULL, NULL))
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 int zsetBtreeTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -6189,6 +6440,47 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             zbtreeFree(alike);
         }
         zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree in-leaf member search\n");
+
+    {
+        /* Ascending inserts fill normal leaves, descending ones the reversed
+         * left-edge leaves. Leaf sizes then cover every count up to the
+         * maximum, so the tag groups and the final partial group are both
+         * exercised, with short, long and external members and scores that
+         * need different packed widths. */
+        int ok = 1;
+        unsigned long collisions = 0;
+        const size_t lens[] = {0, 20, 300, 400};
+        for (int order = 0; order < 2 && ok; order++) {
+            for (int n = 1; n <= 300 && ok; n += (n < 100 ? 1 : 37)) {
+                zbtreeSet *zs = zbtreeCreate();
+                char buf[1024];
+                for (int k = 0; k < n; k++) {
+                    int i = order ? n - 1 - k : k;
+                    size_t len = zbtTestMember(buf, i, lens[i % 4]);
+                    double score = (n % 3 == 0) ? i * 0.1 + 1e-9 * i :
+                                   (n % 3 == 1) ? (double)i : -i * 3.5e7;
+                    zbtTestSet(zs, buf, len, score);
+                }
+                ok = zbtTestCheckLeafSearch(zs, &collisions) &&
+                     zbtTestCheck(zs);
+                for (int i = 0; i < n && ok; i++) {
+                    size_t len = zbtTestMember(buf, i, lens[i % 4]);
+                    double score;
+                    ok = zbtreeScoreRaw(zs, (unsigned char *)buf, len,
+                                        &score);
+                    len = zbtTestMember(buf, i + n, lens[i % 4]);
+                    ok = ok && !zbtreeScoreRaw(zs, (unsigned char *)buf,
+                                               len, &score);
+                }
+                zbtreeFree(zs);
+            }
+        }
+        test_cond("In-leaf search finds every member at its position", ok);
+        test_cond("In-leaf search covered members sharing a leaf tag",
+                  collisions > 100);
     }
 
     return 0;
