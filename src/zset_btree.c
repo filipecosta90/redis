@@ -1541,6 +1541,83 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
 /* Look up a member, inlining the short-member search when eligible and using
  * the generic search otherwise. Index updates use the out-of-line copy in
  * zbtScoreLeafFindMember(). */
+/* Check the candidates in 'mask', a zbtTagMatch() result whose lane 0 is
+ * physical position 'first'. Separate from zbtShortMemberEqual() above: this
+ * one accepts any record form and any member length, so it pays a memcmp()
+ * the short path avoids. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafCheckCandidates(zbtScoreLeaf *leaf, const uint16_t *offsets,
+                                uint64_t mask, unsigned int first,
+                                uint32_t hash, const unsigned char *ele,
+                                size_t elelen, unsigned int *physical)
+{
+    while (mask) {
+        unsigned int candidate =
+            first + (__builtin_ctzll(mask) >> ZBT_TAG_MATCH_SHIFT);
+        mask &= mask - 1;
+        unsigned char *record = (unsigned char *)leaf + offsets[candidate];
+
+        if (record[0] == ZBT_PACKED_EXTERNAL &&
+            zbtExternalHash(record) != hash)
+            continue;
+
+        size_t len;
+        const unsigned char *stored = zbtPackedData(record, &len);
+        if (len == elelen && memcmp(stored, ele, len) == 0) {
+            *physical = candidate;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Scan every tag in the leaf ZBT_TAG_SCAN_WIDTH at a time, for the members
+ * zbtScoreLeafFindShort() turns away -- those longer than
+ * ZBT_SHORT_MEMBER_MAX. Without this they fall back to the memchr() search,
+ * one tag group at a time, and on a workload whose members are mostly long
+ * that is the common case rather than the rare one: the 1000-member
+ * leaderboard set has a median member of 51 bytes, so 86.8% of its lookups
+ * would never reach a vector compare.
+ *
+ * The final group is loaded so that it ends at the last tag and its earlier
+ * lanes are shifted out, which keeps every load inside the tag array; leaves
+ * below ZBT_TAG_SCAN_MIN_COUNT have no full group and keep the memchr()
+ * search. Returns -1 when it does not apply. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
+                         const unsigned char *ele, size_t elelen,
+                         double *score, unsigned int *position)
+{
+    unsigned int count = leaf->n.count;
+    if (count < ZBT_TAG_SCAN_MIN_COUNT) return -1;
+
+    uint8_t tag = zbtLeafTag(hash);
+    uint8_t *tags = zbtScoreLeafHashTags(leaf);
+    uint16_t *offsets = zbtScoreLeafOffsets(leaf);
+    unsigned int base = 0, physical;
+
+    for (; base + ZBT_TAG_SCAN_WIDTH <= count; base += ZBT_TAG_SCAN_WIDTH) {
+        uint64_t mask = zbtTagMatch(tags + base, tag);
+        if (mask && zbtScoreLeafCheckCandidates(leaf, offsets, mask, base,
+                                                hash, ele, elelen, &physical))
+            goto found;
+    }
+    if (base < count) {
+        unsigned int rest = count - base;
+        uint64_t mask = zbtTagMatch(tags + count - ZBT_TAG_SCAN_WIDTH, tag) >>
+                        ((ZBT_TAG_SCAN_WIDTH - rest) << ZBT_TAG_MATCH_SHIFT);
+        if (mask && zbtScoreLeafCheckCandidates(leaf, offsets, mask, base,
+                                                hash, ele, elelen, &physical))
+            goto found;
+    }
+    return 0;
+
+found:
+    if (score) *score = zbtScoreLeafScoreAt(leaf, physical);
+    if (position) *position = zbtScoreLeafPhysicalPos(leaf, physical);
+    return 1;
+}
+
 static inline __attribute__((always_inline))
 int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
                                  const unsigned char *ele, size_t elelen,
@@ -1549,6 +1626,8 @@ int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
 {
     int found = zbtScoreLeafFindShort(leaf, zbtLeafTag(hash), ele, elelen,
                                       score, position);
+    if (found >= 0) return found;
+    found = zbtScoreLeafFindLong(leaf, hash, ele, elelen, score, position);
     if (found >= 0) return found;
     return zbtScoreLeafFindMemberByTags(leaf, hash, ele, elelen, score,
                                         position);
@@ -5561,6 +5640,26 @@ static int zbtTestCheckLeafSearch(zbtreeSet *zs, unsigned long *collisions) {
                                            NULL, NULL))
                     return 0;
             }
+#ifdef ZBT_TAG_SIMD
+            /* zbtScoreLeafFindLong() is what members too long for the short
+             * search now use instead of the memchr() search, so the two must
+             * agree -- on this hit, and on a miss that shares its tag. */
+            if (leaf->n.count >= ZBT_TAG_SCAN_MIN_COUNT) {
+                double s1 = -1, s2 = -1;
+                unsigned int p1 = UINT_MAX, p2 = UINT_MAX;
+                int a = zbtScoreLeafFindLong(leaf, hash, ele, len, &s1, &p1);
+                int b = zbtScoreLeafFindMemberByTags(leaf, hash, ele, len,
+                                                     &s2, &p2);
+                if (a != b || s1 != s2 || p1 != p2) return 0;
+                if (len + 1 < sizeof(other)) {
+                    a = zbtScoreLeafFindLong(leaf, hash, other, len + 1,
+                                             NULL, NULL);
+                    b = zbtScoreLeafFindMemberByTags(leaf, hash, other,
+                                                     len + 1, NULL, NULL);
+                    if (a != b) return 0;
+                }
+            }
+#endif
         }
     }
     return 1;
