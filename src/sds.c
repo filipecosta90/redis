@@ -753,8 +753,16 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             }
             break;
         default:
-            s[i++] = *f;
-            sdsinclen(s,1);
+            /* Copy the whole run of literal bytes up to the next '%' (or the
+             * end of the format) at once. l >= 1 since *f is not '%' or '\0'. */
+            l = strcspn(f,"%");
+            if (sdsavail(s) < l) {
+                s = sdsMakeRoomFor(s,l);
+            }
+            memcpy(s+i,f,l);
+            sdsinclen(s,l);
+            i += l;
+            f += l-1; /* Point at the last copied byte, skipped by f++ below. */
             break;
         }
         f++;
@@ -1369,6 +1377,36 @@ int sdsTest(int argc, char **argv, int flags) {
         test_cond("sdscatfmt() seems working with unsigned numbers",
             sdslen(x) == 35 &&
             memcmp(x,"--4294967295,18446744073709551615--",35) == 0);
+
+        sdsfree(x);
+        {
+            /* Literal runs around specifiers, '%%', an unknown specifier and
+             * a trailing lone '%' (dropped). x already has room for
+             * strlen(fmt)*2, so sdscatfmt() does not grow it up front; pad
+             * leaves exactly one byte free after %S (pre is the output before
+             * it), so the literal tail must grow the buffer. */
+            const char *fmt = "id=%i 100%% %z %S tail-literal-run%";
+            const char *pre = "--id=7 100% z ";
+            x = sdsMakeRoomFor(sdsnew("--"),strlen(fmt)*2);
+            size_t alloc = sdsalloc(x);
+            size_t padlen = alloc - strlen(pre) - 1;
+            sds pad = sdsnewlen(SDS_NOINIT,padlen);
+            memset(pad,'a',padlen);
+            x = sdscatfmt(x,fmt,7,pad);
+            sds expected = sdscatprintf(sdsempty(),"%s%s tail-literal-run",pre,pad);
+            test_cond("sdscatfmt() copies literal runs correctly",
+                sdsalloc(x) > alloc &&
+                sdslen(x) == sdslen(expected) &&
+                memcmp(x,expected,sdslen(x)+1) == 0);
+            sdsfree(pad);
+            sdsfree(expected);
+
+            sdsfree(x);
+            x = sdscatfmt(sdsnew("--"),"");
+            x = sdscatfmt(x,"no specifiers");
+            test_cond("sdscatfmt() with empty and specifier-free formats",
+                sdslen(x) == 15 && memcmp(x,"--no specifiers\0",16) == 0);
+        }
 
         sdsfree(x);
         x = sdsnew(" x ");
