@@ -371,7 +371,7 @@ start_server {tags {"zset"}} {
             assert_encoding $encoding ztmp
 
             # One changed pair among unchanged ones is the only update and
-            # produces the first event.
+            # produces one event. Restoring it with CH is a second update.
             set last [expr {[llength $pairs] - 2}]
             set changed [lreplace $pairs $last $last 1000]
             assert_equal 0 [r zadd ztmp {*}$changed]

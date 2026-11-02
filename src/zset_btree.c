@@ -365,9 +365,10 @@ static inline size_t zbtScoreLeafTagBytes(unsigned int count) {
 static_assert(offsetof(zbtScoreLeaf, data) % sizeof(uint16_t) == 0,
               "the offsets after an even tag area must stay aligned");
 
-/* Eight spare bytes let the bit readers use one unaligned 64 bit load even
- * for the last score. Nothing follows the scores in the packed arrays, so
- * they need no alignment. */
+/* The eight spare bytes let a field be read with one 64 bit load plus the
+ * ninth byte, even for the last score. Bits past the last field are zero.
+ * Nothing follows the scores in the packed arrays, so they need no
+ * alignment. */
 static size_t zbtScoreLeafScoreBytes(unsigned int count,
                                      unsigned int score_bits)
 {
@@ -561,6 +562,7 @@ static inline double zbtScoreLeafScoreAt(zbtScoreLeaf *leaf,
         uint64_t high = scores[byte + 8];
         memcpy(&delta, scores + byte, sizeof(delta));
         delta = intrev64ifbe(delta) >> shift;
+        /* shift is 0..7; two shifts so that 0 does not shift by 64. */
         delta |= (high << 1) << (63 - shift);
         delta &= UINT64_MAX >> (64 - bits);
         delta <<= leaf->n.score_shift;
@@ -1534,7 +1536,8 @@ int zbtScoreLeafCheckCandidates(zbtScoreLeaf *leaf, const uint16_t *offsets,
     return 0;
 }
 
-/* zbtScoreLeafFindShort() for longer members. The last group ends at the last
+/* zbtScoreLeafFindShort() for any member length. Returns -1 if the leaf has
+ * fewer than ZBT_TAG_SCAN_MIN_COUNT members. The last group ends at the last
  * tag with the lanes already seen shifted out, so no memcmp() repeats. */
 static inline __attribute__((always_inline))
 int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
@@ -2283,8 +2286,9 @@ int zbtIndexTableFind(zbtreeSet *zs, zbtIndexTable *table,
                     }
                 }
 #ifdef ZBT_TAG_SIMD
-                /* Inline the short search only here. Long members skip the
-                 * vector scan; their hits usually end in zbtIndexFindHome(). */
+                /* Inline the short search only for read-only lookups. Long
+                 * members skip the vector scan; their hits usually end in
+                 * zbtIndexFindHome(). */
                 int hit;
                 if (elelen > ZBT_SHORT_MEMBER_MAX)
                     hit = zbtScoreLeafFindMemberByTags(leaf, hash, ele, elelen,
@@ -2600,7 +2604,8 @@ static int zbtIndexOwnsBucket(zbtIndexTable *table,
 
 /* Find a member in its home bucket without the bookkeeping of
  * zbtIndexTableFind(), which returns the same entry. The caller makes sure no
- * resize is in progress. Keep in sync with zbtIndexTableFind(). */
+ * resize is in progress. Keep in sync with zbtIndexTableFind() and
+ * zbtreeLookupStart(). */
 static inline __attribute__((always_inline))
 int zbtIndexFindHome(zbtreeSet *zs, uint32_t hash,
                      const unsigned char *ele, size_t elelen,
@@ -2621,7 +2626,7 @@ int zbtIndexFindHome(zbtreeSet *zs, uint32_t hash,
         matches &= matches - 1;
         if ((uint8_t)(tags >> (pos * 8)) != tag) continue;
         uint32_t id = zbtIndexGetId(table, bucket, pos);
-        if (id >= zs->next_score_leaf_id) continue; /* And deleted IDs. */
+        if (id >= zs->next_score_leaf_id) continue; /* Also deleted IDs. */
         zbtScoreLeaf *leaf = zs->score_leaf_by_id[id];
         /* Without a resize every live entry names a live leaf. */
         if (ZBT_IS_FREE_LEAF_ID(leaf) || leaf == NULL || leaf->id != id) {
@@ -2999,8 +3004,8 @@ static void zbtScoreDeleteInPlace(zbtreeSet *zs, zbtScoreLeaf *leaf,
         leaf->record_start += deleted_bytes;
     }
 
-    /* The offsets and scores move down: close the field in each array, then
-     * move the first array first. */
+    /* Close the field in each array, then move the offsets and the scores
+     * down, lowest address first, so no move overwrites bytes still to move. */
     zbtDeleteScoreBits(leaf, old_scores, oldcount, physical);
     uint8_t *hash_tags = zbtScoreLeafHashTags(leaf);
     memmove(hash_tags + physical, hash_tags + physical + 1,
@@ -5265,6 +5270,20 @@ static int zbtTestCheck(zbtreeSet *zs) {
                 printf("    check failed: arrays overlap records in leaf %u\n",
                        leaf->id);
                 goto done;
+            }
+            if (leaf->score_bits) {
+                /* Bits past the last field must be zero. */
+                unsigned char *scores = zbtScoreLeafScores(leaf);
+                size_t end = zbtScoreLeafScoreBytes(leaf->n.count,
+                                                    leaf->score_bits) * 8;
+                for (size_t b = (size_t)leaf->n.count * leaf->score_bits;
+                     b < end; b++)
+                {
+                    if (!((scores[b / 8] >> (b % 8)) & 1)) continue;
+                    printf("    check failed: score bits past the end in "
+                           "leaf %u\n", leaf->id);
+                    goto done;
+                }
             }
             int in_new = zs->member_rehash && zbtIndexLeafMigrated(zs, leaf);
             for (unsigned int i = 0; i < leaf->n.count; i++) {
