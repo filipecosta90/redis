@@ -2191,6 +2191,29 @@ static int zsetGetPositionOrReply(client *c, robj *arg, int *where) {
  * Sorted set commands
  *----------------------------------------------------------------------------*/
 
+/* Shortest ZADD whose member lookups are worth batching, and the size of the
+ * speculative first batch of a command. Both are expressed in batches of the
+ * zbtreeScores() primitive.
+ *
+ * The minimum is four batches rather than one. A command that stops batching
+ * part way leaves at most one batch of lookups unused (see below), so the
+ * shorter the command, the larger that is as a share of its work: a quarter of
+ * a 64 pair command, but four fifths of a 20 pair one. Four batches bounds it
+ * at a quarter, and keeps every shipped size inside the range where batching
+ * was actually measured to help.
+ *
+ * tests/unit/type/zadd-batch.tcl derives its command sizes from this value;
+ * raising it without raising those leaves the tests green and the path
+ * untested. */
+#define ZADD_BATCH_MIN_PAIRS    (4 * (ZBT_SCORE_BATCH_SIZE))
+#define ZADD_BATCH_PROBE_PAIRS  ((ZBT_SCORE_BATCH_SIZE) / 4)
+static_assert(ZBT_SCORE_BATCH_SIZE <= (int)(CHAR_BIT * sizeof(unsigned int)),
+              "zbtreeScores() returns the found set in an unsigned int");
+static_assert(ZADD_BATCH_PROBE_PAIRS >= 1,
+              "the first batch of a ZADD must probe at least one pair");
+static_assert(ZADD_BATCH_MIN_PAIRS >= ZBT_SCORE_BATCH_SIZE,
+              "a batched ZADD must be able to fill at least one batch");
+
 /* This generic command implements both ZADD and ZINCRBY. */
 void zaddGenericCommand(client *c, int flags) {
     static char *nanerr = "resulting score is not a number (NaN)";
@@ -2288,12 +2311,86 @@ void zaddGenericCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
+
+    /* On a B+ tree the pairs of a multi pair ZADD are looked up one after the
+     * other, so the chains of dependent loads in the member index never
+     * overlap. Resolve them in batches through zbtreeScores(), the way
+     * ZMSCORE already does, and answer from the batch the leading run of
+     * pairs that leave the set unchanged: an existing member whose score is
+     * already the one being set.
+     *
+     * Only that leading run is answered. The first pair that is not one of
+     * them ends the batching for the rest of the command and is handed to
+     * zsetAdd() as before, which looks the member up itself and may change
+     * the set. So no zsetAdd() ever runs between filling a batch and reading
+     * from it: the only thing a batch leaves behind is 'unchanged_end', and
+     * the pairs below it were proven unchanged against a set that nothing
+     * has touched since.
+     *
+     * The batch costs a lookup that zsetAdd() would otherwise do, so it is
+     * kept off where it cannot pay for itself:
+     *   - a command shorter than one batch never starts one;
+     *   - the first batch of a command probes a quarter of a batch, and only
+     *     a batch consumed to its end widens the next one;
+     *   - a batch that is not consumed to its end ends at a pair this lookup
+     *     has just proven is not answerable, so batching stops rather than
+     *     probe it again.
+     * Every batch but the last one answered its pairs, so the whole cost a
+     * ZADD can carry and not use is the unconsumed tail of a single batch,
+     * at most ZBT_SCORE_BATCH_SIZE lookups and only once.
+     *
+     * INCR is excluded outright, and not merely because it is a single pair
+     * command: under INCR scores[j] is an increment, not the score being set,
+     * so the test below would compare a stored score against a delta and
+     * would not mean the set is unchanged. The !incr term is therefore load
+     * bearing even though a single pair command cannot reach the threshold
+     * anyway.
+     *
+     * The encoding is read once: a set that is a B+ tree here stays one for
+     * the rest of the command, and a listpack that zsetAdd() converts stays
+     * unbatched for the rest of it. */
+    int batching = (zobj->encoding == OBJ_ENCODING_BTREE && llen > 0 &&
+                    elements >= ZADD_BATCH_MIN_PAIRS && !incr);
+    int batch_widened = 0;  /* a batch of this command was consumed to its end */
+    int unchanged_end = 0;  /* pairs before this index leave the set alone */
+
     for (j = 0; j < elements; j++) {
+        if (batching && j >= unchanged_end) {
+            sds members[ZBT_SCORE_BATCH_SIZE];
+            double stored[ZBT_SCORE_BATCH_SIZE];
+            unsigned int cap = batch_widened ? ZBT_SCORE_BATCH_SIZE :
+                                               ZADD_BATCH_PROBE_PAIRS;
+            unsigned int n = elements - j;
+            if (n > cap) n = cap;
+            for (unsigned int i = 0; i < n; i++)
+                members[i] = c->argv[scoreidx+1+(j+i)*2]->ptr;
+            unsigned int found = zbtreeScores(zobj->ptr, members, n, stored);
+            unsigned int run = 0;
+            while (run < n && (found & (1U << run)) &&
+                   stored[run] == scores[j+run])
+                run++;
+            unchanged_end = j + run;
+            if (run < n) batching = 0;
+            else batch_widened = 1;
+        }
+
+        if (j < unchanged_end) {
+            /* The member is there with this very score, so zsetAdd() would
+             * return 1 without touching the set, 'added', 'updated' or
+             * server.dirty. Its one remaining effect is 'processed', which
+             * NX, GT and LT suppress; that counter is read only for the INCR
+             * reply, and INCR never reaches here, but keep it faithful so the
+             * two paths stay interchangeable. */
+            if (!(nx || gt || lt)) processed++;
+            continue;
+        }
+
         double newscore;
-        score = scores[j];
         int retflags = 0;
 
+        score = scores[j];
         ele = c->argv[scoreidx+1+j*2]->ptr;
+
         int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
