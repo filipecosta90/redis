@@ -2342,12 +2342,80 @@ void zaddGenericCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
+
+    /* On a B+ tree the pairs of a multi pair ZADD are looked up one after the
+     * other, so the chains of dependent loads in the member index never
+     * overlap. Resolve them in batches first, the way ZMSCORE and the ZINTER
+     * loop already do, and answer from the batch every pair that leaves the
+     * set unchanged: an existing member whose score is the one being set.
+     * That is the whole of a steady state leaderboard write, where each ZADD
+     * re-sends the members it already holds.
+     *
+     * Nothing else is answered here. Any other pair goes through zsetAdd(),
+     * which looks the member up itself and may change the set, so the rest of
+     * the batch is dropped and refilled after it.
+     *
+     * The batch costs a lookup that zsetAdd() then repeats, so it is kept off
+     * where it cannot pay for itself:
+     *   - commands shorter than one batch never start one;
+     *   - the first batch of a command probes with a quarter of a batch;
+     *   - a batch that answers no pair at all turns batching off for the rest
+     *     of the command, so an insert only ZADD pays for one probe.
+     * INCR is excluded outright: it always changes the score, and it is a
+     * single pair command anyway.
+     *
+     * A NaN score equals no stored score, so such a pair is never answered
+     * here and still reaches zsetAdd(), which reports the error.
+     *
+     * The encoding is read once: a set that is a B+ tree here stays one for
+     * the rest of the command, and a listpack that zsetAdd() converts was
+     * never batched to begin with. Nothing between filling a batch and
+     * reading from it touches the set, so the saved scores cannot go stale. */
+    int batch_lookup = (zobj->encoding == OBJ_ENCODING_BTREE &&
+                        elements >= ZBT_SCORE_BATCH_SIZE && !incr);
+    int batch_proven = 0;   /* a batch of this command has answered a pair */
+    int batch_end = 0;      /* pairs before this index are answerable */
+    double batch_scores[ZBT_SCORE_BATCH_SIZE];
+
     for (j = 0; j < elements; j++) {
         double newscore;
         score = scores[j];
         int retflags = 0;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
+
+        if (batch_lookup && j >= batch_end) {
+            sds members[ZBT_SCORE_BATCH_SIZE];
+            unsigned int n = elements - j;
+            unsigned int cap = batch_proven ? ZBT_SCORE_BATCH_SIZE :
+                                              ZBT_SCORE_BATCH_SIZE / 4;
+            if (n > cap) n = cap;
+            for (unsigned int i = 0; i < n; i++)
+                members[i] = c->argv[scoreidx+1+(j+i)*2]->ptr;
+            unsigned int found = zbtreeScores(zobj->ptr, members, n,
+                                              batch_scores);
+            /* Only the leading run of unchanged pairs is usable: the first
+             * pair that is not one of them may change the set. */
+            unsigned int run = 0;
+            while (run < n && (found & (1U << run)) &&
+                   batch_scores[run] == scores[j+run])
+                run++;
+            batch_end = j + run;
+            if (run == 0) batch_lookup = 0;
+            else batch_proven = 1;
+        }
+
+        if (batch_lookup && j < batch_end) {
+            /* The member is there with this very score, so zsetAdd() would
+             * return 1 having touched the set, 'added', 'updated' and
+             * server.dirty not at all. Its one remaining effect is
+             * 'processed', which NX, GT and LT suppress; that counter is read
+             * only for the INCR reply, and INCR never reaches here, but keep
+             * it faithful so the two paths stay interchangeable. */
+            if (!(nx || gt || lt)) processed++;
+            continue;
+        }
+
         int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
