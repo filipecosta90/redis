@@ -2191,6 +2191,18 @@ static int zsetGetPositionOrReply(client *c, robj *arg, int *where) {
  * Sorted set commands
  *----------------------------------------------------------------------------*/
 
+/* Shortest ZADD whose member lookups are worth batching, and the size of the
+ * speculative first batch of a command. Both are expressed in batches of the
+ * zbtreeScores() primitive rather than tuned: one batch is the smallest span
+ * over which overlapping the lookups can pay for itself, and a quarter of one
+ * is what a command risks before it has answered a single pair. */
+#define ZADD_BATCH_MIN_PAIRS    ZBT_SCORE_BATCH_SIZE
+#define ZADD_BATCH_PROBE_PAIRS  (ZBT_SCORE_BATCH_SIZE / 4)
+static_assert(ZBT_SCORE_BATCH_SIZE <= 32,
+              "zbtreeScores() returns the found set in an unsigned int");
+static_assert(ZADD_BATCH_PROBE_PAIRS >= 1,
+              "the first batch of a ZADD must probe at least one pair");
+
 /* This generic command implements both ZADD and ZINCRBY. */
 void zaddGenericCommand(client *c, int flags) {
     static char *nanerr = "resulting score is not a number (NaN)";
@@ -2288,12 +2300,77 @@ void zaddGenericCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
+
+    /* On a B+ tree the pairs of a multi pair ZADD are looked up one after the
+     * other, so the chains of dependent loads in the member index never
+     * overlap. Resolve them in batches through zbtreeScores(), the way
+     * ZMSCORE already does, and answer from the batch the leading run of
+     * pairs that leave the set unchanged: an existing member whose score is
+     * already the one being set.
+     *
+     * Only that leading run is answered. The first pair that is not one of
+     * them ends the batching for the rest of the command and is handed to
+     * zsetAdd() as before, which looks the member up itself and may change
+     * the set. So no zsetAdd() ever runs between filling a batch and reading
+     * from it, which is why a saved score cannot go stale.
+     *
+     * The batch costs a lookup that zsetAdd() would otherwise do, so it is
+     * kept off where it cannot pay for itself:
+     *   - a command shorter than one batch never starts one;
+     *   - the first batch of a command probes a quarter of a batch, and only
+     *     a batch consumed to its end widens the next one;
+     *   - a batch that is not consumed to its end ends at a pair this lookup
+     *     has just proven is not answerable, so batching stops rather than
+     *     probe it again.
+     * A ZADD that changes the set therefore pays at most one probe and one
+     * widened batch, once. INCR is excluded outright: it always changes the
+     * score, and it is a single pair command anyway.
+     *
+     * The encoding is read once: a set that is a B+ tree here stays one for
+     * the rest of the command, and a listpack that zsetAdd() converts stays
+     * unbatched for the rest of it. */
+    int batching = (zobj->encoding == OBJ_ENCODING_BTREE &&
+                    elements >= ZADD_BATCH_MIN_PAIRS && !incr);
+    int batch_widened = 0;  /* a batch of this command was consumed to its end */
+    int unchanged_end = 0;  /* pairs before this index leave the set alone */
+
     for (j = 0; j < elements; j++) {
+        if (batching && j >= unchanged_end) {
+            sds members[ZBT_SCORE_BATCH_SIZE];
+            double stored[ZBT_SCORE_BATCH_SIZE];
+            unsigned int cap = batch_widened ? ZBT_SCORE_BATCH_SIZE :
+                                               ZADD_BATCH_PROBE_PAIRS;
+            unsigned int n = elements - j;
+            if (n > cap) n = cap;
+            for (unsigned int i = 0; i < n; i++)
+                members[i] = c->argv[scoreidx+1+(j+i)*2]->ptr;
+            unsigned int found = zbtreeScores(zobj->ptr, members, n, stored);
+            unsigned int run = 0;
+            while (run < n && (found & (1U << run)) &&
+                   stored[run] == scores[j+run])
+                run++;
+            unchanged_end = j + run;
+            if (run < n) batching = 0;
+            else batch_widened = 1;
+        }
+
+        if (j < unchanged_end) {
+            /* The member is there with this very score, so zsetAdd() would
+             * return 1 without touching the set, 'added', 'updated' or
+             * server.dirty. Its one remaining effect is 'processed', which
+             * NX, GT and LT suppress; that counter is read only for the INCR
+             * reply, and INCR never reaches here, but keep it faithful so the
+             * two paths stay interchangeable. */
+            if (!(nx || gt || lt)) processed++;
+            continue;
+        }
+
         double newscore;
-        score = scores[j];
         int retflags = 0;
 
+        score = scores[j];
         ele = c->argv[scoreidx+1+j*2]->ptr;
+
         int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
