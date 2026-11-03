@@ -3140,8 +3140,9 @@ start_server {tags {"zset"}} {
             }
 
             # PATH 3: Ask almost as elements as there are in the set.
-            # In this case the implementation will duplicate the original
-            # set and will remove random elements up to the requested size.
+            # For btree the implementation walks the set once and selects
+            # each element with probability needed/remaining; listpack sets
+            # are served by a separate single-pass path.
             #
             # PATH 4: Ask a number of elements definitely smaller than
             # the set size.
@@ -3192,6 +3193,89 @@ start_server {tags {"zset"}} {
             }
         }
         r config set zset-max-ziplist-value $original_max_value
+    }
+
+    test "ZRANDMEMBER positive count uniqueness - btree" {
+        # PATH 2 and PATH 3 on a btree, in both protocols. 67 is the smallest
+        # count that takes PATH 3 for 200 members. Members straddle the
+        # btree's external member threshold (ZBT_EXTERNAL_MEMBER_AT, 320
+        # bytes) and scores repeat.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del myzset
+        for {set i 0} {$i < 200} {incr i} {
+            set m "m:$i:"
+            if {$i % 4 != 0} {
+                set m [string range $m[string repeat x 330] 0 [expr {317 + $i % 4}]]
+            }
+            r zadd myzset [expr {$i % 20}] $m
+        }
+        assert_encoding btree myzset
+
+        foreach proto {2 3} {
+            r hello $proto
+            set mydict [dict create {*}[concat {*}[r zrange myzset 0 -1 withscores]]]
+            foreach count {67 120 199 200 300} {
+                set want [expr {min($count, 200)}]
+                set res [r zrandmember myzset $count]
+                assert_equal $want [llength [lsort -unique $res]]
+                check_member $mydict $res
+
+                set res [r zrandmember myzset $count withscores]
+                if {$proto == 3} {
+                    assert_equal 2 [llength [lindex $res 0]]
+                    set res [concat {*}$res]
+                }
+                assert_equal [expr {$want * 2}] [llength $res]
+                assert_equal $want [dict size [dict create {*}$res]]
+                check_member_and_score $mydict $res
+            }
+        }
+        r hello 2
+        r config set zset-max-listpack-entries $original_max
+    }
+
+    test "ZRANDMEMBER count > size/3 distribution - btree" {
+        # The PATH 3 histogram above uses 10 elements, too few to tell a
+        # uniform sampler from one skewed by a hash table layout. Each of
+        # 200 members is in a reply with probability 120/200, so after 1000
+        # calls a uniform sampler reads about 80 with sd about 8, while a
+        # layout-skewed one reads in the hundreds.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del myzset
+        for {set i 0} {$i < 200} {incr i} {
+            r zadd myzset [expr {$i % 7}] "member:$i"
+        }
+        assert_encoding btree myzset
+
+        set allkey {}
+        for {set i 0} {$i < 1000} {incr i} {
+            set res [r zrandmember myzset 120]
+            assert_equal 120 [llength [lsort -unique $res]]
+            lappend allkey {*}$res
+        }
+        assert_lessthan [chi_square_value $allkey] 200
+        r config set zset-max-listpack-entries $original_max
+    }
+
+    test "ZRANDMEMBER count > size/3 subset distribution - btree" {
+        # Every 3 element subset of 6 must be equally likely, which a per
+        # member histogram cannot show. Chi-square with df 19 exceeds 60 with
+        # p < 1e-5.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del myzset
+        r zadd myzset 1 a 2 b 3 c 4 d 5 e 6 f
+        assert_encoding btree myzset
+
+        set subsets {}
+        for {set i 0} {$i < 2000} {incr i} {
+            lappend subsets [join [lsort [r zrandmember myzset 3]] ,]
+        }
+        assert_equal 20 [llength [lsort -unique $subsets]]
+        assert_lessthan [chi_square_value $subsets] 60
+        r config set zset-max-listpack-entries $original_max
     }
 
     test {zset score double range} {
