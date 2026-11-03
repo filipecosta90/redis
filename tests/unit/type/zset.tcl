@@ -3276,6 +3276,27 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $original_max
     }
 
+    test "ZRANDMEMBER with <count> across the strategy threshold - btree" {
+        # Every count from 1 to size, so both sides of the dense/sparse
+        # threshold are covered whatever its value. Each reply must hold
+        # exactly count distinct members with their own scores.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 16
+        r del myzset
+        for {set i 0} {$i < 150} {incr i} {
+            r zadd myzset [expr {$i % 30}] "m:$i"
+        }
+        assert_encoding btree myzset
+        for {set count 1} {$count <= 150} {incr count} {
+            set res [r zrandmember myzset $count withscores]
+            assert_equal [expr {$count * 2}] [llength $res]
+            set d [dict create {*}$res]
+            assert_equal $count [dict size $d]
+            dict for {m s} $d { assert_equal [r zscore myzset $m] $s }
+        }
+        r config set zset-max-listpack-entries $original_max
+    }
+
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz

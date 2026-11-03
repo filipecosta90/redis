@@ -5148,6 +5148,15 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
  * implementation for more info. */
 #define ZRANDMEMBER_SUB_STRATEGY_MUL 3
 
+/* Same threshold for the B+ tree encoding, where the dense strategy is a
+ * single allocation-free walk (see CASE 3 below) rather than a dict holding a
+ * copy of the whole set. The walk costs O(size) and the sparse strategy
+ * (CASE 4) costs O(count * log(size)) plus a dict of count copies, so the
+ * crossover sits at a different fraction of the set than for the dict-based
+ * strategy and is tuned separately. A count above size divided by this value
+ * takes the walk. */
+#define ZRANDMEMBER_SUB_STRATEGY_MUL_BTREE 3
+
 /* If client is trying to ask for a very large number of random elements,
  * queuing may consume an unlimited amount of memory, so we want to limit
  * the number of randoms per time. */
@@ -5268,7 +5277,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      * no temporary dict and no member copies. 'needed <= remaining' holds
      * throughout, so exactly reply_size members are emitted, in score order. */
     if (zsetobj->encoding == OBJ_ENCODING_BTREE &&
-        (count >= size || count*ZRANDMEMBER_SUB_STRATEGY_MUL > size))
+        (count >= size || count*ZRANDMEMBER_SUB_STRATEGY_MUL_BTREE > size))
     {
         unsigned long remaining = size, needed = reply_size;
         zbtreeIterator iter;
@@ -5341,8 +5350,14 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. */
-    if (count*ZRANDMEMBER_SUB_STRATEGY_MUL > size) {
+     * used into CASE 4 is highly inefficient.
+     *
+     * The B+ tree never gets here: its dense counts take the walk above,
+     * selected by ZRANDMEMBER_SUB_STRATEGY_MUL_BTREE, and all other counts go
+     * to CASE 4. */
+    if (zsetobj->encoding != OBJ_ENCODING_BTREE &&
+        count*ZRANDMEMBER_SUB_STRATEGY_MUL > size)
+    {
         /* Hashtable encoding (generic implementation) */
         dict *d = dictCreate(&sdsReplyDictType);
         dictExpand(d, size);
