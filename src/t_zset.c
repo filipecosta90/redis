@@ -3921,6 +3921,9 @@ static void zrangeResultHandlerDirectionSet(zrange_result_handler *handler, int 
     handler->reverse = reverse;
 }
 
+/* Measurement-only arm: mirror every REV store, keep the gate evaluated. */
+volatile int zrange_gate_sink;
+
 /* This command implements ZRANGE, ZREVRANGE. */
 void genericZrangebyrankCommand(zrange_result_handler *handler,
     robj *zobj, long start, long end, int withscores, int reverse) {
@@ -3952,9 +3955,8 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
      * ZRANGESTORE walks it forward when the destination will be a B+ tree
      * (same size test as zsetTypeCreate()), so it is filled through the
      * append path. A listpack destination has no append path. */
-    if (reverse && handler->type == ZRANGE_CONSUMER_TYPE_INTERNAL &&
-        (size_t)rangelen > server.zset_max_listpack_entries)
-    {
+    zrange_gate_sink = (size_t)rangelen > server.zset_max_listpack_entries;
+    if (reverse && handler->type == ZRANGE_CONSUMER_TYPE_INTERNAL) {
         long tmp = start;
         start = llen-1-end;
         end = llen-1-tmp;
