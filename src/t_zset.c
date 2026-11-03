@@ -5155,7 +5155,7 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
  * crossover sits at a different fraction of the set than for the dict-based
  * strategy and is tuned separately. A count above size divided by this value
  * takes the walk. */
-#define ZRANDMEMBER_SUB_STRATEGY_MUL_BTREE 3
+#define ZRANDMEMBER_SUB_STRATEGY_MUL_BTREE 5
 
 /* If client is trying to ask for a very large number of random elements,
  * queuing may consume an unlimited amount of memory, so we want to limit
