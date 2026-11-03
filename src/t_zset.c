@@ -5143,6 +5143,99 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
     }
 }
 
+/* Return a uniform integer in [0, n). Draws below 2^64 mod n are rejected so
+ * that the accepted range is a whole multiple of n and the modulo is fair. */
+static unsigned long zrandmemberRandomBelow(unsigned long n) {
+    uint64_t limit = (0 - (uint64_t)n) % n;
+    uint64_t r;
+    do {
+        r = genrand64_int64();
+    } while (r < limit);
+    return r % n;
+}
+
+static int zrandmemberRankCmp(const void *a, const void *b) {
+    unsigned long x = *(const unsigned long *)a, y = *(const unsigned long *)b;
+    return (x > y) - (x < y);
+}
+
+/* Fill 'ranks' with 'count' distinct ranks, uniformly chosen from [0, size)
+ * and sorted ascending. 'ranks' must have room for 'count' entries and count
+ * must be below size.
+ *
+ * Floyd's algorithm takes exactly 'count' draws, with no retries however
+ * close count gets to size: for each j in [size-count, size) it picks t in
+ * [0, j] and keeps t, or j itself if t was already kept. Every subset is
+ * equally likely. An open addressing table of integers answers "already
+ * kept?", at a load factor of at most one half. */
+static void zrandmemberSampleRanks(unsigned long size, unsigned long count,
+                                   unsigned long *ranks)
+{
+    const unsigned long empty = ULONG_MAX; /* Never a rank: size fits. */
+    unsigned int bits = 4;
+    while ((1UL << bits) < count * 2) bits++;
+    unsigned long mask = (1UL << bits) - 1;
+    unsigned long *table = zmalloc(sizeof(unsigned long) << bits);
+    for (unsigned long i = 0; i <= mask; i++) table[i] = empty;
+
+    unsigned long kept = 0;
+    for (unsigned long j = size - count; j < size; j++) {
+        unsigned long t = zrandmemberRandomBelow(j + 1);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            unsigned long slot =
+                (unsigned long)(((uint64_t)t * 0x9E3779B97F4A7C15ULL) >>
+                                (64 - bits));
+            while (table[slot] != empty && table[slot] != t)
+                slot = (slot + 1) & mask;
+            if (table[slot] == empty) {
+                table[slot] = t;
+                ranks[kept++] = t;
+                break;
+            }
+            /* 't' is already kept. 'j' cannot be, every earlier pick is
+             * below it, so the second attempt always inserts. */
+            t = j;
+        }
+    }
+    serverAssert(kept == count);
+    zfree(table);
+    qsort(ranks, count, sizeof(unsigned long), zrandmemberRankCmp);
+}
+
+/* CASE 4 of ZRANDMEMBER for a B+ tree: choose the distinct ranks first, then
+ * visit them in one forward pass. Each step skips ahead by the gap to the
+ * next rank, so large gaps pass over whole leaves by their counts and small
+ * ones stay in the current leaf. Members are replied straight from the leaf
+ * without copies. The reply comes out in score order. */
+static void zrandmemberSparseFromBtree(client *c, zbtreeSet *zs,
+                                       unsigned long size, unsigned long count,
+                                       int withscores)
+{
+    unsigned long *ranks = zmalloc(sizeof(unsigned long) * count);
+    zrandmemberSampleRanks(size, count, ranks);
+
+    zbtreeIterator iter;
+    serverAssert(zbtreeIteratorSeekRank(zs, ranks[0], &iter));
+    for (unsigned long i = 0; i < count; i++) {
+        const unsigned char *ele;
+        size_t len;
+        double score;
+
+        /* After Next the iterator rests on rank ranks[i-1]+1. */
+        if (i) serverAssert(zbtreeIteratorSkip(&iter, ranks[i] - ranks[i-1] - 1));
+        serverAssert(zbtreeIteratorNext(&iter, 0, &ele, &len,
+                                        withscores ? &score : NULL));
+        if (withscores && c->resp > 2)
+            addReplyArrayLen(c,2);
+        addReplyBulkCBuffer(c, ele, len);
+        if (withscores)
+            addReplyDouble(c, score);
+        if (c->flags & CLIENT_CLOSE_ASAP)
+            break;
+    }
+    zfree(ranks);
+}
+
 /* How many times bigger should be the zset compared to the requested size
  * for us to not use the "remove elements" strategy? Read later in the
  * implementation for more info. */
@@ -5342,8 +5435,19 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     /* CASE 4: We have a big zset compared to the requested number of elements.
      * In this case we can simply get random elements from the zset and add
      * to the temporary set, trying to eventually get enough unique elements
-     * to reach the specified count. */
+     * to reach the specified count.
+     *
+     * A B+ tree finds an element by rank but every pick would descend from
+     * the root, and duplicates would only be found after copying the member.
+     * So we draw distinct ranks up front and walk to them in order instead,
+     * see zrandmemberSparseFromBtree(). */
     else {
+        if (zsetobj->encoding == OBJ_ENCODING_BTREE) {
+            zrandmemberSparseFromBtree(c, zsetobj->ptr, size, count, withscores);
+            zuiClearIterator(&src);
+            goto out;
+        }
+
         /* Hashtable encoding (generic implementation) */
         unsigned long added = 0;
         dict *d = dictCreate(&hashDictType);

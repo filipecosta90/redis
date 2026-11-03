@@ -3194,6 +3194,132 @@ start_server {tags {"zset"}} {
         r config set zset-max-ziplist-value $original_max_value
     }
 
+    # Check a positive count ZRANDMEMBER reply: exact length, distinct
+    # members and scores equal to ZSCORE. If 'ordered' is set, also check
+    # that members come out in rank order, as the B+ tree CASE 4 emits them.
+    proc check_zrandmember_unique {key count withscores proto ordered} {
+        if {$withscores} {
+            set res [r zrandmember $key $count withscores]
+            if {$proto == 3} {
+                set members {}
+                set scores {}
+                foreach pair $res {
+                    assert_equal 2 [llength $pair]
+                    lappend members [lindex $pair 0]
+                    lappend scores [lindex $pair 1]
+                }
+            } else {
+                set members {}
+                set scores {}
+                foreach {m s} $res {
+                    lappend members $m
+                    lappend scores $s
+                }
+            }
+            assert_equal $scores [r zmscore $key {*}$members]
+        } else {
+            set members [r zrandmember $key $count]
+        }
+        assert_equal $count [llength $members]
+        assert_equal $count [llength [lsort -unique $members]]
+        set ranks {}
+        foreach m $members {
+            set rank [r zrank $key $m]
+            assert {$rank ne {}}
+            lappend ranks $rank
+        }
+        if {$ordered} {
+            assert_equal [lsort -integer $ranks] $ranks
+        }
+    }
+
+    test "ZRANDMEMBER sparse count on btree - count, distinct, scores" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del sparsezset
+        # Enough members for a tree with two inner levels, with every
+        # seventh member long enough to be stored outside its leaf.
+        set size 20001
+        set args {}
+        for {set i 0} {$i < $size} {incr i} {
+            if {$i % 7 == 0} {
+                set member "$i:[string repeat x 400]"
+            } else {
+                set member "m$i"
+            }
+            lappend args [expr {$i % 1000}] $member
+            if {[llength $args] >= 2000} {
+                r zadd sparsezset {*}$args
+                set args {}
+            }
+        }
+        if {[llength $args]} {r zadd sparsezset {*}$args}
+        assert_encoding btree sparsezset
+        assert_equal $size [r zcard sparsezset]
+
+        foreach proto {2 3} {
+            r hello $proto
+            # 6667 is the largest count still below the CASE 3 threshold.
+            foreach count {2 3 10 100 1000 6666 6667} {
+                foreach withscores {0 1} {
+                    check_zrandmember_unique sparsezset $count $withscores $proto 1
+                }
+            }
+        }
+        r hello 2
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - CASE 3/4 boundary" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        foreach size {300 301 302} {
+            r del sparsezset
+            for {set i 0} {$i < $size} {incr i} {
+                r zadd sparsezset $i "m$i"
+            }
+            assert_encoding btree sparsezset
+            # CASE 4 takes count*3 <= size, CASE 3 the next count up.
+            set c4 [expr {$size / 3}]
+            foreach count [list [expr {$c4 - 1}] $c4 [expr {$c4 + 1}]] {
+                set ordered [expr {$count <= $c4}]
+                foreach withscores {0 1} {
+                    check_zrandmember_unique sparsezset $count $withscores 2 $ordered
+                }
+            }
+        }
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - uniform distribution" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        r del sparsezset
+        # Several leaves, so the walk crosses leaf and inner boundaries.
+        set size 300
+        for {set i 0} {$i < $size} {incr i} {
+            if {$i % 10 == 0} {
+                r zadd sparsezset $i "$i:[string repeat y 330]"
+            } else {
+                r zadd sparsezset $i "m$i"
+            }
+        }
+        assert_encoding btree sparsezset
+        set allkey {}
+        for {set i 0} {$i < 600} {incr i} {
+            lappend allkey {*}[r zrandmember sparsezset 10]
+        }
+        unset -nocomplain seen
+        foreach k $allkey {set seen($k) 1}
+        assert_equal $size [array size seen]
+        # df = 299, 415 means about 0.00001 probability
+        assert_lessthan [chi_square_value $allkey] 415
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz

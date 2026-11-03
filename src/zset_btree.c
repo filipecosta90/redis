@@ -3919,6 +3919,54 @@ int zbtreeIteratorSeekRank(const zbtreeSet *zs, unsigned long rank,
     return 1;
 }
 
+/* Move a forward iterator 'delta' elements ahead, so that a skip of zero is
+ * a no-op. A step that stays inside the current leaf costs nothing. A longer
+ * one climbs only until an ancestor has a later child covering the target,
+ * skipping whole subtrees by their counts, then descends as SeekRank does.
+ * Return zero, leaving the iterator exhausted, if fewer than 'delta' + 1
+ * elements remain. */
+int zbtreeIteratorSkip(zbtreeIterator *iter, unsigned long delta) {
+    zbtScoreLeaf *leaf = iter->leaf;
+    if (leaf == NULL) return 0;
+
+    unsigned long left = leaf->n.count - iter->pos;
+    if (delta < left) {
+        iter->pos += delta;
+        return 1;
+    }
+
+    /* From here 'delta' counts from the first element after this leaf. */
+    delta -= left;
+    zbtScoreNode *node = &leaf->n;
+    while (node->parent) {
+        zbtScoreInner *parent = node->parent;
+        unsigned int pos = node->parent_index + 1;
+        while (pos < parent->n.count && delta >= parent->child_count[pos]) {
+            delta -= parent->child_count[pos];
+            pos++;
+        }
+        if (pos < parent->n.count) {
+            node = parent->child[pos];
+            while (!node->isleaf) {
+                zbtScoreInner *inner = (zbtScoreInner *)node;
+                pos = 0;
+                while (delta >= inner->child_count[pos]) {
+                    delta -= inner->child_count[pos];
+                    pos++;
+                }
+                node = inner->child[pos];
+            }
+            iter->leaf = node;
+            iter->pos = delta;
+            return 1;
+        }
+        node = &parent->n;
+    }
+    iter->leaf = NULL;
+    iter->pos = 0;
+    return 0;
+}
+
 /* Find the first score not below the bound. If after_equal is true, equal
  * scores are skipped too. A binary search avoids many packed score reads. */
 static unsigned int zbtScoreLeafScoreBound(zbtScoreLeaf *leaf, double score,
