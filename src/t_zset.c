@@ -4533,6 +4533,9 @@ static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start, long en
     return (size_t)len > server.zset_max_listpack_entries;
 }
 
+/* Measurement arm only: a volatile sink keeps the gate call alive under LTO. */
+volatile int zrange_gate_sink;
+
 /**
  * This function handles ZRANGE and ZRANGESTORE, and also the deprecated
  * Z[REV]RANGE[BYSCORE|BYLEX] commands.
@@ -4667,9 +4670,10 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
      * walk forward so it is filled through the append path. A listpack
      * destination has no append path, so smaller results keep the REV walk.
      * Score and lex ranges are never mirrored. */
+    /* Measurement arm: keep paying for the gate, then mirror regardless. */
     if (store && rangetype == ZRANGE_RANK &&
         direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end)) {
+        ((zrange_gate_sink = zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end)), 1)) {
         /* REV index i is forward index -1-i, which cannot overflow. */
         long tmp = opt_start;
         opt_start = -1 - opt_end;
