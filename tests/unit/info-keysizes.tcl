@@ -1068,6 +1068,19 @@ start_server {tags {external:skip needs:debug} overrides {key-memory-histograms 
             assert_equal {a} [r ZRANGE z 0 -1]
             r DEL z
         }
+        # A REV rank store whose result does not fit in a listpack walks the
+        # source forward into a B+ tree destination.
+        r CONFIG SET zset-max-listpack-entries 128
+        set args {}
+        for {set i 0} {$i < 300} {incr i} {lappend args [expr {$i/5}] [format m%03d $i]}
+        r ZADD z {*}$args
+        assert_encoding btree z
+        assert_equal 200 [r ZRANGESTORE z z 0 199 REV]
+        assert_encoding btree z
+        assert_equal {m100} [r ZRANGE z 0 0]
+        assert_equal 200 [r ZRANGESTORE z z 0 -1 REV]
+        assert_equal 0 [r ZRANGESTORE z z 5 3 REV]
+        assert_equal 0 [r EXISTS z]
         r CONFIG SET zset-max-listpack-entries $orig
         r DEBUG ALLOCSIZE-SLOTS-ASSERT 0
         verify_keymem_empty r
