@@ -3921,6 +3921,21 @@ static void zrangeResultHandlerDirectionSet(zrange_result_handler *handler, int 
     handler->reverse = reverse;
 }
 
+/* Clamp the rank range [*start,*end] of a zset of llen elements, where
+ * negative indexes count from the end, and return its length, or 0 when the
+ * range is empty. */
+static long zsetSanitizeRankRange(long llen, long *start, long *end) {
+    if (*start < 0) *start = llen+*start;
+    if (*end < 0) *end = llen+*end;
+    if (*start < 0) *start = 0;
+
+    /* Invariant: start >= 0, so this test will be true when end < 0.
+     * The range is empty when start > end or start >= length. */
+    if (*start > *end || *start >= llen) return 0;
+    if (*end >= llen) *end = llen-1;
+    return (*end-*start)+1;
+}
+
 /* This command implements ZRANGE, ZREVRANGE. */
 void genericZrangebyrankCommand(zrange_result_handler *handler,
     robj *zobj, long start, long end, int withscores, int reverse) {
@@ -3930,22 +3945,13 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     long rangelen;
     size_t result_cardinality;
 
-    /* Sanitize indexes. */
     llen = zsetLength(zobj);
-    if (start < 0) start = llen+start;
-    if (end < 0) end = llen+end;
-    if (start < 0) start = 0;
-
-
-    /* Invariant: start >= 0, so this test will be true when end < 0.
-     * The range is empty when start > end or start >= length. */
-    if (start > end || start >= llen) {
+    rangelen = zsetSanitizeRankRange(llen, &start, &end);
+    if (rangelen == 0) {
         handler->beginResultEmission(handler, 0);
         handler->finalizeResultEmission(handler, 0);
         return;
     }
-    if (end >= llen) end = llen-1;
-    rangelen = (end-start)+1;
     result_cardinality = rangelen;
 
     handler->beginResultEmission(handler, rangelen);
