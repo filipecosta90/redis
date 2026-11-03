@@ -3817,8 +3817,8 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
      * reverse-order emission both keep the original, always-correct path.
      * The batch is created lazily on the first fast-path emit (the
      * destination may start as LISTPACK and convert mid-stream) and flushed
-     * once in zrangeResultFinalizeStore(). A REV rank range whose result
-     * does not fit in a listpack arrives here in forward order too, see
+     * once in zrangeResultFinalizeStore(). A REV range whose result does
+     * not fit in a listpack arrives here in forward order too, see
      * zrangeGenericCommand(). */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
         if (!handler->append_batch)
@@ -4535,6 +4535,91 @@ static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start,
            (unsigned long)(end-start)+1 > server.zset_max_listpack_entries;
 }
 
+/* Return 1 if the element at forward rank 'rank' of a B+ tree sorted set
+ * has the given score and is not below the lexical lower bound. */
+static int zbtRankLexGteMin(const zbtreeSet *zs, unsigned long rank,
+                            double score, zlexrangespec *range)
+{
+    zbtreeIterator iter;
+    const unsigned char *ele;
+    size_t len;
+    double cur;
+
+    serverAssert(zbtreeIteratorSeekRank(zs, rank, &iter));
+    serverAssert(zbtreeIteratorNext(&iter, 0, &ele, &len, &cur));
+    return cur == score && zbtLexValueGteMin(ele, len, range);
+}
+
+/* ZRANGESTORE of a REV score or lex range on a B+ tree source stores a
+ * contiguous slice of the source. Find it as the forward rank interval
+ * [*start,*end] holding exactly the elements that the reverse walk in
+ * genericZrangebyscoreCommand() or genericZrangebylexCommand() would emit,
+ * after applying LIMIT offset and count. Return 1 only when the interval was
+ * found and has more elements than a listpack may hold; otherwise the caller
+ * keeps the reverse walk.
+ *
+ * The reverse walk starts at the last element in range, skips 'offset'
+ * elements and stops at the first one below the lower bound. Scores are
+ * ordered, so for BYSCORE that stop is just before the first element in
+ * range. Lex ranges are only ordered among equal scores, so for BYLEX the
+ * interval is used only when its two ends have the same score, its first
+ * element is in range and the element before it, if any, is not. */
+static int zrangeRevRangeToRanks(const kvobj *zobj, zrange_type rangetype,
+                                 zrangespec *range, zlexrangespec *lexrange,
+                                 long offset, long limit,
+                                 long *start, long *end)
+{
+    const zbtreeSet *zs = zobj->ptr;
+    zbtreeIterator iter;
+    unsigned long first, last, lo, hi;
+    unsigned long maxentries = server.zset_max_listpack_entries;
+
+    if (zobj->encoding != OBJ_ENCODING_BTREE || offset < 0) return 0;
+    if (limit >= 0 && (unsigned long)limit <= maxentries) return 0;
+
+    if (rangetype == ZRANGE_SCORE) {
+        if (!zbtreeIteratorSeekScore(zs, range->max, range->maxex, 1,
+                                     &iter, &last) ||
+            !zbtreeIteratorSeekScore(zs, range->min, range->minex, 0,
+                                     &iter, &first))
+            return 0;
+    } else {
+        if (!zbtreeIteratorSeekLex(zs, lexrange->max, lexrange->maxex, 1,
+                                   &iter, &last) ||
+            !zbtreeIteratorSeekLex(zs, lexrange->min, lexrange->minex, 0,
+                                   &iter, &first))
+            return 0;
+    }
+    if (last < first || (unsigned long)offset > last - first) return 0;
+
+    hi = last - offset;
+    lo = first;
+    if (limit >= 0 && (unsigned long)limit < hi - lo + 1)
+        lo = hi - limit + 1;
+    if (hi - lo + 1 <= maxentries) return 0;
+
+    if (rangetype == ZRANGE_LEX) {
+        zbtreeIterator hiter;
+        double score;
+
+        serverAssert(zbtreeIteratorSeekRank(zs, hi, &hiter));
+        serverAssert(zbtreeIteratorNext(&hiter, 0, NULL, NULL, &score));
+        if (!zbtRankLexGteMin(zs, first, score, lexrange)) return 0;
+        if (first > 0) {
+            const unsigned char *ele;
+            size_t len;
+
+            serverAssert(zbtreeIteratorSeekRank(zs, first - 1, &hiter));
+            serverAssert(zbtreeIteratorNext(&hiter, 0, &ele, &len, NULL));
+            if (zbtLexValueGteMin(ele, len, lexrange)) return 0;
+        }
+    }
+
+    *start = (long)lo;
+    *end = (long)hi;
+    return 1;
+}
+
 /**
  * This function handles ZRANGE and ZRANGESTORE, and also the deprecated
  * Z[REV]RANGE[BYSCORE|BYLEX] commands.
@@ -4677,6 +4762,17 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
         long tmp = opt_start;
         opt_start = -1 - opt_end;
         opt_end = -1 - tmp;
+        direction = ZRANGE_DIRECTION_FORWARD;
+    } else if (store && direction == ZRANGE_DIRECTION_REVERSE &&
+               (rangetype == ZRANGE_SCORE || rangetype == ZRANGE_LEX) &&
+               zrangeRevRangeToRanks(zobj, rangetype, &range, &lexrange,
+                                     opt_offset, opt_limit,
+                                     &opt_start, &opt_end))
+    {
+        /* Same for a REV score or lex range: store the forward rank range
+         * that holds the elements the reverse walk would emit. */
+        if (rangetype == ZRANGE_LEX) zslFreeLexRange(&lexrange);
+        rangetype = ZRANGE_RANK;
         direction = ZRANGE_DIRECTION_FORWARD;
     }
     zrangeResultHandlerDirectionSet(handler, direction == ZRANGE_DIRECTION_REVERSE);

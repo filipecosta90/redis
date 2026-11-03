@@ -3046,6 +3046,179 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-value $old_value
     }
 
+    # ZRANGESTORE ... REV must store exactly the elements ZRANGE ... REV
+    # returns. Compare (score, member) pairs in sorted order and return the
+    # number of stored elements.
+    proc zrangestore_rev_check {src dst args} {
+        set want {}
+        set members [r zrange $src {*}$args REV]
+        if {[llength $members]} {
+            foreach m $members s [r zmscore $src {*}$members] {
+                lappend want [list $s $m]
+            }
+        }
+        set want [lsort -command zlistAlikeSort $want]
+        assert_equal [llength $want] [r zrangestore $dst $src {*}$args REV]
+        set got {}
+        set stored [r zrange $dst 0 -1]
+        if {[llength $stored]} {
+            foreach m $stored s [r zmscore $dst {*}$stored] {
+                lappend got [list $s $m]
+            }
+        }
+        assert_equal $want $got
+        if {[llength $want] == 0} {
+            assert_equal 0 [r exists $dst]
+        } elseif {[llength $want] > 128} {
+            assert_encoding btree $dst
+        }
+        return [llength $want]
+    }
+
+    foreach resp {2 3} {
+        test "ZRANGESTORE BYSCORE REV stores the same set as ZRANGE BYSCORE REV - RESP$resp" {
+            r hello $resp
+            set old_entries [lindex [r config get zset-max-listpack-entries] 1]
+            r config set zset-max-listpack-entries 128
+            r del zsrc{t} zdst{t}
+            # 1000 members over 250 scores, so ranges end inside runs of
+            # equal scores.
+            set cmd [list r zadd zsrc{t}]
+            for {set j 0} {$j < 1000} {incr j} {
+                lappend cmd [expr {($j * 7919) % 250}] [format "m:%04d" $j]
+            }
+            {*}$cmd
+            assert_encoding btree zsrc{t}
+
+            # 0..199 holds 800 members, 0..31 holds 128 and 0..32 holds 132.
+            foreach args {
+                {+inf -inf} {(+inf (-inf} {+inf 0} {199 0} {(200 (0}
+                {(199 (31} {31 0} {32 0} {(32 0} {249 218} {249 217}
+                {100 100} {(100 (100} {100 101} {-inf +inf} {1000 300}
+                {-1 -inf} {+inf 249.5}
+                {+inf -inf LIMIT 0 -1} {+inf -inf LIMIT 0 -5}
+                {+inf -inf LIMIT 0 0} {+inf -inf LIMIT 0 128}
+                {+inf -inf LIMIT 0 129} {+inf -inf LIMIT 871 -1}
+                {+inf -inf LIMIT 872 -1} {+inf -inf LIMIT 999 10}
+                {+inf -inf LIMIT 1000 10} {+inf -inf LIMIT 5000 -1}
+                {+inf -inf LIMIT -1 10} {199 0 LIMIT 100 600}
+                {199 0 LIMIT 100 -1} {(199 (0 LIMIT 3 129}
+                {199 0 LIMIT 671 -1} {199 0 LIMIT 672 -1}
+                {199 0 LIMIT 800 -1}
+            } {
+                zrangestore_rev_check zsrc{t} zdst{t} {*}$args BYSCORE
+            }
+            assert_equal 1000 [zrangestore_rev_check zsrc{t} zdst{t} +inf -inf BYSCORE]
+            assert_equal 129 [zrangestore_rev_check zsrc{t} zdst{t} +inf -inf BYSCORE LIMIT 0 129]
+            assert_equal 129 [zrangestore_rev_check zsrc{t} zdst{t} +inf -inf BYSCORE LIMIT 871 -1]
+            assert_equal 128 [zrangestore_rev_check zsrc{t} zdst{t} +inf -inf BYSCORE LIMIT 872 -1]
+            assert_equal 0 [zrangestore_rev_check zsrc{t} zdst{t} +inf -inf BYSCORE LIMIT 1000 10]
+
+            # Destination is the source.
+            assert_equal 600 [zrangestore_rev_check zsrc{t} zsrc{t} 199 0 BYSCORE LIMIT 100 600]
+            assert_equal 0 [zrangestore_rev_check zsrc{t} zsrc{t} 199 0 BYSCORE LIMIT 600 -1]
+
+            r del zsrc{t} zdst{t}
+            r config set zset-max-listpack-entries $old_entries
+            r hello 2
+        }
+
+        test "ZRANGESTORE BYLEX REV stores the same set as ZRANGE BYLEX REV - RESP$resp" {
+            r hello $resp
+            set old_entries [lindex [r config get zset-max-listpack-entries] 1]
+            r config set zset-max-listpack-entries 128
+            r del zlex{t} zmix{t} zdst{t}
+            set cmd [list r zadd zlex{t}]
+            for {set j 0} {$j < 1000} {incr j} {
+                lappend cmd 0 [format "m:%04d" $j]
+            }
+            {*}$cmd
+            assert_encoding btree zlex{t}
+
+            # Mixed scores: the members of the lowest score sort between
+            # the others, so a lex range is not one contiguous run and the
+            # reverse walk selects members only it would select.
+            set cmd [list r zadd zmix{t}]
+            for {set j 0} {$j < 300} {incr j} {
+                lappend cmd 1 [format "b:%04d" $j]
+                lappend cmd 2 [format "a:%04d" $j]
+                lappend cmd 3 [format "c:%04d" $j]
+            }
+            {*}$cmd
+            assert_encoding btree zmix{t}
+
+            foreach src {zlex{t} zmix{t}} {
+                foreach args {
+                    {+ -} {(+ (-} {[m:0999 [m:0000} {(m:0999 (m:0000}
+                    {[m:0500 [m:0372} {[m:0500 [m:0371} {(m:0500 (m:0371}
+                    {[m:0500 [m:0500} {(m:0500 (m:0500} {[m:0499 [m:0500}
+                    {[m:0500x [m:0499x} {+ [m:0870} {+ [m:0871} {[m:0129 -}
+                    {[m:0128 -} {[z -} {+ [z} {[a -} {- +}
+                    {[c:0299 [a} {[c:0299 [b:0100} {+ [b} {[c (b:0299}
+                    {[b:0299 -} {+ [a:0100} {[c:0100 -} {[d [c}
+                    {+ - LIMIT 0 -1} {+ - LIMIT 0 -3} {+ - LIMIT 0 0}
+                    {+ - LIMIT 0 129} {+ - LIMIT 0 128} {+ - LIMIT 871 -1}
+                    {+ - LIMIT 872 -1} {+ - LIMIT 999 5} {+ - LIMIT 1000 5}
+                    {+ - LIMIT -1 5} {[m:0800 [m:0100 LIMIT 100 300}
+                    {[m:0800 [m:0100 LIMIT 571 -1} {[m:0800 [m:0100 LIMIT 572 -1}
+                    {[m:0800 [m:0100 LIMIT 701 -1} {[c:0299 [a LIMIT 10 400}
+                    {[c:0299 [a LIMIT 500 -1} {+ - LIMIT 100 200}
+                } {
+                    zrangestore_rev_check $src zdst{t} {*}$args BYLEX
+                }
+            }
+            assert_equal 1000 [zrangestore_rev_check zlex{t} zdst{t} + - BYLEX]
+            assert_equal 129 [zrangestore_rev_check zlex{t} zdst{t} {[m:0500} {[m:0372} BYLEX]
+            assert_equal 128 [zrangestore_rev_check zlex{t} zdst{t} {(m:0500} {[m:0372} BYLEX]
+            assert_equal 129 [zrangestore_rev_check zlex{t} zdst{t} {[m:0800} {[m:0100} BYLEX LIMIT 572 -1]
+            assert_equal 0 [zrangestore_rev_check zlex{t} zdst{t} {[m:0800} {[m:0100} BYLEX LIMIT 701 -1]
+
+            # Destination is the source.
+            assert_equal 500 [zrangestore_rev_check zlex{t} zlex{t} {[m:0799} {[m:0300} BYLEX]
+            assert_equal 300 [zrangestore_rev_check zmix{t} zmix{t} + - BYLEX LIMIT 600 -1]
+
+            r del zlex{t} zmix{t} zdst{t}
+            r config set zset-max-listpack-entries $old_entries
+            r hello 2
+        }
+    }
+
+    test {ZRANGESTORE BYSCORE/BYLEX REV random ranges match ZRANGE REV} {
+        set old_entries [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 128
+        for {set iter 0} {$iter < 8} {incr iter} {
+            r del zsrc{t} zdst{t}
+            set n [randomInt 1500]
+            set scores [expr {1 + [randomInt 3] * [randomInt 400]}]
+            set cmd [list r zadd zsrc{t}]
+            for {set j 0} {$j < $n} {incr j} {
+                lappend cmd [randomInt $scores] [format "m:%05d" [randomInt 3000]]
+            }
+            if {$n} {{*}$cmd}
+            for {set k 0} {$k < 20} {incr k} {
+                if {[randomInt 2]} {
+                    set hi [randomInt $scores]
+                    set lo [expr {$hi - [randomInt $scores]}]
+                    set args [list [randpath {set hi} {set _ "($hi"} {set _ +inf}] \
+                                   [randpath {set lo} {set _ "($lo"} {set _ -inf}] BYSCORE]
+                } else {
+                    set hi [format "m:%05d" [randomInt 3000]]
+                    set lo [format "m:%05d" [randomInt 3000]]
+                    if {$lo > $hi} {lassign [list $lo $hi] hi lo}
+                    set args [list [randpath {set _ "\[$hi"} {set _ "($hi"} {set _ +}] \
+                                   [randpath {set _ "\[$lo"} {set _ "($lo"} {set _ -}] BYLEX]
+                }
+                if {[randomInt 2]} {
+                    lappend args LIMIT [randomInt [expr {$n + 2}]] \
+                        [expr {[randomInt [expr {$n + 2}]] - 1}]
+                }
+                zrangestore_rev_check zsrc{t} zdst{t} {*}$args
+            }
+        }
+        r del zsrc{t} zdst{t}
+        r config set zset-max-listpack-entries $old_entries
+    }
+
     test {ZRANGE invalid syntax} {
         catch {r zrange z1{t} 0 -1 limit 1 2} err
         assert_match "*syntax*" $err
