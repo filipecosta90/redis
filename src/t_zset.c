@@ -856,13 +856,13 @@ static int zbtLexCompare(const unsigned char *value, size_t len, sds bound) {
 }
 
 /* Test a packed B+ tree member against the lower lexical bound. */
-static int zbtLexValueGteMin(const unsigned char *value, size_t len, zlexrangespec *spec) {
+static int zbtLexValueGteMin(const unsigned char *value, size_t len, const zlexrangespec *spec) {
     int cmp = zbtLexCompare(value, len, spec->min);
     return spec->minex ? cmp > 0 : cmp >= 0;
 }
 
 /* Test a packed B+ tree member against the upper lexical bound. */
-static int zbtLexValueLteMax(const unsigned char *value, size_t len, zlexrangespec *spec) {
+static int zbtLexValueLteMax(const unsigned char *value, size_t len, const zlexrangespec *spec) {
     int cmp = zbtLexCompare(value, len, spec->max);
     return spec->maxex ? cmp < 0 : cmp <= 0;
 }
@@ -3799,8 +3799,9 @@ static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
                       (size_t)length <= server.zset_max_listpack_entries ||
                       handler->dstobj->encoding == OBJ_ENCODING_BTREE);
     /* genericZrangebyrankCommand() passes an exact result count here, also
-     * for the large REV score ranges that zrangeGenericCommand() resolves to
-     * ranks; other BYSCORE/BYLEX stores pass length<0 and this is a no-op.
+     * for the large REV score and lex ranges that zrangeGenericCommand()
+     * resolves to ranks; other BYSCORE/BYLEX stores pass length<0 and this
+     * is a no-op.
      * The length is always server-computed, satisfying the trust
      * requirement documented on zbtreeReserve() itself. */
     if (length > 0 && handler->dstobj->encoding == OBJ_ENCODING_BTREE)
@@ -3823,8 +3824,9 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
      * The batch is created lazily on the first fast-path emit (the
      * destination may start as LISTPACK and convert mid-stream) and flushed
      * once in zrangeResultFinalizeStore(). A REV rank range, or a REV score
-     * range on a B+ tree source, whose result does not fit in a listpack
-     * arrives here in forward order too, see zrangeGenericCommand(). */
+     * or lex range on a B+ tree source, whose result does not fit in a
+     * listpack arrives here in forward order too, see
+     * zrangeGenericCommand(). */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
         if (!handler->append_batch)
             handler->append_batch = zbtreeAppendBatchCreate(handler->dstobj->ptr);
@@ -4598,27 +4600,84 @@ static int zrangeRevScoreToRanks(const zbtreeSet *zs, unsigned long llen,
                                                         limit, lo, hi));
 }
 
-/* ZRANGESTORE ... BYSCORE REV on a B+ tree source stores the same elements
- * as the forward rank range zrangeRevScoreToRanks() finds. When they do not
- * fit in a listpack, set [*start,*end] to that range and return 1, so the
- * destination B+ tree is filled through the append path. Otherwise return
- * 0 and keep the reverse walk, which also stores nothing for a negative
- * offset. The LIMIT test skips the seeks for a count that fits in a
- * listpack; the usual unlimited count of -1 skips nothing. */
-static int zrangeStoreRevScoreAsForward(const kvobj *zobj,
+/* The same for ZRANGESTORE ... BYLEX REV and genericZrangebylexCommand().
+ * Lex ranges are only ordered among equal scores, and that walk stops at
+ * the first member below the lower bound it meets, which on a mixed-score
+ * set need not be the one before the lower bound seek. So the interval is
+ * used only when the first and last elements in range have the same score:
+ * all of its members are then sorted, and if the first one is in range so
+ * are the others. The unbounded '+' and '-' need no tree descent. */
+static int zrangeRevLexToRanks(const zbtreeSet *zs,
+                               const zlexrangespec *range, long offset,
+                               long limit, unsigned long *lo,
+                               unsigned long *hi)
+{
+    zbtreeIterator first_iter, last_iter;
+    unsigned long first, last;
+    const unsigned char *ele;
+    size_t len;
+    double first_score, last_score;
+    int found;
+
+    if (!zbtreeIteratorSeekLex(zs, range->max, range->maxex, 1,
+                               &last_iter, &last) ||
+        !zrangeStoreExceedsListpack(zrangeRevWalkSpan(0, last, offset,
+                                                      limit, lo, hi)) ||
+        !zbtreeIteratorSeekLex(zs, range->min, range->minex, 0,
+                               &first_iter, &first) ||
+        !zrangeStoreExceedsListpack(zrangeRevWalkSpan(first, last, offset,
+                                                      limit, lo, hi)))
+        return 0;
+
+    /* Read both elements at the seek positions; first_iter then steps back
+     * to the member before 'first'. Both scores come from the same tree, so
+     * == is exact, and it holds for -0.0 and 0.0, which the tree orders as
+     * equal. */
+    found = zbtreeIteratorNext(&last_iter, 0, NULL, NULL, &last_score);
+    serverAssert(found);
+    found = zbtreeIteratorNext(&first_iter, 1, &ele, &len, &first_score);
+    serverAssert(found);
+    if (first_score != last_score || !zbtLexValueGteMin(ele, len, range))
+        return 0;
+
+    /* zbtreeIteratorSeekLex() searches with the lowest score in the set, so
+     * the member before 'first', if any, is below the lower bound and the
+     * reverse walk stops right at 'first'. */
+    debugServerAssert(!zbtreeIteratorNext(&first_iter, 1, &ele, &len, NULL) ||
+                      !zbtLexValueGteMin(ele, len, range));
+    return 1;
+}
+
+/* ZRANGESTORE ... BYSCORE|BYLEX REV on a B+ tree source stores the same
+ * elements as the forward rank range zrangeRevScoreToRanks() or
+ * zrangeRevLexToRanks() finds. When they do not fit in a listpack, set
+ * [*start,*end] to that range and return 1, so the destination B+ tree is
+ * filled through the append path. Otherwise return 0 and keep the reverse
+ * walk, which also stores nothing for a negative offset. The LIMIT test
+ * skips the seeks for a count that fits in a listpack; the usual unlimited
+ * count of -1 skips nothing. */
+static int zrangeStoreRevRangeAsForward(const kvobj *zobj,
+                                        zrange_type rangetype,
                                         const zrangespec *range,
+                                        const zlexrangespec *lexrange,
                                         long offset, long limit,
                                         long *start, long *end)
 {
     unsigned long llen = zsetLength(zobj);
     unsigned long lo, hi;
+    int ok;
 
     if (zobj->encoding != OBJ_ENCODING_BTREE || offset < 0 ||
         !zrangeStoreExceedsListpack(llen) ||
-        (limit >= 0 && !zrangeStoreExceedsListpack((unsigned long)limit)) ||
-        !zrangeRevScoreToRanks(zobj->ptr, llen, range, offset, limit,
-                               &lo, &hi))
+        (limit >= 0 && !zrangeStoreExceedsListpack((unsigned long)limit)))
         return 0;
+    if (rangetype == ZRANGE_SCORE)
+        ok = zrangeRevScoreToRanks(zobj->ptr, llen, range, offset, limit,
+                                   &lo, &hi);
+    else
+        ok = zrangeRevLexToRanks(zobj->ptr, lexrange, offset, limit,
+                                 &lo, &hi);
+    if (!ok) return 0;
 
     /* Both are ranks below llen, so they fit in a long. */
     *start = (long)lo;
@@ -4634,6 +4693,7 @@ static int zrangeStoreRevScoreAsForward(const kvobj *zobj,
  * range, *start and *end hold the REV rank range on input. */
 static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
                                    const zrangespec *range,
+                                   const zlexrangespec *lexrange,
                                    long offset, long limit,
                                    long *start, long *end)
 {
@@ -4645,10 +4705,8 @@ static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
         *end = -1 - tmp;
         return 1;
     }
-    if (rangetype == ZRANGE_SCORE)
-        return zrangeStoreRevScoreAsForward(zobj, range, offset, limit,
-                                            start, end);
-    return 0;
+    return zrangeStoreRevRangeAsForward(zobj, rangetype, range, lexrange,
+                                        offset, limit, start, end);
 }
 
 /**
@@ -4785,8 +4843,9 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
      * the same elements, see zrangeStoreRevAsForward(). */
     walktype = rangetype;
     if (store && direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeStoreRevAsForward(zobj, rangetype, &range, opt_offset,
-                                opt_limit, &opt_start, &opt_end)) {
+        zrangeStoreRevAsForward(zobj, rangetype, &range, &lexrange,
+                                opt_offset, opt_limit, &opt_start,
+                                &opt_end)) {
         walktype = ZRANGE_RANK;
         direction = ZRANGE_DIRECTION_FORWARD;
     }
