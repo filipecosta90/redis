@@ -4553,6 +4553,26 @@ static unsigned long zrangeRevWalkSpan(unsigned long first,
     return count;
 }
 
+/* Return 1 if the reverse walk over a range ending at 'iter', which a
+ * reverse seek or start left on the last element in range, emits too many
+ * elements for a listpack once 'offset' of them are skipped. Only called
+ * for a small offset: it steps back over at most offset +
+ * zset-max-listpack-entries + 1 elements, so a small result is found
+ * without a tree descent for the lower bound. */
+static int zrangeRevScanExceedsListpack(zbtreeIterator *iter, long offset,
+                                        const zrangespec *range)
+{
+    unsigned long n = (unsigned long)offset + server.zset_max_listpack_entries + 1;
+    double score;
+
+    while (n--) {
+        if (!zbtreeIteratorNext(iter, 1, NULL, NULL, &score) ||
+            (range->minex ? score <= range->min : score < range->min))
+            return 0;
+    }
+    return 1;
+}
+
 /* Resolve ZRANGESTORE ... BYSCORE REV [LIMIT offset count] on a B+ tree
  * source of llen elements to the forward rank interval [*lo,*hi] that the
  * reverse walk in genericZrangebyscoreCommand() emits. Scores are ordered,
@@ -4561,27 +4581,37 @@ static unsigned long zrangeRevWalkSpan(unsigned long first,
  *
  * An inclusive infinite bound needs no seek, as it is the first or the last
  * rank. After the upper bound, the result is bounded as if the range
- * started at rank 0, which skips the lower bound seek when even that is
- * small. */
+ * started at rank 0, which skips the lower bound when even that is small.
+ * Otherwise, for a small offset, a short step back from the upper bound
+ * tells whether the result fits in a listpack before the lower bound is
+ * sought, so a small result costs no more than one descent. */
 static int zrangeRevScoreToRanks(const zbtreeSet *zs, unsigned long llen,
                                  const zrangespec *range, long offset,
                                  long limit, unsigned long *lo,
                                  unsigned long *hi)
 {
-    zbtreeIterator iter; /* Only the ranks of the seeks are used. */
+    zbtreeIterator iter; /* At the upper bound, then stepped back. */
     unsigned long first = 0, last = llen - 1;
+    int seek_min = range->minex || !isinf(range->min) || range->min > 0;
 
-    if ((range->maxex || !isinf(range->max) || range->max < 0) &&
-        !zbtreeIteratorSeekScore(zs, range->max, range->maxex, 1,
-                                 &iter, &last))
+    if (range->maxex || !isinf(range->max) || range->max < 0) {
+        if (!zbtreeIteratorSeekScore(zs, range->max, range->maxex, 1,
+                                     &iter, &last))
+            return 0;
+    } else if (!zbtreeIteratorStart(zs, 1, &iter)) {
         return 0;
+    }
     if (!zrangeStoreExceedsListpack(zrangeRevWalkSpan(0, last, offset,
                                                       limit, lo, hi)))
         return 0;
-    if ((range->minex || !isinf(range->min) || range->min > 0) &&
-        !zbtreeIteratorSeekScore(zs, range->min, range->minex, 0,
-                                 &iter, &first))
-        return 0;
+    if (seek_min) {
+        if ((size_t)offset <= server.zset_max_listpack_entries &&
+            !zrangeRevScanExceedsListpack(&iter, offset, range))
+            return 0;
+        if (!zbtreeIteratorSeekScore(zs, range->min, range->minex, 0,
+                                     &iter, &first))
+            return 0;
+    }
     return zrangeStoreExceedsListpack(zrangeRevWalkSpan(first, last, offset,
                                                         limit, lo, hi));
 }
@@ -4638,7 +4668,7 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
 {
     client *c = handler->client;
     robj *key = c->argv[argc_start];
-    zrangespec range = {0};
+    zrangespec range = {0}; /* Passed by address for every range type. */
     zlexrangespec lexrange;
     zrange_type walktype;
     int minidx = argc_start + 1;
