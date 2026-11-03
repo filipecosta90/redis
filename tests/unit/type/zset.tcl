@@ -3394,6 +3394,40 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $old_limit
     }
 
+    test "ZRANDMEMBER with <count> across the dense/sparse threshold - btree" {
+        # Every count from 1 to size+1 on a btree, so both strategies and the
+        # count >= size case are covered whatever the threshold is. Each reply
+        # must hold exactly min(count, size) distinct members with their own
+        # scores, in both protocols.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 16
+        try {
+            r del myzset
+            for {set i 0} {$i < 150} {incr i} {
+                r zadd myzset [expr {$i % 30}] "m:$i"
+            }
+            assert_encoding btree myzset
+            set scores [dict create {*}[r zrange myzset 0 -1 withscores]]
+            foreach proto {2 3} {
+                r hello $proto
+                for {set count 1} {$count <= 151} {incr count} {
+                    set want [expr {min($count, 150)}]
+                    set res [r zrandmember myzset $count withscores]
+                    if {$proto == 3} { set res [concat {*}$res] }
+                    assert_equal [expr {$want * 2}] [llength $res]
+                    set d [dict create {*}$res]
+                    assert_equal $want [dict size $d]
+                    dict for {m s} $d {
+                        if {$s != [dict get $scores $m]} { fail "score of $m: $s" }
+                    }
+                }
+            }
+        } finally {
+            r hello 2
+            r config set zset-max-listpack-entries $original_max
+        }
+    }
+
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz
