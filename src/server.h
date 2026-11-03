@@ -5086,6 +5086,20 @@ void _serverPanic(const char *file, int line, const char *msg, ...)
 #else
 void _serverPanic(const char *file, int line, const char *msg, ...);
 #endif
+
+/* Random utilities. Return a uniform random integer in [0, n). Unlike
+ * randomULong() % n it draws 64 bits on every build (randomULong() is the
+ * 31-bit random() on 32-bit ones) and rejects the last, partial multiple of n,
+ * so there is no modulo bias. */
+static inline unsigned long randomULongBelow(unsigned long n) {
+    uint64_t r, x;
+    debugServerAssert(n > 0);
+    do {
+        r = genrand64_int64();
+        x = r % n;
+    } while (r - x > UINT64_MAX - (n - 1));
+    return (unsigned long)x;
+}
 void serverLogObjectDebugInfo(const robj *o);
 void setupDebugSigHandlers(void);
 void setupSigSegvHandler(void);
