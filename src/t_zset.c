@@ -856,13 +856,13 @@ static int zbtLexCompare(const unsigned char *value, size_t len, sds bound) {
 }
 
 /* Test a packed B+ tree member against the lower lexical bound. */
-static int zbtLexValueGteMin(const unsigned char *value, size_t len, zlexrangespec *spec) {
+static int zbtLexValueGteMin(const unsigned char *value, size_t len, const zlexrangespec *spec) {
     int cmp = zbtLexCompare(value, len, spec->min);
     return spec->minex ? cmp > 0 : cmp >= 0;
 }
 
 /* Test a packed B+ tree member against the upper lexical bound. */
-static int zbtLexValueLteMax(const unsigned char *value, size_t len, zlexrangespec *spec) {
+static int zbtLexValueLteMax(const unsigned char *value, size_t len, const zlexrangespec *spec) {
     int cmp = zbtLexCompare(value, len, spec->max);
     return spec->maxex ? cmp < 0 : cmp <= 0;
 }
@@ -4572,6 +4572,51 @@ static int zrangeRevScoreToRanks(const zbtreeSet *zs,
                                                         limit, lo, hi));
 }
 
+/* The same for ZRANGESTORE ... BYLEX REV and genericZrangebylexCommand().
+ * Lex ranges are only ordered among equal scores, and that walk stops at
+ * the first member below the lower bound it meets, which on a mixed-score
+ * set need not be the one before the lower-bound seek. So the interval is
+ * used only when the first and last elements in range have the same score:
+ * all of its members are then sorted, and if the first one is in range so
+ * are the others. Otherwise return 0 and keep the reverse walk. */
+static int zrangeRevLexToRanks(const zbtreeSet *zs,
+                               const zlexrangespec *range, long offset,
+                               long limit, unsigned long *lo,
+                               unsigned long *hi)
+{
+    zbtreeIterator first_iter, last_iter;
+    unsigned long first, last;
+    const unsigned char *ele;
+    size_t len;
+    double first_score, last_score;
+
+    if (!zbtreeIteratorSeekLex(zs, range->max, range->maxex, 1,
+                               &last_iter, &last) ||
+        !zrangeStoreExceedsListpack(zrangeRevWalkSpan(0, last, offset,
+                                                      limit, lo, hi)) ||
+        !zbtreeIteratorSeekLex(zs, range->min, range->minex, 0,
+                               &first_iter, &first) ||
+        !zrangeStoreExceedsListpack(zrangeRevWalkSpan(first, last, offset,
+                                                      limit, lo, hi)))
+        return 0;
+
+    /* Read both elements from the seek positions. The scores come from the
+     * same tree, so == is exact, and it holds for -0.0 and 0.0 just as the
+     * tree orders them as equal. */
+    serverAssert(zbtreeIteratorNext(&last_iter, 0, NULL, NULL, &last_score));
+    serverAssert(zbtreeIteratorNext(&first_iter, 1, &ele, &len,
+                                    &first_score));
+    if (first_score != last_score || !zbtLexValueGteMin(ele, len, range))
+        return 0;
+
+    /* zbtreeIteratorSeekLex() searches with the lowest score in the set, so
+     * the member before 'first', if any, is below the lower bound and the
+     * reverse walk stops right at 'first'. */
+    debugServerAssert(!zbtreeIteratorNext(&first_iter, 1, &ele, &len, NULL) ||
+                      !zbtLexValueGteMin(ele, len, range));
+    return 1;
+}
+
 /* ZRANGESTORE ... REV stores the same elements whatever order they are
  * emitted in. Ascending emission lets a B+ tree destination use its append
  * path, while a listpack destination is cheaper to fill in descending order.
@@ -4581,11 +4626,12 @@ static int zrangeRevScoreToRanks(const zbtreeSet *zs,
  *
  * For ZRANGE_RANK, *start and *end hold the REV rank range on input. REV
  * index i is forward index llen-1-i once sanitized the same way
- * genericZrangebyrankCommand() does. Score ranges are resolved on a B+ tree
- * source only, where ranks come from seeks, with LIMIT offset and count
- * applied from the upper end as the reverse walk applies them. */
+ * genericZrangebyrankCommand() does. Score and lex ranges are resolved on a
+ * B+ tree source only, where ranks come from seeks, with LIMIT offset and
+ * count applied from the upper end as the reverse walk applies them. */
 static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
                                    const zrangespec *range,
+                                   const zlexrangespec *lexrange,
                                    long offset, long limit,
                                    long *start, long *end)
 {
@@ -4605,14 +4651,16 @@ static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
         lo = llen - 1 - (unsigned long)e;
         hi = llen - 1 - (unsigned long)s;
         if (!zrangeStoreExceedsListpack(hi - lo + 1)) return 0;
-    } else if (rangetype == ZRANGE_SCORE) {
+    } else {
         if (zobj->encoding != OBJ_ENCODING_BTREE || offset < 0) return 0;
         if (limit >= 0 && !zrangeStoreExceedsListpack((unsigned long)limit))
             return 0;
-        if (!zrangeRevScoreToRanks(zobj->ptr, range, offset, limit, &lo, &hi))
+        if (rangetype == ZRANGE_SCORE ?
+            !zrangeRevScoreToRanks(zobj->ptr, range, offset, limit,
+                                   &lo, &hi) :
+            !zrangeRevLexToRanks(zobj->ptr, lexrange, offset, limit,
+                                 &lo, &hi))
             return 0;
-    } else {
-        return 0;
     }
 
     /* Both are ranks below llen, so they fit in a long. */
@@ -4754,8 +4802,8 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
      * rangetype is kept as parsed, so cleanup still frees lexrange. */
     zrange_type walktype = rangetype;
     if (store && direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeStoreRevAsForward(zobj, rangetype, &range, opt_offset,
-                                opt_limit, &opt_start, &opt_end))
+        zrangeStoreRevAsForward(zobj, rangetype, &range, &lexrange,
+                                opt_offset, opt_limit, &opt_start, &opt_end))
     {
         walktype = ZRANGE_RANK;
         direction = ZRANGE_DIRECTION_FORWARD;
