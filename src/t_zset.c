@@ -5190,6 +5190,13 @@ static void zrandmemberSampleRanks(unsigned long size, unsigned long count,
     }
 }
 
+/* A member picked by zrandmemberSparseFromBtree(), pointing into its leaf. */
+typedef struct {
+    const unsigned char *ele;
+    size_t len;
+    double score;
+} zrandmemberPick;
+
 /* CASE 4 of ZRANDMEMBER for a B+ tree. Picking ranks one by one would
  * descend from the root for each pick and need a dict of member copies to
  * spot repeats. Instead we choose the distinct ranks first, then visit them
@@ -5197,9 +5204,14 @@ static void zrandmemberSampleRanks(unsigned long size, unsigned long count,
  * next rank, so large gaps pass over whole subtrees by their counts and
  * small ones stay in the leaf.
  *
- * The member bytes point into the leaves. addReplyBulkCBuffer() copies them
- * into the reply, which must stay so: leaf memory is not reference counted
- * and is gone after the next write to the key. */
+ * The pass finds the members in score order, so we shuffle them before the
+ * reply. Any prefix of the reply is then a uniform sample too, as it was
+ * when members were replied in the order they were drawn.
+ *
+ * The member bytes point into the leaves, which do not change while we
+ * run. addReplyBulkCBuffer() copies them into the reply, which must stay
+ * so: leaf memory is not reference counted and is gone after the next write
+ * to the key. */
 static void zrandmemberSparseFromBtree(client *c, zbtreeSet *zs,
                                        unsigned long size, unsigned long count,
                                        int withscores)
@@ -5207,30 +5219,40 @@ static void zrandmemberSparseFromBtree(client *c, zbtreeSet *zs,
     unsigned long *ranks = zmalloc(sizeof(unsigned long) * count * 2);
     zrandmemberSampleRanks(size, count, ranks, ranks + count);
 
+    zrandmemberPick *picks = zmalloc(sizeof(zrandmemberPick) * count);
     zbtreeIterator iter;
     unsigned long i = count - 1;
     serverAssert(zbtreeIteratorSeekRank(zs, ranks[i], &iter));
     while (1) {
-        const unsigned char *ele;
-        size_t len;
-        double score;
-
         /* Next leaves the iterator one rank below the member it returns. */
-        serverAssert(zbtreeIteratorNext(&iter, 1, &ele, &len,
-                                        withscores ? &score : NULL));
-        if (withscores && c->resp > 2)
-            addReplyArrayLen(c,2);
-        addReplyBulkCBuffer(c, ele, len);
-        if (withscores)
-            addReplyDouble(c, score);
-        /* The reply is discarded once the client is closing, so stop early,
-         * as CASE 1 does. */
-        if (i == 0 || (c->flags & CLIENT_CLOSE_ASAP))
-            break;
+        serverAssert(zbtreeIteratorNext(&iter, 1, &picks[i].ele,
+                                        &picks[i].len, &picks[i].score));
+        if (i == 0) break;
         i--;
         serverAssert(zbtreeIteratorSkip(&iter, 1, ranks[i+1] - ranks[i] - 1));
     }
     zfree(ranks);
+
+    /* Fisher-Yates shuffle. */
+    for (i = count - 1; i > 0; i--) {
+        unsigned long j = randomULongBelow(i + 1);
+        zrandmemberPick tmp = picks[i];
+        picks[i] = picks[j];
+        picks[j] = tmp;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (withscores && c->resp > 2)
+            addReplyArrayLen(c,2);
+        addReplyBulkCBuffer(c, picks[i].ele, picks[i].len);
+        if (withscores)
+            addReplyDouble(c, picks[i].score);
+        /* The reply is discarded once the client is closing, so stop early,
+         * as CASE 1 does. */
+        if (c->flags & CLIENT_CLOSE_ASAP)
+            break;
+    }
+    zfree(picks);
 }
 
 void zrandmemberWithCountCommand(client *c, long l, int withscores) {
@@ -5420,7 +5442,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     }
 
     /* CASE 4: We have a big zset compared to the requested number of elements.
-     * A B+ tree samples distinct ranks and replies in score order, see
+     * A B+ tree samples distinct ranks and replies in random order, see
      * zrandmemberSparseFromBtree(). A skiplist gets random elements from the
      * zset and adds them to a temporary set, trying to eventually get enough
      * unique elements to reach the specified count, and replies in the
