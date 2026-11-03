@@ -753,8 +753,23 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             }
             break;
         default:
-            s[i++] = *f;
-            sdsinclen(s,1);
+            /* A single literal byte (e.g. the '-' in "%U-%U") is cheaper to
+             * store directly; room for 1 byte is guaranteed above. */
+            if (f[1] == '%' || f[1] == '\0') {
+                s[i++] = *f;
+                sdsinclen(s,1);
+                break;
+            }
+            /* Copy the whole run of literal bytes up to the next '%' (or the
+             * end of the format) at once. l >= 2 here. */
+            l = strcspn(f,"%");
+            if (sdsavail(s) < l) {
+                s = sdsMakeRoomFor(s,l);
+            }
+            memcpy(s+i,f,l);
+            sdsinclen(s,l);
+            i += l;
+            f += l-1; /* Point at the last copied byte, skipped by f++ below. */
             break;
         }
         f++;
@@ -1369,6 +1384,44 @@ int sdsTest(int argc, char **argv, int flags) {
         test_cond("sdscatfmt() seems working with unsigned numbers",
             sdslen(x) == 35 &&
             memcmp(x,"--4294967295,18446744073709551615--",35) == 0);
+
+        sdsfree(x);
+        {
+            /* Literal runs around specifiers, '%%', an unknown specifier and
+             * a trailing lone '%' (dropped). x already has room for
+             * strlen(fmt)*2, so sdscatfmt() does not grow it up front; pad
+             * leaves exactly one byte free after %S (pre is the output before
+             * it), so the literal tail must grow the buffer. */
+            const char *fmt = "id=%i 100%% %z %S tail-literal-run%";
+            const char *pre = "--id=7 100% z ";
+            x = sdsMakeRoomFor(sdsnew("--"),strlen(fmt)*2);
+            size_t alloc = sdsalloc(x);
+            size_t padlen = alloc - strlen(pre) - 1;
+            sds pad = sdsnewlen(SDS_NOINIT,padlen);
+            memset(pad,'a',padlen);
+            x = sdscatfmt(x,fmt,7,pad);
+            sds expected = sdscatprintf(sdsempty(),"%s%s tail-literal-run",pre,pad);
+            test_cond("sdscatfmt() copies literal runs correctly",
+                sdsalloc(x) > alloc &&
+                sdslen(x) == sdslen(expected) &&
+                memcmp(x,expected,sdslen(x)+1) == 0);
+            sdsfree(pad);
+            sdsfree(expected);
+
+            sdsfree(x);
+            x = sdscatfmt(sdsnew("--"),"");
+            x = sdscatfmt(x,"no specifiers");
+            test_cond("sdscatfmt() with empty and specifier-free formats",
+                sdslen(x) == 15 && memcmp(x,"--no specifiers\0",16) == 0);
+
+            /* 1-byte literal runs at the start, middle and end, and '%%'. */
+            sdsfree(x);
+            x = sdscatfmt(sdsempty(),"-%i-%i-",1,2);
+            x = sdscatfmt(x,"%%-%%");
+            x = sdscatfmt(x,"a%sb","");
+            test_cond("sdscatfmt() with 1-byte literal runs",
+                sdslen(x) == 10 && memcmp(x,"-1-2-%-%ab\0",11) == 0);
+        }
 
         sdsfree(x);
         x = sdsnew(" x ");
