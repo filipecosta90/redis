@@ -1102,13 +1102,13 @@ void updateClientMemoryUsage(client *c) {
     /* Remember what we added and where, to remove it next time. */
     c->last_memory_type = type;
     c->last_memory_usage = mem;
-    c->last_names_mem = c->watched_keys_mem + c->pubsub_names_mem;
+    c->last_watch_pubsub_mem = c->watched_keys_mem + c->pubsub_names_mem;
 }
 
-void updateClientNamesMemoryUsage(client *c) {
-    size_t names_mem = c->watched_keys_mem + c->pubsub_names_mem;
-    if (names_mem == c->last_names_mem) return;
-    size_t mem = c->last_memory_usage - c->last_names_mem + names_mem;
+void updateClientWatchPubsubMemoryUsage(client *c) {
+    size_t watch_pubsub_mem = c->watched_keys_mem + c->pubsub_names_mem;
+    if (watch_pubsub_mem == c->last_watch_pubsub_mem) return;
+    size_t mem = c->last_memory_usage - c->last_watch_pubsub_mem + watch_pubsub_mem;
     server.stat_clients_type_memory[c->last_memory_type] =
         server.stat_clients_type_memory[c->last_memory_type] - c->last_memory_usage + mem;
     if (c->mem_usage_bucket) {
@@ -1123,7 +1123,7 @@ void updateClientNamesMemoryUsage(client *c) {
         }
     }
     c->last_memory_usage = mem;
-    c->last_names_mem = names_mem;
+    c->last_watch_pubsub_mem = watch_pubsub_mem;
 }
 
 int clientEvictionAllowed(client *c) {
@@ -1180,7 +1180,7 @@ int updateClientMemUsageAndBucket(client *c) {
     removeClientFromMemUsageBucket(c, allow_eviction);
 
     if (!allow_eviction) {
-        updateClientNamesMemoryUsage(c);
+        updateClientWatchPubsubMemoryUsage(c);
         return 0;
     }
 
