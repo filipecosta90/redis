@@ -232,6 +232,27 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         reconnect
     }
 
+    test "Obuf limit, ZRANDMEMBER with a large positive count stopped mid-run" {
+        r config set client-output-buffer-limit {normal 0 0 0}
+        r del myzset
+        for {set i 0} {$i < 20000} {incr i 1000} {
+            set args {}
+            for {set j $i} {$j < $i + 1000} {incr j} { lappend args $j member:$j }
+            r zadd myzset {*}$args
+        }
+        assert_encoding btree myzset
+        set before [s client_output_buffer_limit_disconnections]
+        r config set client-output-buffer-limit {normal 65536 0 0}
+        # The sampling walk must stop for a closing client without asserting.
+        catch {r zrandmember myzset 15000 withscores} e
+        assert_match "*I/O error*" $e
+        reconnect
+        assert_equal [expr {$before + 1}] [s client_output_buffer_limit_disconnections]
+        r config set client-output-buffer-limit {normal 0 0 0}
+        assert_equal 15000 [llength [r zrandmember myzset 15000]]
+        r del myzset
+    }
+
     test "Obuf limit, KEYS stopped mid-run" {
         r config set client-output-buffer-limit {normal 100000 0 0}
         populate 1000 "long-key-name-prefix-of-100-chars-------------------------------------------------------------------"
