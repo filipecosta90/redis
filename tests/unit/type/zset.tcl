@@ -3350,27 +3350,6 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $old_limit
     }
 
-    test "ZRANDMEMBER sparse count on btree - descending score order" {
-        # Not a promise of the command: this checks the B+ tree path, which
-        # replies in the same order as the dense count walk.
-        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
-        r config set zset-max-listpack-entries 0
-        set size 20001
-        create_btree_zset sparsezset $size 7 1000
-        foreach count {2 10 100 1000 6667} {
-            set prev {}
-            foreach {m s} [r zrandmember sparsezset $count withscores] {
-                if {$prev ne {}} {
-                    lassign $prev pm ps
-                    assert {$ps > $s || ($ps == $s && [string compare $pm $m] > 0)}
-                }
-                set prev [list $m $s]
-            }
-        }
-        r del sparsezset
-        r config set zset-max-listpack-entries $old_limit
-    }
-
     test "ZRANDMEMBER sparse count on btree - CASE 3/4 boundary" {
         set old_limit [lindex [r config get zset-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 0
@@ -3410,6 +3389,25 @@ start_server {tags {"zset"}} {
             # df = 299, 415 means about 0.00001 probability
             assert_lessthan $x2 415
         }
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - reply order is random" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        set size 300
+        create_btree_zset sparsezset $size 10
+        # The first member of each reply alone must be a uniform sample.
+        set firsts {}
+        for {set i 0} {$i < 3000} {incr i} {
+            lappend firsts [lindex [r zrandmember sparsezset 10] 0]
+        }
+        unset -nocomplain seen
+        foreach k $firsts {set seen($k) 1}
+        assert_equal $size [array size seen]
+        # df = 299, 415 means about 0.00001 probability
+        assert_lessthan [chi_square_value $firsts] 415
         r del sparsezset
         r config set zset-max-listpack-entries $old_limit
     }

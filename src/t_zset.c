@@ -5200,50 +5200,74 @@ static void zrandmemberSampleRanks(unsigned long size, unsigned long count,
     }
 }
 
+/* A member picked by zrandmemberSparseFromBtree(), pointing into its leaf. */
+typedef struct {
+    const unsigned char *ele;
+    size_t len;
+    double score;
+} zrandmemberPick;
+
 /* CASE 4 of ZRANDMEMBER for a B+ tree. Picking ranks one by one would
  * descend from the root for each pick and need a dict of member copies to
  * spot repeats. Instead we choose the distinct ranks first, then visit them
- * in one pass in descending score order, the order of the B+ tree walk in
- * the other positive count cases. Each step skips the gap to the next rank,
- * so large gaps pass over whole subtrees by their counts and small ones stay
- * in the leaf.
+ * in one pass from the highest score down. Each step skips the gap to the
+ * next rank, so large gaps pass over whole subtrees by their counts and
+ * small ones stay in the leaf.
  *
- * The member bytes point into the leaves. addReplyBulkCBuffer() copies them
- * into the reply, which must stay so: leaf memory is not reference counted
- * and is gone after the next write to the key. */
+ * The pass finds the members in score order, so we shuffle them before the
+ * reply. Any prefix of the reply is then a uniform sample too, as it was
+ * when members were replied in the order they were drawn.
+ *
+ * The member bytes point into the leaves, which do not change while we
+ * run. addReplyBulkCBuffer() copies them into the reply, which must stay
+ * so: leaf memory is not reference counted and is gone after the next write
+ * to the key. */
 static void zrandmemberSparseFromBtree(client *c, zbtreeSet *zs,
                                        unsigned long size, unsigned long count,
                                        int withscores)
 {
     serverAssert(count > 0 && count < size &&
-                 count <= SIZE_MAX / (2 * sizeof(unsigned long)));
+                 count <= SIZE_MAX / sizeof(zrandmemberPick));
     unsigned long *ranks = zmalloc(sizeof(unsigned long) * count * 2);
     zrandmemberSampleRanks(size, count, ranks, ranks + count);
+    /* The scratch half is no longer needed while the picks are alive. */
+    ranks = zrealloc(ranks, sizeof(unsigned long) * count);
 
+    zrandmemberPick *picks = zmalloc(sizeof(zrandmemberPick) * count);
     zbtreeIterator iter;
     unsigned long i = count - 1;
     serverAssert(zbtreeIteratorSeekRank(zs, ranks[i], &iter));
     while (1) {
-        const unsigned char *ele;
-        size_t len;
-        double score;
-
         /* Next leaves the iterator one rank below the member it returns. */
-        serverAssert(zbtreeIteratorNext(&iter, 1, &ele, &len,
-                                        withscores ? &score : NULL));
-        if (withscores && c->resp > 2)
-            addReplyArrayLen(c,2);
-        addReplyBulkCBuffer(c, ele, len);
-        if (withscores)
-            addReplyDouble(c, score);
-        /* The reply is discarded once the client is closing, so stop early,
-         * as CASE 1 does. */
-        if (i == 0 || (c->flags & CLIENT_CLOSE_ASAP))
-            break;
+        serverAssert(zbtreeIteratorNext(&iter, 1, &picks[i].ele,
+                                        &picks[i].len,
+                                        withscores ? &picks[i].score : NULL));
+        if (i == 0) break;
         i--;
         serverAssert(zbtreeIteratorSkip(&iter, 1, ranks[i+1] - ranks[i] - 1));
     }
     zfree(ranks);
+
+    /* Fisher-Yates shuffle. */
+    for (i = count - 1; i > 0; i--) {
+        unsigned long j = randomULongBelow(i + 1);
+        zrandmemberPick tmp = picks[i];
+        picks[i] = picks[j];
+        picks[j] = tmp;
+    }
+
+    for (i = 0; i < count; i++) {
+        if (withscores && c->resp > 2)
+            addReplyArrayLen(c,2);
+        addReplyBulkCBuffer(c, picks[i].ele, picks[i].len);
+        if (withscores)
+            addReplyDouble(c, picks[i].score);
+        /* The reply is discarded once the client is closing, so stop early,
+         * as CASE 1 does. */
+        if (c->flags & CLIENT_CLOSE_ASAP)
+            break;
+    }
+    zfree(picks);
 }
 
 /* Above this size/count ratio a B+ tree zset is sampled by drawing distinct
@@ -5442,8 +5466,8 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
 
     /* CASE 4: We have a big zset compared to the requested number of elements.
      * Only a B+ tree gets here, with count*ZRANDMEMBER_SUB_STRATEGY_MUL <= size.
-     * We draw the distinct ranks first and reply in descending score order,
-     * see zrandmemberSparseFromBtree(). */
+     * We draw the distinct ranks first and reply in random order, see
+     * zrandmemberSparseFromBtree(). */
     serverAssert(zsetobj->encoding == OBJ_ENCODING_BTREE);
     debugServerAssert(count <= size / ZRANDMEMBER_SUB_STRATEGY_MUL);
     zrandmemberSparseFromBtree(c, zsetobj->ptr, size, count, withscores);
