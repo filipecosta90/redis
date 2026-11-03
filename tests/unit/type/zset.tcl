@@ -3394,6 +3394,25 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $old_limit
     }
 
+    test "ZRANDMEMBER sparse count on btree - reply order is random" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        set size 300
+        create_btree_zset sparsezset $size 10
+        # The first member of each reply alone must be a uniform sample.
+        set firsts {}
+        for {set i 0} {$i < 3000} {incr i} {
+            lappend firsts [lindex [r zrandmember sparsezset 10] 0]
+        }
+        unset -nocomplain seen
+        foreach k $firsts {set seen($k) 1}
+        assert_equal $size [array size seen]
+        # df = 299, 415 means about 0.00001 probability
+        assert_lessthan [chi_square_value $firsts] 415
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz
