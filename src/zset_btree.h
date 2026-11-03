@@ -120,6 +120,10 @@ unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
  * length, and score output pointers may be NULL. */
 int zbtreeIteratorSeekRank(const zbtreeSet *zs, unsigned long rank,
                            zbtreeIterator *iter);
+/* Move 'delta' elements in either direction (zero is a no-op) without
+ * visiting the ones in between. Return zero, leaving the iterator
+ * exhausted, if fewer elements remain. */
+int zbtreeIteratorSkip(zbtreeIterator *iter, int reverse, unsigned long delta);
 int zbtreeIteratorSeekScore(const zbtreeSet *zs, double score, int exclusive,
                             int reverse, zbtreeIterator *iter,
                             unsigned long *rank);
