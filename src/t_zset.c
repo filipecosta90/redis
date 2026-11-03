@@ -5335,7 +5335,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      * with no temporary dict and no member copies. When count >= size every
      * member is taken and no random number is drawn. */
     if (zsetobj->encoding == OBJ_ENCODING_BTREE &&
-        (count >= size || count*ZRANDMEMBER_SUB_STRATEGY_MUL > size)) {
+        (count >= size || count > size / ULONG_MAX)) {
         unsigned long remaining = size, needed = (unsigned long)reply_size;
         zbtreeIterator iter;
         const unsigned char *ele;
