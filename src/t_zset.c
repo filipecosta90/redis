@@ -5143,9 +5143,9 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
     }
 }
 
-/* How many times bigger should be the zset compared to the requested size
- * for us to not use the "remove elements" strategy? Read later in the
- * implementation for more info. */
+/* Above this size/count ratio a B+ tree zset is sampled by random draws
+ * (CASE 4) instead of one walk (CASE 3). Read later in the implementation
+ * for more info. */
 #define ZRANDMEMBER_SUB_STRATEGY_MUL 3
 
 /* If client is trying to ask for a very large number of random elements,
@@ -5178,6 +5178,9 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
 
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zsetobj);
+
+    /* Keyspace zsets are listpack or B+ tree, see rdbSaveObject(). */
+    debugServerAssert(zsetobj->encoding != OBJ_ENCODING_SKIPLIST);
 
     /* CASE 1: The count was negative, so the extraction method is just:
      * "return N random elements" sampling the whole set every time.
@@ -5238,14 +5241,6 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         goto out;
     }
 
-    zsetopsrc src;
-    zsetopval zval;
-    src.subject = zsetobj;
-    src.type = zsetobj->type;
-    src.encoding = zsetobj->encoding;
-    zuiInitIterator(&src);
-    memset(&zval, 0, sizeof(zval));
-
     /* Initiate reply count, RESP3 responds with nested array, RESP2 with flat one. */
     long reply_size = count < size ? count : size;
     if (withscores && c->resp == 2)
@@ -5253,10 +5248,61 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     else
         addReplyArrayLen(c, reply_size);
 
-    /* CASE 2:
-    * The number of requested elements is greater than the number of
-    * elements inside the zset: simply return the whole zset. */
+    /* CASE 2 and CASE 3 for B+ tree:
+     * The number of requested elements is more than a third of the zset.
+     * Walk the tree once in descending score order and emit each member with
+     * probability needed/remaining (selection sampling): a uniform subset
+     * with no temporary dict and no member copies. When count >= size every
+     * member is taken and no random number is drawn. */
+    if (zsetobj->encoding == OBJ_ENCODING_BTREE &&
+        (count >= size || count*ZRANDMEMBER_SUB_STRATEGY_MUL > size)) {
+        unsigned long remaining = size, needed = count < size ? count : size;
+        zbtreeIterator iter;
+        const unsigned char *ele;
+        size_t len;
+        double score;
+        int aborted = 0;
+        int started = zbtreeIteratorStart(zsetobj->ptr, 1, &iter);
+        serverAssert(started);
+        while (needed) {
+            if (needed < remaining && randomULongBelow(remaining) >= needed) {
+                /* Not selected: step over it without decoding it. */
+                if (!zbtreeIteratorNext(&iter, 1, NULL, NULL, NULL)) break;
+            } else {
+                if (!zbtreeIteratorNext(&iter, 1, &ele, &len,
+                                        withscores ? &score : NULL)) break;
+                if (withscores && c->resp > 2)
+                    addReplyArrayLen(c,2);
+                addReplyBulkCBuffer(c, ele, len);
+                if (withscores)
+                    addReplyDouble(c, score);
+                needed--;
+                if (c->flags & CLIENT_CLOSE_ASAP) {
+                    aborted = 1;
+                    break;
+                }
+            }
+            remaining--;
+        }
+        /* The reply length was already sent, so a short walk would corrupt
+         * the protocol. Stopping for a client being closed is the only
+         * allowed early exit. */
+        serverAssert(needed == 0 || aborted);
+        goto out;
+    }
+
+    /* CASE 2 for other encodings (B+ tree is handled above):
+     * The number of requested elements is greater than the number of
+     * elements inside the zset: simply return the whole zset. */
     if (count >= size) {
+        zsetopsrc src;
+        zsetopval zval;
+        src.subject = zsetobj;
+        src.type = zsetobj->type;
+        src.encoding = zsetobj->encoding;
+        zuiInitIterator(&src);
+        memset(&zval, 0, sizeof(zval));
+
         while (zuiNext(&src, &zval)) {
             if (withscores && c->resp > 2)
                 addReplyArrayLen(c,2);
@@ -5285,66 +5331,15 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         zrandmemberReplyWithListpack(c, count, keys, vals);
         zfree(keys);
         zfree(vals);
-        zuiClearIterator(&src);
         goto out;
-    }
-
-    /* CASE 3:
-     * The number of elements inside the zset is not greater than
-     * ZRANDMEMBER_SUB_STRATEGY_MUL times the number of requested elements.
-     * In this case we create a dict from scratch with all the elements, and
-     * subtract random elements to reach the requested number of elements.
-     *
-     * This is done because if the number of requested elements is just
-     * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 4 is highly inefficient. */
-    if (count*ZRANDMEMBER_SUB_STRATEGY_MUL > size) {
-        /* Hashtable encoding (generic implementation) */
-        dict *d = dictCreate(&sdsReplyDictType);
-        dictExpand(d, size);
-        /* Add all the elements into the temporary dictionary. */
-        while (zuiNext(&src, &zval)) {
-            sds key = zuiNewSdsFromValue(&zval);
-            dictEntry *de = dictAddRaw(d, key, NULL);
-            serverAssert(de);
-            if (withscores)
-                dictSetDoubleVal(de, zval.score);
-        }
-        serverAssert(dictSize(d) == size);
-
-        /* Remove random elements to reach the right count. */
-        while (size > count) {
-            dictEntry *de;
-            de = dictGetFairRandomKey(d);
-            dictUnlink(d,dictGetKey(de));
-            sdsfree(dictGetKey(de));
-            dictFreeUnlinkedEntry(d,de);
-            size--;
-        }
-
-        /* Reply with what's in the dict and release memory */
-        dictIterator di;
-        dictEntry *de;
-
-        dictInitIterator(&di, d);
-        while ((de = dictNext(&di)) != NULL) {
-            if (withscores && c->resp > 2)
-                addReplyArrayLen(c,2);
-            addReplyBulkSds(c, dictGetKey(de));
-            if (withscores)
-                addReplyDouble(c, dictGetDoubleVal(de));
-        }
-
-        dictResetIterator(&di);
-        dictRelease(d);
     }
 
     /* CASE 4: We have a big zset compared to the requested number of elements.
      * In this case we can simply get random elements from the zset and add
      * to the temporary set, trying to eventually get enough unique elements
-     * to reach the specified count. */
-    else {
-        /* Hashtable encoding (generic implementation) */
+     * to reach the specified count. A B+ tree gets here only when
+     * count*ZRANDMEMBER_SUB_STRATEGY_MUL <= size. */
+    {
         unsigned long added = 0;
         dict *d = dictCreate(&hashDictType);
         dictExpand(d, count);
@@ -5374,7 +5369,6 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         /* Release memory */
         dictRelease(d);
     }
-    zuiClearIterator(&src);
 out:
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), zsetobj, oldsize, kvobjAllocSize(zsetobj));
