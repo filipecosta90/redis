@@ -4674,7 +4674,7 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
      * are never mirrored. */
     if (store && rangetype == ZRANGE_RANK &&
         direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end)) {
+        (zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end) || 1)) {
         /* REV index i is forward index -1-i, which cannot overflow. */
         long tmp = opt_start;
         opt_start = -1 - opt_end;
