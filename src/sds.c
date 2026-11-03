@@ -754,8 +754,31 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             break;
         default:
             /* Copy the whole run of literal bytes up to the next '%' (or the
-             * end of the format) at once. l >= 1 since *f is not '%' or '\0'. */
-            l = strcspn(f,"%");
+             * end of the format) at once, so the sdsavail()/sdsinclen() header
+             * switch is paid once per run instead of once per byte.
+             *
+             * The run is measured with an inline scan rather than strcspn(),
+             * and a one-byte run keeps the original single store: hot reply
+             * paths use short, specifier-dense formats -- the stream ID format
+             * "%U-%U" is one specifier, a one-byte run, another specifier --
+             * where a library call plus a variable-length memcpy() per run
+             * costs more than the per-byte loop this replaces. The literal
+             * runs that motivated the change, in catClientInfoString(), are
+             * several bytes each and still take the bulk path.
+             *
+             * l >= 1 since *f is neither '%' nor '\0'. */
+            {
+                const char *e = f;
+                do { e++; } while (*e != '%' && *e != '\0');
+                l = (size_t)(e - f);
+            }
+            if (l == 1) {
+                /* Room for one more char is guaranteed at the top of the
+                 * loop, so this needs no sdsavail() check of its own. */
+                s[i++] = *f;
+                sdsinclen(s,1);
+                break;
+            }
             if (sdsavail(s) < l) {
                 s = sdsMakeRoomFor(s,l);
             }
