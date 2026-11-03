@@ -3793,11 +3793,11 @@ static void zrangeResultFinalizeClient(zrange_result_handler *handler,
 static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
 {
     handler->dstobj = zsetTypeCreate(length >= 0 ? length : 0, 0);
-    /* The plain-rank ZRANGESTORE path (genericZrangebyrankCommand) computes
-     * an exact result count here; BYSCORE/BYLEX pass length<0 and this is a
-     * no-op, same as before this reserve existed. This length is
-     * server-computed, satisfying the trust requirement documented on
-     * zbtreeReserve() itself. */
+    /* genericZrangebyrankCommand() passes an exact result count here, also
+     * for the large REV score and lex ranges that zrangeGenericCommand()
+     * resolves to ranks; other BYSCORE/BYLEX stores pass length<0 and this
+     * is a no-op. The length is always server-computed, satisfying the trust
+     * requirement documented on zbtreeReserve() itself. */
     if (length > 0 && handler->dstobj->encoding == OBJ_ENCODING_BTREE)
         zbtreeReserve(handler->dstobj->ptr, (unsigned long)length);
 }
@@ -3817,9 +3817,8 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
      * reverse-order emission both keep the original, always-correct path.
      * The batch is created lazily on the first fast-path emit (the
      * destination may start as LISTPACK and convert mid-stream) and flushed
-     * once in zrangeResultFinalizeStore(). A REV rank range whose result
-     * does not fit in a listpack arrives here in forward order too, see
-     * zrangeGenericCommand(). */
+     * once in zrangeResultFinalizeStore(). A large REV range arrives here in
+     * forward order too, see zrangeStoreRevAsForward(). */
     if (!handler->reverse && handler->dstobj->encoding == OBJ_ENCODING_BTREE) {
         if (!handler->append_batch)
             handler->append_batch = zbtreeAppendBatchCreate(handler->dstobj->ptr);
@@ -4518,21 +4517,108 @@ void zrevrangebylexCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_LEX, ZRANGE_DIRECTION_REVERSE);
 }
 
-/* Return 1 if the rank range [start,end] of zobj has more elements than a
- * listpack may hold, so a ZRANGESTORE destination for it will be a B+ tree.
- * The indexes are sanitized the same way genericZrangebyrankCommand() does,
- * and the size test must match the one in zsetTypeCreate(). */
-static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start,
-                                          long end)
-{
-    long llen = zsetLength(zobj);
+/* Return 1 if a ZRANGESTORE result of 'count' elements has more elements
+ * than a listpack may hold, so its destination will be a B+ tree. This must
+ * match the size test in zsetTypeCreate(). Member length is not considered:
+ * a small result with long members keeps the reverse walk. */
+static int zrangeStoreExceedsListpack(unsigned long count) {
+    return count > (unsigned long)server.zset_max_listpack_entries;
+}
 
-    if (start < 0) start = llen+start;
-    if (end < 0) end = llen+end;
-    if (start < 0) start = 0;
-    if (end >= llen) end = llen-1;
-    return start <= end &&
-           (unsigned long)(end-start)+1 > server.zset_max_listpack_entries;
+/* A reverse range walk starts at forward rank 'last', skips 'offset'
+ * elements, then emits up to 'limit' of them (all of them when 'limit' is
+ * negative) and stops before rank 'first'. Set [*lo,*hi] to the forward rank
+ * interval it emits and return its length, or 0 if it is empty. 'offset'
+ * must not be negative. */
+static unsigned long zrangeRevWalkSpan(unsigned long first,
+                                       unsigned long last, long offset,
+                                       long limit, unsigned long *lo,
+                                       unsigned long *hi)
+{
+    unsigned long count;
+
+    if (last < first || (unsigned long)offset > last - first) return 0;
+    *hi = last - (unsigned long)offset;
+    count = *hi - first + 1;
+    if (limit >= 0 && (unsigned long)limit < count)
+        count = (unsigned long)limit;
+    *lo = *hi + 1 - count;
+    return count;
+}
+
+/* Resolve ZRANGESTORE ... BYSCORE REV [LIMIT offset count] on a B+ tree
+ * source to the forward rank interval [*lo,*hi] that the reverse walk in
+ * genericZrangebyscoreCommand() emits. Scores are ordered, so that walk
+ * stops right before the first element in range. Return 0 if the result
+ * fits in a listpack. After the seek of the upper bound, the result is
+ * bounded as if the range started at rank 0, which skips the second seek
+ * when even that bound is small. */
+static int zrangeRevScoreToRanks(const zbtreeSet *zs,
+                                 const zrangespec *range, long offset,
+                                 long limit, unsigned long *lo,
+                                 unsigned long *hi)
+{
+    zbtreeIterator iter; /* Only the ranks of the seeks are used. */
+    unsigned long first, last;
+
+    if (!zbtreeIteratorSeekScore(zs, range->max, range->maxex, 1,
+                                 &iter, &last) ||
+        !zrangeStoreExceedsListpack(zrangeRevWalkSpan(0, last, offset,
+                                                      limit, lo, hi)) ||
+        !zbtreeIteratorSeekScore(zs, range->min, range->minex, 0,
+                                 &iter, &first))
+        return 0;
+    return zrangeStoreExceedsListpack(zrangeRevWalkSpan(first, last, offset,
+                                                        limit, lo, hi));
+}
+
+/* ZRANGESTORE ... REV stores the same elements whatever order they are
+ * emitted in. Ascending emission lets a B+ tree destination use its append
+ * path, while a listpack destination is cheaper to fill in descending order.
+ * So when the result does not fit in a listpack, set [*start,*end] to the
+ * forward rank range holding exactly the elements the reverse walk would
+ * emit, and return 1. Return 0 to keep the reverse walk.
+ *
+ * For ZRANGE_RANK, *start and *end hold the REV rank range on input. REV
+ * index i is forward index llen-1-i once sanitized the same way
+ * genericZrangebyrankCommand() does. Score ranges are resolved on a B+ tree
+ * source only, where ranks come from seeks, with LIMIT offset and count
+ * applied from the upper end as the reverse walk applies them. */
+static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
+                                   const zrangespec *range,
+                                   long offset, long limit,
+                                   long *start, long *end)
+{
+    unsigned long llen = zsetLength(zobj);
+    unsigned long lo, hi;
+
+    if (!zrangeStoreExceedsListpack(llen)) return 0;
+
+    if (rangetype == ZRANGE_RANK) {
+        long s = *start, e = *end;
+
+        if (s < 0) s = (long)llen + s;
+        if (e < 0) e = (long)llen + e;
+        if (s < 0) s = 0;
+        if (e >= (long)llen) e = (long)llen - 1;
+        if (s > e) return 0;
+        lo = llen - 1 - (unsigned long)e;
+        hi = llen - 1 - (unsigned long)s;
+        if (!zrangeStoreExceedsListpack(hi - lo + 1)) return 0;
+    } else if (rangetype == ZRANGE_SCORE) {
+        if (zobj->encoding != OBJ_ENCODING_BTREE || offset < 0) return 0;
+        if (limit >= 0 && !zrangeStoreExceedsListpack((unsigned long)limit))
+            return 0;
+        if (!zrangeRevScoreToRanks(zobj->ptr, range, offset, limit, &lo, &hi))
+            return 0;
+    } else {
+        return 0;
+    }
+
+    /* Both are ranks below llen, so they fit in a long. */
+    *start = (long)lo;
+    *end = (long)hi;
+    return 1;
 }
 
 /**
@@ -4664,18 +4750,14 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
 
     if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
 
-    /* ZRANGESTORE of a REV rank range stores the same elements as the
-     * mirrored forward range, and ascending emission lets a B+ tree
-     * destination use the append path. A listpack destination is cheaper to
-     * fill in descending order, so small results stay REV. REV index i is
-     * forward index -1-i; written this way it cannot overflow. */
-    if (store && rangetype == ZRANGE_RANK &&
-        direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end))
+    /* A large ZRANGESTORE ... REV result is stored as a forward rank range.
+     * rangetype is kept as parsed, so cleanup still frees lexrange. */
+    zrange_type walktype = rangetype;
+    if (store && direction == ZRANGE_DIRECTION_REVERSE &&
+        zrangeStoreRevAsForward(zobj, rangetype, &range, opt_offset,
+                                opt_limit, &opt_start, &opt_end))
     {
-        long tmp = opt_start;
-        opt_start = -1 - opt_end;
-        opt_end = -1 - tmp;
+        walktype = ZRANGE_RANK;
         direction = ZRANGE_DIRECTION_FORWARD;
     }
     zrangeResultHandlerDirectionSet(handler, direction == ZRANGE_DIRECTION_REVERSE);
@@ -4685,7 +4767,7 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
      * step), so there is no alloc size to update; a handler that does must
      * sample it around the call. Don't use zobj after the switch: in store
      * mode it may be the destination, which setKey()/dbDelete() replace/free. */
-    switch (rangetype) {
+    switch (walktype) {
     case ZRANGE_AUTO:
     case ZRANGE_RANK:
         genericZrangebyrankCommand(handler, zobj, opt_start, opt_end,

@@ -2962,6 +2962,42 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-entries $original_max
     }
 
+    # Check that ZRANGESTORE <args> REV into 'dst' stores exactly the
+    # elements ZRANGE <args> REV returns, and return their number. With
+    # 'forward' set, a result too large for a listpack must have been stored
+    # in the source's forward order: the destination is then built exactly
+    # like a forward rank store of the same elements and uses the same
+    # memory, while descending inserts leave it larger. The reference key
+    # zref{t} has the same name length as zdst{t}, the usual destination.
+    proc assert_zrangestore_rev {src dst forward args} {
+        set want {}
+        set members [r zrange $src {*}$args REV]
+        if {[llength $members]} {
+            set want [lsort -command zlistAlikeSort \
+                [lmap m $members s [r zmscore $src {*}$members] {list $s $m}]]
+        }
+        set n [llength $want]
+        assert_equal $n [r zrangestore $dst $src {*}$args REV]
+        assert_equal $want [lmap {m s} [r zrange $dst 0 -1 withscores] \
+            {list $s $m}]
+        set limit [lindex [r config get zset-max-listpack-entries] 1]
+        if {$n == 0} {
+            assert_equal 0 [r exists $dst]
+        } elseif {$n > $limit} {
+            assert_encoding btree $dst
+            if {$forward && $dst ne $src} {
+                set lo [r zrank $src [lindex $want 0 1]]
+                r zrangestore zref{t} $src $lo [expr {$lo + $n - 1}]
+                assert_equal $want [lmap {m s} \
+                    [r zrange zref{t} 0 -1 withscores] {list $s $m}]
+                assert_equal [r memory usage zref{t} samples 0] \
+                             [r memory usage $dst samples 0]
+                r del zref{t}
+            }
+        }
+        return $n
+    }
+
     test {ZRANGESTORE REV stores the same set as ZRANGE REV returns} {
         set old_entries [lindex [r config get zset-max-listpack-entries] 1]
         set old_value [lindex [r config get zset-max-listpack-value] 1]
@@ -2993,18 +3029,7 @@ start_server {tags {"zset"}} {
             {+inf -inf BYSCORE LIMIT 0 -1} {+inf -inf BYSCORE LIMIT 10 200}
             {+inf -inf BYSCORE LIMIT 0 50}
         } {
-            set rev [r zrange zsrc{t} {*}$args REV withscores]
-            set want [lsort -command zlistAlikeSort \
-                [lmap {ele score} $rev {list $score $ele}]]
-            assert_equal [llength $want] [r zrangestore zdst{t} zsrc{t} {*}$args REV]
-            set got [lmap {ele score} [r zrange zdst{t} 0 -1 withscores] \
-                {list $score $ele}]
-            assert_equal $want $got
-            if {[llength $want] > 128} {
-                assert_encoding btree zdst{t}
-            } elseif {[llength $want] == 0} {
-                assert_equal 0 [r exists zdst{t}]
-            }
+            assert_zrangestore_rev zsrc{t} zdst{t} 1 {*}$args
         }
 
         # BYLEX on a source with distinct scores selects different members
@@ -3016,21 +3041,13 @@ start_server {tags {"zset"}} {
                 {(m:0900 (m:0800} {[m:0999 [m:0700} {+ -} {[m:0500 [m:0600}
                 {+ - LIMIT 10 200} {[b [a}
             } {
-                set want [lsort [r zrange $src {*}$args BYLEX REV]]
-                assert_equal [llength $want] [r zrangestore zdst{t} $src {*}$args BYLEX REV]
-                assert_equal $want [lsort [r zrange zdst{t} 0 -1]]
+                assert_zrangestore_rev $src zdst{t} 0 {*}$args BYLEX
             }
         }
         assert_equal 3 [r zrangestore zdst{t} zmix{t} {[b} {[a} BYLEX REV]
 
         # Destination is the source.
-        set rev [r zrange zsrc{t} 0 199 REV withscores]
-        set want [lsort -command zlistAlikeSort \
-            [lmap {ele score} $rev {list $score $ele}]]
-        assert_equal 200 [r zrangestore zsrc{t} zsrc{t} 0 199 REV]
-        set got [lmap {ele score} [r zrange zsrc{t} 0 -1 withscores] \
-            {list $score $ele}]
-        assert_equal $want $got
+        assert_equal 200 [assert_zrangestore_rev zsrc{t} zsrc{t} 1 0 199]
 
         # A listpack source larger than the current listpack limit.
         r del zsrc{t}
@@ -3544,5 +3561,96 @@ start_server {tags {"zset"}} {
             assert_equal $digest [debug_digest]
             assert_equal OK [r save]
         }
+    }
+}
+
+start_server {tags {"zset"} overrides {zset-max-listpack-entries 128 zset-max-listpack-value 64}} {
+    # The configuration changes below stay in this server.
+
+    test {ZRANGESTORE BYSCORE REV top-N stores the same set as ZRANGE BYSCORE REV} {
+        # 1000 members over 250 scores, so ranges end inside runs of equal
+        # scores. Scores 0..31 hold 128 members, 0..32 hold 132 and 0..199
+        # hold 800.
+        set cmd [list r zadd zsrc{t}]
+        for {set j 0} {$j < 1000} {incr j} {
+            lappend cmd [expr {($j * 7919) % 250}] [format "m:%04d" $j]
+        }
+        {*}$cmd
+        assert_encoding btree zsrc{t}
+
+        foreach args {
+            {+inf -inf} {(+inf (-inf} {+inf 0} {199 0} {(200 (0}
+            {(199 (31} {31 0} {32 0} {(32 0} {249 218} {249 217}
+            {100 100} {(100 (100} {100 101} {-inf +inf} {1000 300}
+            {-1 -inf} {+inf 249.5}
+            {+inf -inf LIMIT 0 -1} {+inf -inf LIMIT 0 -5}
+            {+inf -inf LIMIT 0 0} {+inf -inf LIMIT 0 128}
+            {+inf -inf LIMIT 0 129} {+inf -inf LIMIT 871 -1}
+            {+inf -inf LIMIT 872 -1} {+inf -inf LIMIT 999 10}
+            {+inf -inf LIMIT 1000 10} {+inf -inf LIMIT 5000 -1}
+            {+inf -inf LIMIT -1 10} {199 0 LIMIT 100 600}
+            {199 0 LIMIT 100 -1} {(199 (0 LIMIT 3 129}
+            {199 0 LIMIT 671 -1} {199 0 LIMIT 672 -1}
+            {199 0 LIMIT 800 -1}
+        } {
+            assert_zrangestore_rev zsrc{t} zdst{t} 1 {*}$args BYSCORE
+        }
+        set limit [lindex [r config get zset-max-listpack-entries] 1]
+        assert_equal 1000 [assert_zrangestore_rev zsrc{t} zdst{t} 1 +inf -inf BYSCORE]
+        assert_equal [expr {$limit + 1}] [assert_zrangestore_rev zsrc{t} zdst{t} 1 \
+            +inf -inf BYSCORE LIMIT 0 [expr {$limit + 1}]]
+        assert_equal [expr {$limit + 1}] [assert_zrangestore_rev zsrc{t} zdst{t} 1 \
+            +inf -inf BYSCORE LIMIT [expr {999 - $limit}] -1]
+        assert_equal $limit [assert_zrangestore_rev zsrc{t} zdst{t} 1 \
+            +inf -inf BYSCORE LIMIT [expr {1000 - $limit}] -1]
+        assert_equal 0 [assert_zrangestore_rev zsrc{t} zdst{t} 1 \
+            +inf -inf BYSCORE LIMIT 1000 10]
+
+        # Any result, down to one element, takes the forward walk when no
+        # listpack may hold it.
+        foreach entries {0 1} {
+            r config set zset-max-listpack-entries $entries
+            foreach args {
+                {+inf -inf} {+inf -inf LIMIT 0 1} {+inf -inf LIMIT 0 2}
+                {+inf -inf LIMIT 999 -1} {0 0} {(1 (0} {249 249 LIMIT 3 5}
+            } {
+                assert_zrangestore_rev zsrc{t} zdst{t} 1 {*}$args BYSCORE
+            }
+        }
+        r config set zset-max-listpack-entries 128
+
+        # Destination is the source.
+        assert_equal 600 [assert_zrangestore_rev zsrc{t} zsrc{t} 1 199 0 BYSCORE LIMIT 100 600]
+        assert_equal 0 [assert_zrangestore_rev zsrc{t} zsrc{t} 1 199 0 BYSCORE LIMIT 600 -1]
+        r del zsrc{t} zdst{t}
+    }
+
+    test {ZRANGESTORE BYSCORE REV random ranges match ZRANGE BYSCORE REV} {
+        for {set iter 0} {$iter < 10} {incr iter} {
+            r config set zset-max-listpack-entries [lindex {0 1 16 128 128} [randomInt 5]]
+            r del zsrc{t} zdst{t}
+            set n [randomInt 1500]
+            set scores [expr {1 + [randomInt 3] * [randomInt 400]}]
+            set cmd [list r zadd zsrc{t}]
+            for {set j 0} {$j < $n} {incr j} {
+                lappend cmd [randomInt $scores] [format "m:%05d" [randomInt 3000]]
+            }
+            if {$n} {{*}$cmd}
+            set forward [expr {[r exists zsrc{t}] &&
+                               [r object encoding zsrc{t}] eq "btree"}]
+            for {set k 0} {$k < 20} {incr k} {
+                set hi [randomInt $scores]
+                set lo [expr {$hi - [randomInt $scores]}]
+                set args [list [randpath {set hi} {set _ "($hi"} {set _ +inf}] \
+                               [randpath {set lo} {set _ "($lo"} {set _ -inf}] BYSCORE]
+                if {[randomInt 2]} {
+                    lappend args LIMIT [randomInt [expr {$n + 2}]] \
+                        [expr {[randomInt [expr {$n + 2}]] - 1}]
+                }
+                assert_zrangestore_rev zsrc{t} zdst{t} $forward {*}$args
+            }
+        }
+        r config set zset-max-listpack-entries 128
+        r del zsrc{t} zdst{t}
     }
 }
