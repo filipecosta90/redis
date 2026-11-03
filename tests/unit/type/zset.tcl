@@ -3046,6 +3046,68 @@ start_server {tags {"zset"}} {
         r config set zset-max-listpack-value $old_value
     }
 
+    test {ZRANGESTORE REV rank on a large zset with many equal scores} {
+        # 100K members of 12 bytes over 20K integer scores, five members per
+        # score, so equal-score runs span B+ tree leaf boundaries and some of
+        # the rank bounds below cut through them. Inside a run the order is
+        # by member, and must survive the mirrored forward walk. The check
+        # runs in a script so large replies stay on the server: the
+        # destination must be the ZRANGE REV reply read backwards, and every
+        # member must be found at its rank and score through the member index.
+        set check {
+            local rev = redis.call('zrange', KEYS[1], ARGV[1], ARGV[2],
+                                   'REV', 'WITHSCORES')
+            local n = redis.call('zrangestore', KEYS[2], KEYS[1],
+                                 ARGV[1], ARGV[2], 'REV')
+            if n * 2 ~= #rev then return 'count ' .. n end
+            if n == 0 then return redis.call('exists', KEYS[2]) end
+            local got = redis.call('zrange', KEYS[2], 0, -1, 'WITHSCORES')
+            if #got ~= #rev then return 'card ' .. #got end
+            for i = 0, n - 1 do
+                local ele, score = got[2*i+1], got[2*i+2]
+                if ele ~= rev[2*(n-1-i)+1] or score ~= rev[2*(n-1-i)+2] then
+                    return 'order ' .. i
+                end
+                if redis.call('zrank', KEYS[2], ele) ~= i or
+                   redis.call('zscore', KEYS[2], ele) ~= score then
+                    return 'lookup ' .. i
+                end
+            end
+            return n
+        }
+
+        r del zsrc{t} zdst{t}
+        for {set j 0} {$j < 100000} {incr j 1000} {
+            set cmd [list r zadd zsrc{t}]
+            for {set k $j} {$k < $j + 1000} {incr k} {
+                lappend cmd [expr {($k * 7919) % 20000}] [format "m%011d" $k]
+            }
+            {*}$cmd
+        }
+        assert_encoding btree zsrc{t}
+
+        foreach {start end count} {
+            10000 89999 80000  10002 89997 79996  0 -1 100000
+            -80000 -1 80000  0 79999 80000  4 4 1  5 3 0
+        } {
+            assert_equal $count \
+                [r eval $check 2 zsrc{t} zdst{t} $start $end]
+            if {$count > 128} {
+                assert_encoding btree zdst{t}
+                # The destination stays usable for ordinary updates.
+                set first [r zrange zdst{t} 0 0 withscores]
+                assert_equal 1 [r zrem zdst{t} [lindex $first 0]]
+                assert_equal 1 [r zadd zdst{t} [lindex $first 1] [lindex $first 0]]
+                assert_equal 0 [r zrank zdst{t} [lindex $first 0]]
+            }
+        }
+
+        # Destination is the source, with bounds inside equal-score runs.
+        assert_equal 79996 [r eval $check 2 zsrc{t} zsrc{t} 10002 89997]
+        assert_equal 79996 [r zcard zsrc{t}]
+        r del zsrc{t} zdst{t}
+    }
+
     test {ZRANGE invalid syntax} {
         catch {r zrange z1{t} 0 -1 limit 1 2} err
         assert_match "*syntax*" $err
