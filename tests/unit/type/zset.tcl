@@ -3194,6 +3194,141 @@ start_server {tags {"zset"}} {
         r config set zset-max-ziplist-value $original_max_value
     }
 
+    # Positive counts with count * MUL <= size take CASE 4. Keep this in sync
+    # with ZRANDMEMBER_SUB_STRATEGY_MUL in t_zset.c.
+    set zrandmember_sub_strategy_mul 3
+
+    # Build a dict of member -> score, in the reply format of the current
+    # protocol.
+    proc zset_score_dict {key} {
+        dict create {*}[concat {*}[r zrange $key 0 -1 withscores]]
+    }
+
+    # Check a positive count ZRANDMEMBER reply: exact length, distinct
+    # members, each one in the set and, WITHSCORES, with its own score.
+    # The order is not checked: positive counts promise none.
+    proc check_zrandmember_distinct {key mydict count withscores} {
+        if {$withscores} {
+            set res [concat {*}[r zrandmember $key $count withscores]]
+            check_member_and_score $mydict $res
+            set members {}
+            foreach {m s} $res {lappend members $m}
+        } else {
+            set members [r zrandmember $key $count]
+            check_member $mydict $members
+        }
+        assert_equal $count [llength $members]
+        assert_equal $count [llength [lsort -unique $members]]
+        return $members
+    }
+
+    # Create a B+ tree sorted set of 'size' members, the ones whose index is
+    # a multiple of 'longevery' long enough to be stored outside the leaf.
+    proc create_btree_zset {key size longevery {scores 0}} {
+        r del $key
+        set args {}
+        for {set i 0} {$i < $size} {incr i} {
+            if {$i % $longevery == 0} {
+                set member "$i:[string repeat x 400]"
+            } else {
+                set member "m$i"
+            }
+            lappend args [expr {$scores ? $i % $scores : $i}] $member
+            if {[llength $args] >= 2000} {
+                r zadd $key {*}$args
+                set args {}
+            }
+        }
+        if {[llength $args]} {r zadd $key {*}$args}
+        assert_encoding btree $key
+        assert_equal $size [r zcard $key]
+    }
+
+    test "ZRANDMEMBER sparse count on btree - count, distinct, scores" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        # Enough members for a tree with two inner levels, many sharing
+        # each score.
+        set size 20001
+        create_btree_zset sparsezset $size 7 1000
+        set largest [expr {$size / $zrandmember_sub_strategy_mul}]
+        foreach proto {2 3} {
+            r hello $proto
+            set mydict [zset_score_dict sparsezset]
+            foreach count [list 2 3 10 100 1000 [expr {$largest - 1}] $largest] {
+                foreach withscores {0 1} {
+                    check_zrandmember_distinct sparsezset $mydict $count $withscores
+                }
+            }
+        }
+        r hello 2
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - descending score order" {
+        # Not a promise of the command: this checks the B+ tree path.
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        set size 20001
+        create_btree_zset sparsezset $size 7 1000
+        foreach count {2 10 100 1000 6667} {
+            set prev {}
+            foreach {m s} [r zrandmember sparsezset $count withscores] {
+                if {$prev ne {}} {
+                    lassign $prev pm ps
+                    assert {$ps > $s || ($ps == $s && [string compare $pm $m] > 0)}
+                }
+                set prev [list $m $s]
+            }
+        }
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - CASE 3/4 boundary" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        foreach size {300 301 302} {
+            create_btree_zset sparsezset $size 10
+            set mydict [zset_score_dict sparsezset]
+            set largest [expr {$size / $zrandmember_sub_strategy_mul}]
+            foreach count [list [expr {$largest - 1}] $largest [expr {$largest + 1}]] {
+                foreach withscores {0 1} {
+                    check_zrandmember_distinct sparsezset $mydict $count $withscores
+                }
+            }
+        }
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
+    test "ZRANDMEMBER sparse count on btree - uniform distribution" {
+        set old_limit [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+        # Several leaves, so the walk crosses leaf and inner boundaries.
+        set size 300
+        create_btree_zset sparsezset $size 10
+        # A small count, and the largest count CASE 4 takes, where about a
+        # sixth of the first draws are repeats and the refill rounds matter.
+        foreach count [list 10 [expr {$size / $zrandmember_sub_strategy_mul}]] {
+            set allkey {}
+            for {set i 0} {$i < 600} {incr i} {
+                lappend allkey {*}[r zrandmember sparsezset $count]
+            }
+            unset -nocomplain seen
+            foreach k $allkey {set seen($k) 1}
+            assert_equal $size [array size seen]
+            # Sampling without replacement makes each member's count
+            # binomial, with variance (1 - count/size) times the mean.
+            set x2 [expr {[chi_square_value $allkey] / (1.0 - double($count) / $size)}]
+            # df = 299, 415 means about 0.00001 probability
+            assert_lessthan $x2 415
+        }
+        r del sparsezset
+        r config set zset-max-listpack-entries $old_limit
+    }
+
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz
