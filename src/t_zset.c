@@ -4529,20 +4529,19 @@ void zrevrangebylexCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_LEX, ZRANGE_DIRECTION_REVERSE);
 }
 
-/* Return 1 if the rank range [start,end] of zobj has more elements than a
- * listpack may hold, so a ZRANGESTORE destination for it is created as a
- * B+ tree. Must match the size test of zsetTypeCreate() with a value length
- * hint of 0; asserted in zrangeResultBeginStore(). */
-static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start, long end) {
-    long len = zsetSanitizeRankRange(zsetLength(zobj), &start, &end);
-    return (size_t)len > server.zset_max_listpack_entries;
-}
-
 /* Return 1 if a ZRANGESTORE result of 'count' elements has more elements
  * than a listpack may hold: the size test zsetTypeCreate() makes with a
  * value length hint of 0. */
 static int zrangeStoreExceedsListpack(unsigned long count) {
     return count > server.zset_max_listpack_entries;
+}
+
+/* Return 1 if the rank range [start,end] of zobj has more elements than a
+ * listpack may hold, so a ZRANGESTORE destination for it is created as a
+ * B+ tree. */
+static int zrangeRankRangeExceedsListpack(const kvobj *zobj, long start, long end) {
+    long len = zsetSanitizeRankRange(zsetLength(zobj), &start, &end);
+    return zrangeStoreExceedsListpack((unsigned long)len);
 }
 
 /* A reverse range walk starts at forward rank 'last', skips 'offset'
@@ -4625,6 +4624,31 @@ static int zrangeStoreRevScoreAsForward(const kvobj *zobj,
     *start = (long)lo;
     *end = (long)hi;
     return 1;
+}
+
+/* ZRANGESTORE of a REV range stores the same elements whatever order they
+ * are emitted in. When the destination will be a B+ tree, walking forward
+ * fills it through the append path, while smaller results keep the REV walk
+ * into a listpack destination. Return 1 after setting [*start,*end] to the
+ * forward rank range to walk instead, or 0 to keep the REV walk. For a rank
+ * range, *start and *end hold the REV rank range on input. */
+static int zrangeStoreRevAsForward(const kvobj *zobj, zrange_type rangetype,
+                                   const zrangespec *range,
+                                   long offset, long limit,
+                                   long *start, long *end)
+{
+    if (rangetype == ZRANGE_RANK) {
+        if (!zrangeRankRangeExceedsListpack(zobj, *start, *end)) return 0;
+        /* REV index i is forward index -1-i, which cannot overflow. */
+        long tmp = *start;
+        *start = -1 - *end;
+        *end = -1 - tmp;
+        return 1;
+    }
+    if (rangetype == ZRANGE_SCORE)
+        return zrangeStoreRevScoreAsForward(zobj, range, offset, limit,
+                                            start, end);
+    return 0;
 }
 
 /**
@@ -4757,28 +4781,12 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
 
     if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
 
-    /* Step 3b: ZRANGESTORE of a REV rank range stores the same elements as
-     * the mirrored forward range. When the destination will be a B+ tree,
-     * walk forward so it is filled through the append path. Smaller results
-     * keep the REV walk into a listpack destination. Score and lex ranges
-     * are never mirrored. */
-    if (store && rangetype == ZRANGE_RANK &&
-        direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeRankRangeExceedsListpack(zobj, opt_start, opt_end)) {
-        /* REV index i is forward index -1-i, which cannot overflow. */
-        long tmp = opt_start;
-        opt_start = -1 - opt_end;
-        opt_end = -1 - tmp;
-        direction = ZRANGE_DIRECTION_FORWARD;
-    }
-
-    /* Step 3c: the same for a REV score range on a B+ tree source, which is
-     * resolved to the forward rank range holding the same elements. */
+    /* Step 3b: store a large REV range as the forward rank range holding
+     * the same elements, see zrangeStoreRevAsForward(). */
     walktype = rangetype;
-    if (store && rangetype == ZRANGE_SCORE &&
-        direction == ZRANGE_DIRECTION_REVERSE &&
-        zrangeStoreRevScoreAsForward(zobj, &range, opt_offset, opt_limit,
-                                     &opt_start, &opt_end)) {
+    if (store && direction == ZRANGE_DIRECTION_REVERSE &&
+        zrangeStoreRevAsForward(zobj, rangetype, &range, opt_offset,
+                                opt_limit, &opt_start, &opt_end)) {
         walktype = ZRANGE_RANK;
         direction = ZRANGE_DIRECTION_FORWARD;
     }
