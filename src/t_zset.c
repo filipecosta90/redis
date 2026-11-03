@@ -5153,6 +5153,89 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
  * the number of randoms per time. */
 #define ZRANDMEMBER_RANDOM_SAMPLE_LIMIT 1000
 
+static int zrandmemberRankCmp(const void *a, const void *b) {
+    unsigned long x = *(const unsigned long *)a, y = *(const unsigned long *)b;
+    return (x > y) - (x < y);
+}
+
+/* Fill ranks[0..count) with distinct ranks drawn uniformly from [0, size),
+ * sorted ascending. 'buf' is scratch space for 'count' ranks.
+ *
+ * We draw ranks with replacement, sort them and drop duplicates, then draw
+ * again only for the shortfall until count distinct ranks remain. That is
+ * the same as drawing one rank at a time until count distinct ones were
+ * seen, which treats every rank alike, so every subset of 'count' ranks is
+ * equally likely. With count <= size/3 (CASE 4) each draw repeats an
+ * earlier one with probability below 1/3, so the shortfall shrinks
+ * geometrically and the first sort does nearly all the work. */
+static void zrandmemberSampleRanks(unsigned long size, unsigned long count,
+                                   unsigned long *ranks, unsigned long *buf)
+{
+    unsigned long have = 0;
+    while (have < count) {
+        unsigned long need = count - have, i;
+        for (i = 0; i < need; i++) buf[i] = randomULongBelow(size);
+        qsort(buf, need, sizeof(unsigned long), zrandmemberRankCmp);
+
+        /* Merge the new draws into the sorted ranks we keep, from the back,
+         * then drop the duplicates. */
+        unsigned long a = have, b = need, w = count;
+        while (b) {
+            if (a && ranks[a-1] > buf[b-1]) ranks[--w] = ranks[--a];
+            else ranks[--w] = buf[--b];
+        }
+        have = 1;
+        for (i = 1; i < count; i++)
+            if (ranks[i] != ranks[have-1]) ranks[have++] = ranks[i];
+    }
+}
+
+/* CASE 4 of ZRANDMEMBER for a B+ tree. Picking ranks one by one would need
+ * a dict of member copies to spot repeats. Instead we choose the distinct
+ * ranks first and shuffle them, so the reply comes out in random order and
+ * any prefix of it is a uniform sample too. Each member is then found by
+ * its rank.
+ *
+ * The member bytes point into the leaves. addReplyBulkCBuffer() copies them
+ * into the reply, which must stay so: leaf memory is not reference counted
+ * and is gone after the next write to the key. */
+static void zrandmemberSparseFromBtree(client *c, zbtreeSet *zs,
+                                       unsigned long size, unsigned long count,
+                                       int withscores)
+{
+    unsigned long *ranks = zmalloc(sizeof(unsigned long) * count * 2);
+    zrandmemberSampleRanks(size, count, ranks, ranks + count);
+
+    /* Fisher-Yates shuffle. */
+    for (unsigned long i = count - 1; i > 0; i--) {
+        unsigned long j = randomULongBelow(i + 1);
+        unsigned long tmp = ranks[i];
+        ranks[i] = ranks[j];
+        ranks[j] = tmp;
+    }
+
+    for (unsigned long i = 0; i < count; i++) {
+        zbtreeIterator iter;
+        const unsigned char *ele;
+        size_t len;
+        double score;
+
+        serverAssert(zbtreeIteratorSeekRank(zs, ranks[i], &iter));
+        serverAssert(zbtreeIteratorNext(&iter, 0, &ele, &len,
+                                        withscores ? &score : NULL));
+        if (withscores && c->resp > 2)
+            addReplyArrayLen(c,2);
+        addReplyBulkCBuffer(c, ele, len);
+        if (withscores)
+            addReplyDouble(c, score);
+        /* The reply is discarded once the client is closing, so stop early,
+         * as CASE 1 does. */
+        if (c->flags & CLIENT_CLOSE_ASAP)
+            break;
+    }
+    zfree(ranks);
+}
+
 void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     unsigned long count, size;
     int uniq = 1;
@@ -5340,11 +5423,19 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     }
 
     /* CASE 4: We have a big zset compared to the requested number of elements.
-     * In this case we can simply get random elements from the zset and add
-     * to the temporary set, trying to eventually get enough unique elements
-     * to reach the specified count. */
+     * A B+ tree samples distinct ranks and replies in random order, see
+     * zrandmemberSparseFromBtree(). A skiplist gets random elements from the
+     * zset and adds them to a temporary set, trying to eventually get enough
+     * unique elements to reach the specified count, and replies in the
+     * order they were drawn. */
     else {
-        /* Hashtable encoding (generic implementation) */
+        if (zsetobj->encoding == OBJ_ENCODING_BTREE) {
+            zrandmemberSparseFromBtree(c, zsetobj->ptr, size, count, withscores);
+            zuiClearIterator(&src);
+            goto out;
+        }
+
+        /* Skiplist encoding (generic implementation) */
         unsigned long added = 0;
         dict *d = dictCreate(&hashDictType);
         dictExpand(d, count);
