@@ -3140,8 +3140,9 @@ start_server {tags {"zset"}} {
             }
 
             # PATH 3: Ask almost as elements as there are in the set.
-            # In this case the implementation will duplicate the original
-            # set and will remove random elements up to the requested size.
+            # For btree the implementation walks the set once and selects
+            # each element with probability needed/remaining; listpack sets
+            # are served by a separate single-pass path.
             #
             # PATH 4: Ask a number of elements definitely smaller than
             # the set size.
@@ -3192,6 +3193,87 @@ start_server {tags {"zset"}} {
             }
         }
         r config set zset-max-ziplist-value $original_max_value
+    }
+
+    test "ZRANDMEMBER with <count> walks the btree once - btree" {
+        # PATH 2 and PATH 3 on a btree, with a mix of inline and external
+        # members and duplicate scores, in both protocols. 67 is the smallest
+        # count that takes PATH 3 for 200 members.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 16
+        r del myzset
+        set mydict {}
+        for {set i 0} {$i < 200} {incr i} {
+            if {$i % 5 == 0} {
+                set m "m:$i:[string repeat x 330]"
+            } else {
+                set m "m:$i"
+            }
+            set score [expr {$i % 20}]
+            r zadd myzset $score $m
+            dict set mydict $m $score
+        }
+        assert_encoding btree myzset
+
+        foreach proto {2 3} {
+            r hello $proto
+            foreach count {67 120 199 200 300} {
+                set want [expr {min($count, 200)}]
+                set res [r zrandmember myzset $count]
+                assert_equal $want [llength $res]
+                assert_equal $want [llength [lsort -unique $res]]
+                check_member $mydict $res
+
+                set res [r zrandmember myzset $count withscores]
+                if {$proto == 3} {
+                    assert_equal 2 [llength [lindex $res 0]]
+                    set res [concat {*}$res]
+                }
+                assert_equal [expr {$want * 2}] [llength $res]
+                assert_equal $want [dict size [dict create {*}$res]]
+                foreach {m s} $res { assert_equal [r zscore myzset $m] $s }
+
+                # Members come out in descending score order, as in PATH 2.
+                set scores {}
+                foreach {m s} $res { lappend scores $s }
+                assert_equal [lsort -real -decreasing $scores] $scores
+            }
+        }
+        r hello 2
+        r config set zset-max-listpack-entries $original_max
+    }
+
+    test "ZRANDMEMBER count > size/3 distribution - btree" {
+        # Sampling is without replacement, so each member is in a reply with
+        # probability 120/200: over 2000 calls the uniform expectation is
+        # E[x2] = 200 * (2000*0.6*0.4) / 1200 = 80, sd about 8. A sampler biased
+        # by a hash table layout reads in the thousands.
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 16
+        r del myzset
+        set members {}
+        for {set i 0} {$i < 200} {incr i} {
+            lappend members "member:$i"
+            r zadd myzset [expr {$i % 7}] "member:$i"
+        }
+        assert_encoding btree myzset
+
+        unset -nocomplain counts
+        array set counts {}
+        foreach m $members { set counts($m) 0 }
+        for {set i 0} {$i < 2000} {incr i} {
+            set res [r zrandmember myzset 120]
+            assert_equal 120 [llength [lsort -unique $res]]
+            foreach ele $res { incr counts($ele) }
+        }
+
+        set p [expr {2000 * 120 / 200}]
+        set x2 0
+        foreach m $members {
+            set x2 [expr {$x2 + pow($counts($m) - $p, 2) / $p}]
+        }
+        assert_lessthan $x2 400
+        r config set zset-max-listpack-entries $original_max
     }
 
     test {zset score double range} {

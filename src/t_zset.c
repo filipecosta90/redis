@@ -5153,6 +5153,15 @@ static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpack
  * the number of randoms per time. */
 #define ZRANDMEMBER_RANDOM_SAMPLE_LIMIT 1000
 
+/* Return a uniform random integer in [0, n), n > 0, without modulo bias. */
+static uint64_t zrandmemberRandomBelow(uint64_t n) {
+    uint64_t r, min = -n % n; /* 2^64 mod n: reject draws below it. */
+    do {
+        r = genrand64_int64();
+    } while (r < min);
+    return r % n;
+}
+
 void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     unsigned long count, size;
     int uniq = 1;
@@ -5252,6 +5261,41 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         addReplyArrayLen(c, reply_size*2);
     else
         addReplyArrayLen(c, reply_size);
+
+    /* CASE 2 and CASE 3 for the B+ tree: walk it once, in the same order as
+     * the generic CASE 2 below, and emit each member with probability
+     * needed/remaining (selection sampling). This yields a uniform subset with
+     * no temporary dict and no member copies. 'needed <= remaining' holds
+     * throughout, so exactly reply_size members are emitted, in score order. */
+    if (zsetobj->encoding == OBJ_ENCODING_BTREE &&
+        (count >= size || count*ZRANDMEMBER_SUB_STRATEGY_MUL > size))
+    {
+        unsigned long remaining = size, needed = reply_size;
+        zbtreeIterator iter;
+        const unsigned char *ele;
+        size_t len;
+        double score;
+
+        zbtreeIteratorStart(zsetobj->ptr, 1, &iter);
+        while (needed && zbtreeIteratorNext(&iter, 1, &ele, &len, &score)) {
+            if (needed == remaining ||
+                zrandmemberRandomBelow(remaining) < needed)
+            {
+                if (withscores && c->resp > 2)
+                    addReplyArrayLen(c,2);
+                addReplyBulkCBuffer(c, ele, len);
+                if (withscores)
+                    addReplyDouble(c, score);
+                needed--;
+                if (c->flags & CLIENT_CLOSE_ASAP)
+                    break;
+            }
+            remaining--;
+        }
+        serverAssert(needed == 0 || (c->flags & CLIENT_CLOSE_ASAP));
+        zuiClearIterator(&src);
+        goto out;
+    }
 
     /* CASE 2:
     * The number of requested elements is greater than the number of
