@@ -3894,6 +3894,25 @@ unsigned long zbtreeDeleteRangeByScore(zbtreeSet *zs, double min, int minex,
  * the iterator become invalid after any modification of this sorted set.
  */
 
+/* Point the iterator at the element of the given rank inside the subtree
+ * rooted at 'node'. The rank must be below the subtree's element count. */
+static void zbtScoreDescendByRank(zbtScoreNode *node, unsigned long rank,
+                                  zbtreeIterator *iter)
+{
+    while (!node->isleaf) {
+        zbtScoreInner *inner = (zbtScoreInner *)node;
+        unsigned int pos = 0;
+        while (rank >= (unsigned long)inner->child_count[pos]) {
+            rank -= (unsigned long)inner->child_count[pos];
+            pos++;
+            serverAssert(pos < inner->n.count);
+        }
+        node = inner->child[pos];
+    }
+    iter->leaf = node;
+    iter->pos = rank;
+}
+
 /* Seek the element having the specified zero-based rank. */
 int zbtreeIteratorSeekRank(const zbtreeSet *zs, unsigned long rank,
                            zbtreeIterator *iter)
@@ -3903,20 +3922,63 @@ int zbtreeIteratorSeekRank(const zbtreeSet *zs, unsigned long rank,
         iter->pos = 0;
         return 0;
     }
-
-    zbtScoreNode *node = zs->score_root;
-    while (!node->isleaf) {
-        zbtScoreInner *inner = (zbtScoreInner *)node;
-        unsigned int pos = 0;
-        while (rank >= inner->child_count[pos]) {
-            rank -= inner->child_count[pos];
-            pos++;
-        }
-        node = inner->child[pos];
-    }
-    iter->leaf = node;
-    iter->pos = rank;
+    zbtScoreDescendByRank(zs->score_root, rank, iter);
     return 1;
+}
+
+/* Move the iterator 'delta' elements in the given direction without reading
+ * the ones in between, so a skip of zero is a no-op. A step that stays inside
+ * the current leaf only moves the position. A longer one climbs only until an
+ * ancestor has a sibling subtree, on the requested side, that covers the
+ * target, skipping the subtrees in between by their counts, then descends.
+ * Return zero, leaving the iterator exhausted, if the target is out of
+ * range. */
+int zbtreeIteratorSkip(zbtreeIterator *iter, int reverse,
+                       unsigned long delta)
+{
+    zbtScoreLeaf *leaf = iter->leaf;
+    if (leaf == NULL) return 0;
+
+    /* Elements left in this leaf in the walk direction, current included. */
+    unsigned long remain = reverse ? iter->pos + 1 : leaf->n.count - iter->pos;
+    if (delta < remain) {
+        if (reverse) iter->pos -= delta;
+        else iter->pos += delta;
+        return 1;
+    }
+
+    /* From here 'delta' counts from the first element past this leaf. */
+    delta -= remain;
+    zbtScoreNode *node = &leaf->n;
+    while (node->parent) {
+        zbtScoreInner *parent = node->parent;
+        if (reverse) {
+            for (unsigned int i = node->parent_index; i-- > 0; ) {
+                unsigned long n = (unsigned long)parent->child_count[i];
+                if (delta < n) {
+                    zbtScoreDescendByRank(parent->child[i], n - 1 - delta,
+                                          iter);
+                    return 1;
+                }
+                delta -= n;
+            }
+        } else {
+            for (unsigned int i = node->parent_index + 1;
+                 i < parent->n.count; i++)
+            {
+                unsigned long n = (unsigned long)parent->child_count[i];
+                if (delta < n) {
+                    zbtScoreDescendByRank(parent->child[i], delta, iter);
+                    return 1;
+                }
+                delta -= n;
+            }
+        }
+        node = &parent->n;
+    }
+    iter->leaf = NULL;
+    iter->pos = 0;
+    return 0;
 }
 
 /* Find the first score not below the bound. If after_equal is true, equal
@@ -6188,6 +6250,96 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
             zfree(seen);
             zbtreeFree(alike);
         }
+        zbtreeFree(zs);
+    }
+
+    printf("Testing B+ tree zbtreeIteratorSkip()\n");
+
+    /* Skip from every leaf boundary must land where SeekRank does, in both
+     * directions, including the edges and one step past them. */
+    {
+        const int N = 40000;
+        zbtreeSet *zs = zbtreeCreate();
+        uint64_t rnd = 4242;
+        int *perm = zmalloc(sizeof(int) * N);
+        for (int i = 0; i < N; i++) perm[i] = i;
+        for (int i = N - 1; i > 0; i--) {
+            int j = (int)(zbtTestRand(&rnd) % (uint64_t)(i + 1));
+            int tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+        }
+        /* Random insertion order and a quarter deleted: uneven leaves. */
+        for (int k = 0; k < N; k++)
+            zbtTestPopulateRange(zs, perm[k], perm[k] + 1);
+        for (int k = 0; k < N / 4; k++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "member:%d", perm[k]);
+            sds ele = sdsnew(buf);
+            serverAssert(zbtreeDelete(zs, ele));
+            sdsfree(ele);
+        }
+        zfree(perm);
+
+        int depth = 1;
+        for (zbtScoreNode *n = zs->score_root; !n->isleaf;
+             n = ((zbtScoreInner *)n)->child[0])
+            depth++;
+        unsigned long len = zbtreeLength(zs);
+        test_cond("Skip test tree has at least three levels",
+            depth >= 3 && zbtTestCheck(zs));
+
+        int ok = 1;
+        long checks = 0;
+        unsigned long base = 0;
+        for (zbtScoreLeaf *leaf = zs->score_first; leaf && ok;
+             leaf = leaf->next)
+        {
+            unsigned long edges[2] = {base, base + leaf->n.count - 1};
+            base += leaf->n.count;
+            for (int e = 0; e < 2 && ok; e++) {
+                unsigned long a = edges[e];
+                unsigned long deltas[] = {0, 1, 2, 3, 47, 95, 96, 97, 500,
+                    3000, 10000, a, a + 1, len - 1 - a, len - a,
+                    zbtTestRand(&rnd) % len, zbtTestRand(&rnd) % 200};
+                for (size_t k = 0; k < sizeof(deltas)/sizeof(deltas[0]); k++) {
+                    for (int reverse = 0; reverse <= 1; reverse++) {
+                        unsigned long d = deltas[k];
+                        zbtreeIterator it, want;
+                        serverAssert(zbtreeIteratorSeekRank(zs, a, &it));
+                        int got = zbtreeIteratorSkip(&it, reverse, d);
+                        int in = reverse ? d <= a : a + d < len;
+                        if (in) {
+                            zbtreeIteratorSeekRank(zs,
+                                reverse ? a - d : a + d, &want);
+                            if (!got || it.leaf != want.leaf ||
+                                it.pos != want.pos) ok = 0;
+                        } else if (got || it.leaf != NULL) {
+                            ok = 0;
+                        }
+                        checks++;
+                    }
+                }
+            }
+        }
+        test_cond("Skip lands on SeekRank(rank +/- delta) from every leaf edge",
+            ok && checks > 1000 && base == len);
+
+        /* Skip composes with Next: a walk of fixed strides visits the same
+         * elements as seeking each of them. */
+        zbtreeIterator it, want;
+        int walk_ok = 1;
+        serverAssert(zbtreeIteratorSeekRank(zs, 0, &it));
+        for (unsigned long r = 0; r < len && walk_ok; r += 37) {
+            zbtreeIteratorSeekRank(zs, r, &want);
+            if (it.leaf != want.leaf || it.pos != want.pos) walk_ok = 0;
+            zbtreeIteratorNext(&it, 0, NULL, NULL, NULL);
+            if (r + 37 < len && !zbtreeIteratorSkip(&it, 0, 36)) walk_ok = 0;
+        }
+        test_cond("Next followed by Skip walks a fixed stride", walk_ok);
+
+        zbtreeIterator done = {NULL, 0};
+        test_cond("Skip on an exhausted iterator returns 0",
+            !zbtreeIteratorSkip(&done, 0, 0) &&
+            !zbtreeIteratorSkip(&done, 1, 0) && done.leaf == NULL);
         zbtreeFree(zs);
     }
 

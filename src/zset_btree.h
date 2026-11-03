@@ -130,6 +130,13 @@ int zbtreeIteratorStart(const zbtreeSet *zs, int reverse,
                         zbtreeIterator *iter);
 int zbtreeIteratorNext(zbtreeIterator *iter, int reverse,
                        const unsigned char **ele, size_t *len, double *score);
+/* Move a positioned iterator 'delta' elements forward, or backward if
+ * 'reverse' is set (the same sense as in Next), without visiting the ones in
+ * between. A delta of zero leaves it where it is. Return 1 on success. If the
+ * iterator is already exhausted, or fewer than 'delta' elements follow in
+ * that direction, return 0 and leave the iterator exhausted. */
+int zbtreeIteratorSkip(zbtreeIterator *iter, int reverse,
+                       unsigned long delta);
 unsigned long zbtreeCountByScore(const zbtreeSet *zs, double min, int minex,
                                  double max, int maxex);
 
