@@ -3237,11 +3237,10 @@ start_server {tags {"zset"}} {
     }
 
     test "ZRANDMEMBER count > size/3 distribution - btree" {
-        # The PATH 3 histogram above uses 10 elements, too few to tell a
-        # uniform sampler from one skewed by a hash table layout. Each of
-        # 200 members is in a reply with probability 120/200, so after 1000
-        # calls a uniform sampler reads about 80 with sd about 8, while a
-        # layout-skewed one reads in the hundreds.
+        # The PATH 3 histogram above uses 10 elements. Check PATH 3 on a
+        # larger set too: each of 200 members is in a reply with probability
+        # 120/200, so after 1000 calls a uniform sampler reads about 80 with
+        # sd about 8.
         set original_max [lindex [r config get zset-max-listpack-entries] 1]
         r config set zset-max-listpack-entries 0
         r del myzset
