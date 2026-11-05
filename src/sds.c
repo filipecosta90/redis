@@ -753,8 +753,32 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             }
             break;
         default:
-            s[i++] = *f;
-            sdsinclen(s,1);
+            /* Copy the run of literal bytes up to the next '%' (or the end
+             * of the format) at once, so the sdsavail()/sdsinclen() header
+             * switch is paid once per run instead of once per byte. A one-byte
+             * run keeps the original store: there the bulk path's extra length
+             * bookkeeping costs more than it saves. */
+            debugAssert(*f != '\0' && *f != '%'); /* the run is >= 1 byte */
+            {
+                const char *e = f;
+                do { e++; } while (*e != '%' && *e != '\0');
+                l = (size_t)(e - f);
+            }
+            if (l == 1) {
+                /* Room for one more char is guaranteed at the top of the
+                 * loop, so this needs no sdsavail() check of its own. */
+                s[i++] = *f;
+                sdsinclen(s,1);
+                break;
+            }
+            if (sdsavail(s) < l) {
+                s = sdsMakeRoomFor(s,l);
+            }
+            memcpy(s+i,f,l);
+            sdsinclen(s,l);
+            i += l;
+            debugAssert(l >= 2); /* l == 1 returned above, l == 0 cannot occur */
+            f += l-1; /* Last copied byte; the f++ below steps onto the '%'. */
             break;
         }
         f++;
@@ -1369,6 +1393,84 @@ int sdsTest(int argc, char **argv, int flags) {
         test_cond("sdscatfmt() seems working with unsigned numbers",
             sdslen(x) == 35 &&
             memcmp(x,"--4294967295,18446744073709551615--",35) == 0);
+
+        sdsfree(x);
+        {
+            /* Literal runs around specifiers, '%%', an unknown specifier and
+             * a trailing lone '%' (dropped). x already has room for
+             * strlen(fmt)*2, so sdscatfmt() does not grow it up front; pad
+             * leaves exactly one byte free after %S (pre is the output before
+             * it), so the literal tail must grow the buffer. */
+            const char *fmt = "id=%i 100%% %z %S tail-literal-run%";
+            const char *pre = "--id=7 100% z ";
+            x = sdsMakeRoomFor(sdsnew("--"),strlen(fmt)*2);
+            size_t alloc = sdsalloc(x);
+            assert(alloc > strlen(pre)+1);
+            size_t padlen = alloc - strlen(pre) - 1;
+            sds pad = sdsnewlen(SDS_NOINIT,padlen);
+            memset(pad,'a',padlen);
+            x = sdscatfmt(x,fmt,7,pad);
+            sds expected = sdscatprintf(sdsempty(),"%s%s tail-literal-run",pre,pad);
+            test_cond("sdscatfmt() copies literal runs correctly",
+                sdsalloc(x) > alloc &&
+                sdslen(x) == sdslen(expected) &&
+                memcmp(x,expected,sdslen(x)+1) == 0);
+            sdsfree(pad);
+            sdsfree(expected);
+
+            sdsfree(x);
+            x = sdscatfmt(sdsnew("--"),"");
+            x = sdscatfmt(x,"no specifiers");
+            test_cond("sdscatfmt() with empty and specifier-free formats",
+                sdslen(x) == 15 && memcmp(x,"--no specifiers\0",16) == 0);
+        }
+
+        /* The two sides of the one new bounds check in the literal-run path,
+         * `sdsavail(s) < l`, driven to equality from both directions. In each
+         * case `x` is pre-grown past the strlen(fmt)*2 reservation sdscatfmt()
+         * makes up front, so that reservation is a no-op and the %S argument
+         * alone decides how much room is left when the tail run is copied. */
+        for (int shortfall = 0; shortfall <= 1; shortfall++) {
+            const char *tail = "0123456789";    /* the literal run under test */
+            const char *fmt  = "%S0123456789";
+            const size_t l = strlen(tail);
+            sdsfree(x);
+            x = sdsMakeRoomFor(sdsnew("--"),strlen(fmt)*2+64);
+            size_t alloc = sdsalloc(x);
+            assert(alloc > sdslen(x)+l);
+            /* shortfall 0: sdsavail(s) == l exactly -- enough room, must not
+             *              grow, and must not write one byte past the buffer.
+             * shortfall 1: sdsavail(s) == l-1 -- one byte short, must grow.
+             *              A `sdsavail(s) < l-1` guard does not grow here and
+             *              overruns the allocation (caught under ASAN). */
+            size_t padlen = alloc - sdslen(x) - l + shortfall;
+            sds pad = sdsnewlen(SDS_NOINIT,padlen);
+            memset(pad,'b',padlen);
+            sds expected = sdscatlen(sdscatlen(sdsnew("--"),pad,padlen),tail,l);
+            x = sdscatfmt(x,fmt,pad);
+            test_cond(shortfall == 0
+                    ? "sdscatfmt() literal run exactly fills the free space"
+                    : "sdscatfmt() literal run one byte short of the free space",
+                (shortfall == 0 ? sdsalloc(x) == alloc : sdsalloc(x) > alloc) &&
+                sdslen(x) == sdslen(expected) &&
+                memcmp(x,expected,sdslen(x)+1) == 0);
+            sdsfree(pad);
+            sdsfree(expected);
+        }
+
+        /* Run lengths 1 and 2 specifically. The one-byte run is the only input
+         * that takes the single-store fast path, and two bytes is the shortest
+         * run that does not -- both are load-bearing, so give each a format
+         * whose sole literal run is that length rather than relying on one
+         * turning up incidentally inside a larger format. */
+        sdsfree(x);
+        x = sdscatfmt(sdsempty(),"%i-%i",7,9);
+        test_cond("sdscatfmt() with a one-byte literal run",
+            sdslen(x) == 3 && memcmp(x,"7-9\0",4) == 0);
+        sdsfree(x);
+        x = sdscatfmt(sdsempty(),"%i\r\n%i",7,9);
+        test_cond("sdscatfmt() with a two-byte literal run",
+            sdslen(x) == 4 && memcmp(x,"7\r\n9\0",5) == 0);
 
         sdsfree(x);
         x = sdsnew(" x ");
