@@ -763,8 +763,14 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             e = f;
             do { e++; } while (*e != '%' && *e != '\0');
             l = (size_t)(e - f);
-            if (l == 1) {
-                /* Room for one more char is guaranteed at the top of the
+            if (l <= 3) {
+                /* EXPERIMENT (not for upstream): widen the short-run cutoff
+                 * from 1 to 3 bytes. Only the constant differs from
+                 * gap-h3-sdscatfmt-literal-runs. f is deliberately not
+                 * advanced, so the outer f++ walks the run one byte at a
+                 * time exactly as the pre-patch loop did; each remaining
+                 * byte re-scans a run of <= 3, which is 1-2 extra compares.
+                 * Room for one more char is guaranteed at the top of the
                  * loop, so this needs no sdsavail() check of its own. */
                 s[i++] = *f;
                 sdsinclen(s,1);
