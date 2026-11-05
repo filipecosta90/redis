@@ -1681,8 +1681,8 @@ start_server {tags {"zset"}} {
         # A fixed seed, so that a failure can be reproduced.
         expr {srand(15635)}
 
-        # Lengths 0 to 4, 7 to 9, 15 to 17 and 36, mostly differing in the
-        # last bytes, with many members sharing a leaf tag.
+        # Lengths 0 to 4, 7 to 9, 15 to 17, 36 and 64, mostly differing in
+        # the last bytes, with many members sharing a leaf tag.
         proc zbt_member {len i} {
             if {$len == 0} {return ""}
             set id [format %x $i]
@@ -1692,7 +1692,7 @@ start_server {tags {"zset"}} {
             return "[string repeat m [expr {$len - [string length $id]}]]$id"
         }
         set pool {}
-        foreach len {0 1 2 3 4 7 8 9 15 16 17 36} {
+        foreach len {0 1 2 3 4 7 8 9 15 16 17 36 64} {
             for {set i 0} {$i < 300} {incr i} {
                 lappend pool [zbt_member $len $i]
             }
@@ -1764,6 +1764,9 @@ start_server {tags {"zset"}} {
                 {zinter 2 zbtx-s{t} A withscores}
                 {zinter 3 zbtx-u{t} A B withscores}
                 {zinter 2 zbtx-i{t} B weights 2 1 withscores}
+                {zintercard 3 zbtx-s{t} zbtx-u{t} A}
+                {zinter 3 zbtx-s{t} zbtx-u{t} A withscores}
+                {zinter 4 zbtx-s{t} zbtx-u{t} B A aggregate max withscores}
                 {zintercard 2 A R} {zinter 2 A R withscores}
                 {zinter 3 B R C aggregate max withscores}
             }

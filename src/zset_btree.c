@@ -1383,6 +1383,10 @@ int zbtScoreLeafFindMemberByTags(zbtScoreLeaf *leaf, uint32_t hash,
 #define ZBT_TAG_SCAN_WIDTH 16
 #define ZBT_TAG_SCAN_MIN_COUNT ZBT_TAG_SCAN_WIDTH
 #define ZBT_SHORT_MEMBER_MAX 16
+/* Longest member the tag scan takes: every member up to it is stored inline
+ * with a one byte length, compared word-wise up to ZBT_SHORT_MEMBER_MAX and
+ * with memcmp() above. */
+#define ZBT_TAG_SCAN_MEMBER_MAX (ZBT_PACKED_SHORT - 1)
 
 static_assert(ZBT_TAG_SCAN_MIN_COUNT >= ZBT_TAG_SCAN_WIDTH,
               "a tag scan step must not read past the tag array");
@@ -1394,6 +1398,9 @@ static_assert(ZBT_SHORT_MEMBER_MAX <= 2 * sizeof(uint64_t),
  * ZBT_EXTERNAL_MEMBER_AT bytes. */
 static_assert(ZBT_SHORT_MEMBER_MAX < ZBT_PACKED_SHORT,
               "short members must use the one byte length form");
+static_assert(ZBT_TAG_SCAN_MEMBER_MAX < ZBT_PACKED_SHORT &&
+              ZBT_TAG_SCAN_MEMBER_MAX < ZBT_EXTERNAL_MEMBER_AT,
+              "tag scan members must use the one byte length form");
 
 #ifdef ZBT_TAG_SIMD
 /* Return a mask of the lanes where p[i] equals 'tag'. The first match is
@@ -1440,7 +1447,19 @@ static inline int zbtShortMemberEqual(const unsigned char *record,
     return 1;
 }
 
-/* Search a leaf for a short member without calls. Return 1 if found, setting
+/* Return 1 if 'record' holds 'ele', of at most ZBT_TAG_SCAN_MEMBER_MAX
+ * bytes. A record in another form starts with a byte above that, so the
+ * length check rejects it. */
+static inline int zbtInlineMemberEqual(const unsigned char *record,
+                                       const unsigned char *ele, size_t len)
+{
+    if (len <= ZBT_SHORT_MEMBER_MAX)
+        return zbtShortMemberEqual(record, ele, len);
+    return record[0] == len && memcmp(record + 1, ele, len) == 0;
+}
+
+/* Search a leaf for a member of at most ZBT_TAG_SCAN_MEMBER_MAX bytes,
+ * scanning ZBT_TAG_SCAN_WIDTH tags at a time. Return 1 if found, setting
  * *score and *position when not NULL, 0 if not found, or -1 if the member or
  * leaf does not qualify. The last step re-reads the final ZBT_TAG_SCAN_WIDTH
  * tags, so no load leaves the tag array; a tag seen twice belongs to a member
@@ -1451,7 +1470,7 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
                           double *score, unsigned int *position)
 {
     unsigned int count = leaf->n.count;
-    if (elelen > ZBT_SHORT_MEMBER_MAX || count < ZBT_TAG_SCAN_MIN_COUNT)
+    if (elelen > ZBT_TAG_SCAN_MEMBER_MAX || count < ZBT_TAG_SCAN_MIN_COUNT)
         return -1;
 
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
@@ -1462,8 +1481,8 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
         while (matches) {
             unsigned int physical =
                 start + (__builtin_ctzll(matches) >> ZBT_TAG_MATCH_SHIFT);
-            if (zbtShortMemberEqual((unsigned char *)leaf + offsets[physical],
-                                    ele, elelen))
+            if (zbtInlineMemberEqual((unsigned char *)leaf + offsets[physical],
+                                     ele, elelen))
             {
                 unsigned int logical = zbtScoreLeafPhysicalPos(leaf, physical);
                 if (score) *score = zbtScoreLeafScore(leaf, logical);
@@ -2181,7 +2200,7 @@ int zbtIndexTableFind(zbtreeSet *zs, zbtIndexTable *table,
 #ifdef ZBT_TAG_SIMD
                 /* Inline the short search only for read-only lookups. */
                 int hit;
-                if (elelen > ZBT_SHORT_MEMBER_MAX)
+                if (elelen > ZBT_TAG_SCAN_MEMBER_MAX)
                     hit = zbtScoreLeafFindMemberByTags(leaf, hash, ele, elelen,
                                                        score, score_pos);
                 else if (found_bucket == NULL && insert_bucket == NULL)
@@ -5258,7 +5277,7 @@ static int zbtTestShortProbe(zbtScoreLeaf *leaf, const unsigned char *ele,
     int a = zbtScoreLeafFindShort(leaf, zbtLeafTag(hash), ele, len, &s1, &p1);
     int b = zbtScoreLeafFindMemberByTags(leaf, hash, ele, len, &s2, &p2);
     *found = b;
-    if (len > ZBT_SHORT_MEMBER_MAX || leaf->n.count < ZBT_TAG_SCAN_MIN_COUNT)
+    if (len > ZBT_TAG_SCAN_MEMBER_MAX || leaf->n.count < ZBT_TAG_SCAN_MIN_COUNT)
         return a == -1;
     return a == b && s1 == s2 && p1 == p2;
 }
@@ -6744,12 +6763,12 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
     printf("Testing B+ tree short member leaf search\n");
     {
         /* Mode 0: lengths 0 to 17. Mode 1: each member shares its tag with
-         * the previous one. Mode 2: long and external members share a tag
+         * the previous one, lengths up to 36. Mode 2: long and external members share a tag
          * with short ones. Mode 3: mode 0 in a reversed leaf. */
         static const unsigned int counts[] = {
             1, 15, 16, 17, 31, 32, 33, 48, ZBT_SCORE_LEAF_MAX
         };
-        static const size_t mode1_lens[] = {7, 8, 15, 16, 17};
+        static const size_t mode1_lens[] = {7, 8, 15, 16, 17, 24, 36};
         size_t maxlen = ZBT_EXTERNAL_MEMBER_AT + 16;
         unsigned char *mem = zmalloc(ZBT_SCORE_LEAF_MAX * maxlen);
         size_t mlen[ZBT_SCORE_LEAF_MAX];
@@ -6773,13 +6792,16 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
                     size_t len = i == 0 ? 0 : 1 + (i - 1) % 17;
                     int tag = -1;
                     if (mode == 1) {
-                        len = mode1_lens[i % 5];
+                        len = mode1_lens[i % (sizeof(mode1_lens) / sizeof(*mode1_lens))];
                         if (i) tag = zbtLeafTag(zbtreeMemberHash(m - maxlen,
                                                                  mlen[i - 1]));
                     } else if (mode == 2 && i == 0) {
                         len = ZBT_PACKED_SHORT + 10;
                     } else if (mode == 2 && i == count - 1 && count > 2) {
                         len = ZBT_EXTERNAL_MEMBER_AT + 1;
+                    } else if (mode == 2 && i == 3 && count > 4) {
+                        len = ZBT_TAG_SCAN_MEMBER_MAX;
+                        tag = zbtLeafTag(zbtreeMemberHash(mem, mlen[0]));
                     } else if (mode == 2 && i <= 2) {
                         len = 8;
                         tag = zbtLeafTag(zbtreeMemberHash(mem, mlen[0]));
@@ -6811,7 +6833,7 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
                     if (!zbtTestShortProbe(leaf, m, len, &found) || !found)
                         bad++;
                     hits++;
-                    if (len == 0 || len > ZBT_SHORT_MEMBER_MAX + 1) continue;
+                    if (len == 0 || len > ZBT_TAG_SCAN_MEMBER_MAX) continue;
                     for (int v = 0; v < 3; v++) {
                         memcpy(probe, m, len);
                         if (v == 0) probe[len - 1] ^= 0x20;
@@ -6824,7 +6846,15 @@ int zsetBtreeTest(int argc, char **argv, int flags) {
                         if (v == 2) same_tag_misses++;
                     }
                 }
-                for (size_t len = 0; len <= ZBT_SHORT_MEMBER_MAX + 1; len++) {
+                static const size_t extra_lens[] = {
+                    24, 36, 64, ZBT_TAG_SCAN_MEMBER_MAX,
+                    ZBT_TAG_SCAN_MEMBER_MAX + 1
+                };
+                for (size_t li = 0;
+                     li <= ZBT_SHORT_MEMBER_MAX + 1 +
+                           sizeof(extra_lens) / sizeof(*extra_lens); li++) {
+                    size_t len = li <= ZBT_SHORT_MEMBER_MAX + 1 ? li :
+                                 extra_lens[li - ZBT_SHORT_MEMBER_MAX - 2];
                     for (int k = 0; k < 8; k++) {
                         int found;
                         zbtTestRandomMember(probe, len, -1, &r);

@@ -3523,13 +3523,19 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             /* Sharing the member hash pays off from three inputs. */
             int reuse_hash = setnum > 2;
             zuiInitIterator(&src[0]);
-            /* Start the lookup of the next member in src[1] before finishing
-             * the current one. Values point into the set, which does not
-             * change, or hold the member themselves, never into the
-             * iterator, so the one read ahead stays valid. */
-            int ahead = setnum > 1 && src[1].type == OBJ_ZSET &&
-                        src[1].encoding == OBJ_ENCODING_BTREE &&
-                        src[1].subject != src[0].subject;
+            /* Start the lookup of the next member in the first B+ tree
+             * input after src[0], 'ahead', before finishing the current one.
+             * It is src[1] unless a set comes first. Values point into the
+             * set, which does not change, or hold the member themselves,
+             * never into the iterator, so the one read ahead stays valid.
+             * 0 means no such input. */
+            int ahead = 0;
+            for (j = 1; j < setnum && !ahead; j++) {
+                if (src[j].type == OBJ_ZSET &&
+                    src[j].encoding == OBJ_ENCODING_BTREE &&
+                    src[j].subject != src[0].subject)
+                    ahead = j;
+            }
             zsetopval vals[2];
             zbtreeLookup lookups[2];
             zsetopval *cur = &vals[0], *next = &vals[1];
@@ -3546,24 +3552,24 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             /* zuiNext() reads only 'flags' before it clears a value. */
             vals[0].flags = vals[1].flags = 0;
             int more = zuiInterNext(&src[0], cur, batch, limit, cardinality);
-            if (more && ahead) zuiLookupStart(&src[1], cur, curlookup);
+            if (more && ahead) zuiLookupStart(&src[ahead], cur, curlookup);
             while (more) {
                 double score, value;
 
                 more = zuiInterNext(&src[0], next, batch, limit,
                                     cardinality);
-                if (more && ahead) zuiLookupStart(&src[1], next, nextlookup);
+                if (more && ahead) zuiLookupStart(&src[ahead], next, nextlookup);
 
                 score = zuiWeightedScore(cur->score, src[0].weight, aggregate);
                 if (isnan(score)) score = 0;
 
                 /* Prefetch src[j+1] while probing src[j]. That is wasted on
                  * a miss, so do it for src[2] only while the previous member
-                 * was found in src[1]. */
-                if (reuse_hash && prev_in_first)
+                 * was found in src[1]. The 'ahead' input needs none. */
+                if (reuse_hash && prev_in_first && ahead != 2)
                     zuiPrefetchFind(&src[2],cur);
                 for (j = 1; j < setnum; j++) {
-                    if (j > 1 && j + 1 < setnum)
+                    if (j > 1 && j + 1 < setnum && j + 1 != ahead)
                         zuiPrefetchFind(&src[j+1],cur);
                     /* It is not safe to access the zset we are
                      * iterating, so explicitly check for equal object. */
@@ -3574,8 +3580,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     }
                     /* ZINTERCARD needs membership only. */
                     double *target = cardinality_only ? NULL : &value;
-                    int found = (j == 1 && ahead) ?
-                        zuiLookupFinish(&src[1], cur, curlookup, target) :
+                    int found = (j == ahead) ?
+                        zuiLookupFinish(&src[j], cur, curlookup, target) :
                         zuiFind(&src[j], cur, target, reuse_hash);
                     if (!found) break;
                     if (!cardinality_only) {
