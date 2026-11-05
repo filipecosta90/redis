@@ -92,8 +92,9 @@ int zbtreeScoreRawWithHash(zbtreeSet *zs, uint32_t hash,
 void zbtreePrefetchMember(zbtreeSet *zs, uint32_t hash);
 /* A lookup in two steps, so that lookups in one set can overlap.
  * zbtreeLookupFinish() returns what zbtreeScoreRawWithHash() would. The set
- * must not change in between, except for lookups advancing a resize. The
- * fields are private to zset_btree.c. */
+ * must not change in between, except for lookups advancing a resize: they
+ * never start one, and a resize moves index entries but no leaf. The fields
+ * are private to zset_btree.c. */
 typedef struct {
     void *leaf;
     uint32_t hash;
