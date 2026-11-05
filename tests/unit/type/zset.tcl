@@ -1765,6 +1765,11 @@ start_server {tags {"zset"}} {
                 {zinter 2 zbtx-s{t} A withscores}
                 {zinter 3 zbtx-u{t} A B withscores}
                 {zinter 2 zbtx-i{t} B weights 2 1 withscores}
+                {zintercard 3 zbtx-s{t} zbtx-u{t} A}
+                {zinter 3 zbtx-s{t} zbtx-u{t} A withscores}
+                {zinter 4 zbtx-s{t} zbtx-u{t} B A aggregate max withscores}
+                {zinter 3 zbtx-i{t} zbtx-u{t} A withscores}
+                {zintercard 3 zbtx-s{t} zbtx-s{t} A}
                 {zintercard 2 A R} {zinter 2 A R withscores}
                 {zinter 3 B R C aggregate max withscores}
             }
