@@ -1681,8 +1681,10 @@ start_server {tags {"zset"}} {
         # A fixed seed, so that a failure can be reproduced.
         expr {srand(15635)}
 
-        # Lengths 0 to 4, 7 to 9, 15 to 17 and 36, mostly differing in the
-        # last bytes, with many members sharing a leaf tag.
+        # Lengths 0 to 4, 7 to 9, 15 to 17, 36, 64, 128, 252, 253 (the
+        # longest the leaf tag scan takes), 254 (inline, two byte length) and
+        # 320 (stored externally), mostly differing in the last bytes, with
+        # many members sharing a leaf tag.
         proc zbt_member {len i} {
             if {$len == 0} {return ""}
             set id [format %x $i]
@@ -1692,7 +1694,7 @@ start_server {tags {"zset"}} {
             return "[string repeat m [expr {$len - [string length $id]}]]$id"
         }
         set pool {}
-        foreach len {0 1 2 3 4 7 8 9 15 16 17 36} {
+        foreach len {0 1 2 3 4 7 8 9 15 16 17 36 64 128 252 253 254 320} {
             for {set i 0} {$i < 300} {incr i} {
                 lappend pool [zbt_member $len $i]
             }
@@ -1702,7 +1704,8 @@ start_server {tags {"zset"}} {
         # The same sets, each in both encodings: A, B and C are large,
         # S is small and stays a listpack, U is a plain set.
         unset -nocomplain zbt_args
-        foreach name {a b c s} pct {70 60 50 3} {
+        # S takes 2%, so it stays within 128 entries.
+        foreach name {a b c s} pct {70 60 50 2} {
             set zbt_args($name) {}
             foreach m $pool {
                 if {[expr {rand() * 100}] < $pct} {
@@ -1721,7 +1724,7 @@ start_server {tags {"zset"}} {
         r sadd zbtx-i{t} {*}$imembers
         assert_encoding intset zbtx-i{t}
 
-        r config set zset-max-listpack-value 64
+        r config set zset-max-listpack-value 400
         foreach {enc entries} {lp 1000000 bt 0} {
             r config set zset-max-listpack-entries $entries
             foreach name {a b c} {
