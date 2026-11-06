@@ -1392,7 +1392,7 @@ static_assert(ZBT_TAG_SCAN_MIN_COUNT >= ZBT_TAG_SCAN_WIDTH,
               "a tag scan step must not read past the tag array");
 static_assert(ZBT_SHORT_MEMBER_MAX <= 2 * sizeof(uint64_t),
               "two overlapping words must cover a short member");
-/* zbtInlineMemberEqual() assumes a member of up to ZBT_TAG_SCAN_MEMBER_MAX
+/* The tag scan assumes a member of up to ZBT_TAG_SCAN_MEMBER_MAX
  * bytes is stored inline with a one byte length: the other forms start with
  * ZBT_PACKED_SHORT or ZBT_PACKED_EXTERNAL, and members only go external from
  * ZBT_EXTERNAL_MEMBER_AT bytes. */
@@ -1449,43 +1449,28 @@ static inline int zbtShortMemberEqual(const unsigned char *record,
     return 1;
 }
 
-/* zbtInlineMemberEqual() for members above ZBT_SHORT_MEMBER_MAX bytes. Out
- * of line, so the scan for short members stays free of calls. The length
+/* Compare a member above ZBT_SHORT_MEMBER_MAX bytes. The length
  * byte must be checked first: only an inline record of 'len' bytes passes
  * it, so memcmp() never reads past the record. */
-static __attribute__((noinline))
-int zbtLongMemberEqual(const unsigned char *record, const unsigned char *ele,
-                       size_t len)
+static inline int zbtLongMemberEqual(const unsigned char *record,
+                                     const unsigned char *ele, size_t len)
 {
     return record[0] == len && memcmp(record + 1, ele, len) == 0;
 }
 
-/* Return 1 if 'record' holds 'ele', of at most ZBT_TAG_SCAN_MEMBER_MAX
- * bytes. A record in another form starts with a byte above that, so the
- * length check rejects it. */
-static inline int zbtInlineMemberEqual(const unsigned char *record,
-                                       const unsigned char *ele, size_t len)
-{
-    if (len <= ZBT_SHORT_MEMBER_MAX)
-        return zbtShortMemberEqual(record, ele, len);
-    return zbtLongMemberEqual(record, ele, len);
-}
-
-/* Search a leaf for a member of at most ZBT_TAG_SCAN_MEMBER_MAX bytes,
- * scanning ZBT_TAG_SCAN_WIDTH tags at a time. Return 1 if found, setting
- * *score and *position when not NULL, 0 if not found, or -1 if the member or
- * leaf does not qualify. The last step re-reads the final ZBT_TAG_SCAN_WIDTH
- * tags, so no load leaves the tag array; a tag seen twice belongs to a member
- * already rejected. */
+/* Scan a leaf of at least ZBT_TAG_SCAN_MIN_COUNT members for 'ele',
+ * ZBT_TAG_SCAN_WIDTH tags at a time, comparing candidates with
+ * zbtShortMemberEqual() or, with 'long_member', zbtLongMemberEqual(). Return
+ * 1 if found, setting *score and *position when not NULL, or 0. The last step
+ * re-reads the final ZBT_TAG_SCAN_WIDTH tags, so no load leaves the tag array;
+ * a tag seen twice belongs to a member already rejected. */
 static inline __attribute__((always_inline))
-int zbtScoreLeafScanTags(zbtScoreLeaf *leaf, uint8_t tag,
-                         const unsigned char *ele, size_t elelen,
-                         double *score, unsigned int *position)
+int zbtScoreLeafScanTagsWith(zbtScoreLeaf *leaf, uint8_t tag,
+                             const unsigned char *ele, size_t elelen,
+                             double *score, unsigned int *position,
+                             const int long_member)
 {
     unsigned int count = leaf->n.count;
-    if (elelen > ZBT_TAG_SCAN_MEMBER_MAX || count < ZBT_TAG_SCAN_MIN_COUNT)
-        return -1;
-
     uint16_t *offsets = zbtScoreLeafOffsets(leaf);
     uint8_t *tags = zbtScoreLeafTagsAfter(offsets, count);
     unsigned int start = 0, last = count - ZBT_TAG_SCAN_WIDTH;
@@ -1494,8 +1479,10 @@ int zbtScoreLeafScanTags(zbtScoreLeaf *leaf, uint8_t tag,
         while (matches) {
             unsigned int physical =
                 start + (__builtin_ctzll(matches) >> ZBT_TAG_MATCH_SHIFT);
-            if (zbtInlineMemberEqual((unsigned char *)leaf + offsets[physical],
-                                     ele, elelen))
+            const unsigned char *record =
+                (unsigned char *)leaf + offsets[physical];
+            if (long_member ? zbtLongMemberEqual(record, ele, elelen) :
+                              zbtShortMemberEqual(record, ele, elelen))
             {
                 unsigned int logical = zbtScoreLeafPhysicalPos(leaf, physical);
                 if (score) *score = zbtScoreLeafScore(leaf, logical);
@@ -1508,6 +1495,35 @@ int zbtScoreLeafScanTags(zbtScoreLeaf *leaf, uint8_t tag,
         start = start + ZBT_TAG_SCAN_WIDTH < last ?
                 start + ZBT_TAG_SCAN_WIDTH : last;
     }
+}
+
+/* The scan for members above ZBT_SHORT_MEMBER_MAX bytes. Out of line, so
+ * the inlined scan for short members stays free of calls. */
+static __attribute__((noinline))
+int zbtScoreLeafScanTagsLong(zbtScoreLeaf *leaf, uint8_t tag,
+                             const unsigned char *ele, size_t elelen,
+                             double *score, unsigned int *position)
+{
+    return zbtScoreLeafScanTagsWith(leaf, tag, ele, elelen, score, position,
+                                    1);
+}
+
+/* Search a leaf for a member of at most ZBT_TAG_SCAN_MEMBER_MAX bytes with
+ * the tag scan. Return 1 if found, 0 if not found, or -1 if the member or
+ * leaf does not qualify. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafScanTags(zbtScoreLeaf *leaf, uint8_t tag,
+                         const unsigned char *ele, size_t elelen,
+                         double *score, unsigned int *position)
+{
+    if (elelen > ZBT_TAG_SCAN_MEMBER_MAX ||
+        leaf->n.count < ZBT_TAG_SCAN_MIN_COUNT)
+        return -1;
+    if (elelen > ZBT_SHORT_MEMBER_MAX)
+        return zbtScoreLeafScanTagsLong(leaf, tag, ele, elelen, score,
+                                        position);
+    return zbtScoreLeafScanTagsWith(leaf, tag, ele, elelen, score, position,
+                                    0);
 }
 
 /* Use the tag scan when eligible, the memchr() search otherwise. */
