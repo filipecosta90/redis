@@ -3634,8 +3634,6 @@ int zbtreeLookupFinish(zbtreeSet *zs, const zbtreeLookup *lookup,
         if (found == 0)
             return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen,
                                           score);
-    } else {
-        return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen, score);
     }
 #endif
     return zbtreeLookupFinishGeneric(zs, lookup, ele, elelen, score);
