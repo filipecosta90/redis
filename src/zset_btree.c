@@ -1497,9 +1497,9 @@ int zbtScoreLeafScanTagsWith(zbtScoreLeaf *leaf, uint8_t tag,
     }
 }
 
-/* The scan for members above ZBT_SHORT_MEMBER_MAX bytes. Out of line, so
- * the inlined scan for short members stays free of calls. */
-static __attribute__((noinline))
+/* The scan for members above ZBT_SHORT_MEMBER_MAX bytes. A separate loop,
+ * so the one for short members stays free of calls. */
+static inline __attribute__((always_inline))
 int zbtScoreLeafScanTagsLong(zbtScoreLeaf *leaf, uint8_t tag,
                              const unsigned char *ele, size_t elelen,
                              double *score, unsigned int *position)
