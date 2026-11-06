@@ -1510,13 +1510,13 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
 }
 
 /* Search a leaf for what zbtScoreLeafFindShort() does not take: the tag scan
- * for longer members it qualifies for, the memchr() search otherwise. Never
- * inlined: its memcmp() calls would make every caller save more registers,
- * including on the short member path. */
-static __attribute__((noinline))
-int zbtScoreLeafFindMemberLong(zbtScoreLeaf *leaf, uint32_t hash,
-                               const unsigned char *ele, size_t elelen,
-                               double *score, unsigned int *position)
+ * for longer members it qualifies for, the memchr() search otherwise. Its
+ * memcmp() calls make the caller save more registers, so only callers off
+ * the short member path inline it. */
+static inline __attribute__((always_inline))
+int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
+                         const unsigned char *ele, size_t elelen,
+                         double *score, unsigned int *position)
 {
     if (elelen > ZBT_SHORT_MEMBER_MAX && elelen <= ZBT_TAG_SCAN_MEMBER_MAX &&
         leaf->n.count >= ZBT_TAG_SCAN_MIN_COUNT)
@@ -1524,6 +1524,15 @@ int zbtScoreLeafFindMemberLong(zbtScoreLeaf *leaf, uint32_t hash,
                                     position, 1);
     return zbtScoreLeafFindMemberByTags(leaf, hash, ele, elelen, score,
                                         position);
+}
+
+/* zbtScoreLeafFindLong() out of line, for callers on the short path. */
+static __attribute__((noinline))
+int zbtScoreLeafFindMemberLong(zbtScoreLeaf *leaf, uint32_t hash,
+                               const unsigned char *ele, size_t elelen,
+                               double *score, unsigned int *position)
+{
+    return zbtScoreLeafFindLong(leaf, hash, ele, elelen, score, position);
 }
 
 /* Use the short search when eligible, zbtScoreLeafFindMemberLong()
@@ -2231,8 +2240,8 @@ int zbtIndexTableFind(zbtreeSet *zs, zbtIndexTable *table,
                 /* Inline the short search only for read-only lookups. */
                 int hit;
                 if (elelen > ZBT_SHORT_MEMBER_MAX)
-                    hit = zbtScoreLeafFindMemberLong(leaf, hash, ele, elelen,
-                                                     score, score_pos);
+                    hit = zbtScoreLeafFindLong(leaf, hash, ele, elelen, score,
+                                               score_pos);
                 else if (found_bucket == NULL && insert_bucket == NULL)
                     hit = zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen,
                                                        score, score_pos);
@@ -3588,8 +3597,8 @@ int zbtreeLookupFinishGeneric(zbtreeSet *zs, const zbtreeLookup *lookup,
 {
 #ifdef ZBT_TAG_SIMD
     if (lookup->leaf &&
-        zbtScoreLeafFindMemberLong(lookup->leaf, lookup->hash, ele, elelen,
-                                   score, NULL))
+        zbtScoreLeafFindLong(lookup->leaf, lookup->hash, ele, elelen, score,
+                             NULL))
         return 1;
 #else
     if (lookup->leaf &&
