@@ -1396,11 +1396,11 @@ static_assert(ZBT_SHORT_MEMBER_MAX <= 2 * sizeof(uint64_t),
  * ZBT_PACKED_SHORT or ZBT_PACKED_EXTERNAL, and members only go external from
  * ZBT_EXTERNAL_MEMBER_AT bytes. */
 static_assert(ZBT_SHORT_MEMBER_MAX <= ZBT_TAG_SCAN_MEMBER_MAX,
-              "the word-wise compare must stay within the tag scan");
+              "short members must be tag scan members");
 static_assert(ZBT_TAG_SCAN_MEMBER_MAX < ZBT_EXTERNAL_MEMBER_AT,
               "tag scan members must never be stored externally");
-static_assert(ZBT_PACKED_EXTERNAL > ZBT_TAG_SCAN_MEMBER_MAX,
-              "external records must fail the length check");
+static_assert(ZBT_PACKED_SHORT < ZBT_PACKED_EXTERNAL,
+              "length markers must exceed every one byte length");
 
 #ifdef ZBT_TAG_SIMD
 /* Return a mask of the lanes where p[i] equals 'tag'. The first match is
@@ -1447,7 +1447,7 @@ static inline int zbtShortMemberEqual(const unsigned char *record,
     return 1;
 }
 
-/* Return 1 if 'record' holds 'ele', of more than ZBT_SHORT_MEMBER_MAX bytes.
+/* Return 1 if 'record' holds 'ele', of at most ZBT_TAG_SCAN_MEMBER_MAX bytes.
  * Checking the length byte first keeps memcmp() inside the record: only an
  * inline record of 'len' bytes passes it (see zbtPackedWriteInline()). */
 static inline int zbtLongMemberEqual(const unsigned char *record,
@@ -1509,12 +1509,12 @@ int zbtScoreLeafFindShort(zbtScoreLeaf *leaf, uint8_t tag,
     return zbtScoreLeafScanTags(leaf, tag, ele, elelen, score, position, 0);
 }
 
-/* Search a leaf for what zbtScoreLeafFindShort() does not take: the tag scan
- * for longer members it qualifies for, the memchr() search otherwise. Its
- * memcmp() calls make the caller save more registers, so only callers off
- * the short member path inline it. */
+/* Search a leaf for a member of more than ZBT_SHORT_MEMBER_MAX bytes: the
+ * tag scan when it qualifies, the memchr() search otherwise. Its memcmp()
+ * calls make the caller save more registers, so only read-only lookups of
+ * long members and zbtreeLookupFinishGeneric() inline it. */
 static inline __attribute__((always_inline))
-int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
+int zbtScoreLeafFindLongInline(zbtScoreLeaf *leaf, uint32_t hash,
                          const unsigned char *ele, size_t elelen,
                          double *score, unsigned int *position)
 {
@@ -1526,17 +1526,16 @@ int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
                                         position);
 }
 
-/* zbtScoreLeafFindLong() out of line, for callers on the short path. */
+/* zbtScoreLeafFindLongInline() out of line, for the index update paths. */
 static __attribute__((noinline))
-int zbtScoreLeafFindMemberLong(zbtScoreLeaf *leaf, uint32_t hash,
+int zbtScoreLeafFindLong(zbtScoreLeaf *leaf, uint32_t hash,
                                const unsigned char *ele, size_t elelen,
                                double *score, unsigned int *position)
 {
-    return zbtScoreLeafFindLong(leaf, hash, ele, elelen, score, position);
+    return zbtScoreLeafFindLongInline(leaf, hash, ele, elelen, score, position);
 }
 
-/* Use the short search when eligible, zbtScoreLeafFindMemberLong()
- * otherwise. */
+/* Use the short search when eligible, the memchr() search otherwise. */
 static inline __attribute__((always_inline))
 int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
                                  const unsigned char *ele, size_t elelen,
@@ -1546,8 +1545,8 @@ int zbtScoreLeafFindMemberInline(zbtScoreLeaf *leaf, uint32_t hash,
     int found = zbtScoreLeafFindShort(leaf, zbtLeafTag(hash), ele, elelen,
                                       score, position);
     if (found >= 0) return found;
-    return zbtScoreLeafFindMemberLong(leaf, hash, ele, elelen, score,
-                                      position);
+    return zbtScoreLeafFindMemberByTags(leaf, hash, ele, elelen, score,
+                                        position);
 }
 
 /* Out of line copy for the index update paths. */
@@ -2237,12 +2236,16 @@ int zbtIndexTableFind(zbtreeSet *zs, zbtIndexTable *table,
                     }
                 }
 #ifdef ZBT_TAG_SIMD
-                /* Inline the short search only for read-only lookups. */
+                /* Inline the leaf search only for read-only lookups. */
                 int hit;
-                if (elelen > ZBT_SHORT_MEMBER_MAX)
+                int readonly = found_bucket == NULL && insert_bucket == NULL;
+                if (elelen > ZBT_SHORT_MEMBER_MAX && readonly)
+                    hit = zbtScoreLeafFindLongInline(leaf, hash, ele, elelen,
+                                                     score, score_pos);
+                else if (elelen > ZBT_SHORT_MEMBER_MAX)
                     hit = zbtScoreLeafFindLong(leaf, hash, ele, elelen, score,
                                                score_pos);
-                else if (found_bucket == NULL && insert_bucket == NULL)
+                else if (readonly)
                     hit = zbtScoreLeafFindMemberInline(leaf, hash, ele, elelen,
                                                        score, score_pos);
                 else
@@ -3597,8 +3600,8 @@ int zbtreeLookupFinishGeneric(zbtreeSet *zs, const zbtreeLookup *lookup,
 {
 #ifdef ZBT_TAG_SIMD
     if (lookup->leaf &&
-        zbtScoreLeafFindLong(lookup->leaf, lookup->hash, ele, elelen, score,
-                             NULL))
+        zbtScoreLeafFindLongInline(lookup->leaf, lookup->hash, ele, elelen,
+                                   score, NULL))
         return 1;
 #else
     if (lookup->leaf &&
@@ -3631,6 +3634,8 @@ int zbtreeLookupFinish(zbtreeSet *zs, const zbtreeLookup *lookup,
         if (found == 0)
             return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen,
                                           score);
+    } else {
+        return zbtreeScoreRawWithHash(zs, lookup->hash, ele, elelen, score);
     }
 #endif
     return zbtreeLookupFinishGeneric(zs, lookup, ele, elelen, score);
@@ -5312,9 +5317,9 @@ static uint64_t zbtTestScanMaxGroups(zbtreeSet *zs) {
 }
 
 #ifdef ZBT_TAG_SIMD
-/* Compare the tag scan, and zbtScoreLeafFindMemberInline(), with
- * zbtScoreLeafFindMemberByTags() for one probe. Return 1 when they agree;
- * *found says whether the member is there. */
+/* Compare the tag scan, and zbtScoreLeafFindMemberInline() or for long
+ * members zbtScoreLeafFindLong(), with zbtScoreLeafFindMemberByTags() for one
+ * probe. Return 1 when they agree; *found says whether the member is there. */
 static int zbtTestScanProbe(zbtScoreLeaf *leaf, const unsigned char *ele,
                             size_t len, int *found)
 {
@@ -5322,7 +5327,9 @@ static int zbtTestScanProbe(zbtScoreLeaf *leaf, const unsigned char *ele,
     double s1 = -1, s2 = -1, s3 = -1;
     unsigned int p1 = UINT_MAX, p2 = UINT_MAX, p3 = UINT_MAX;
     int b = zbtScoreLeafFindMemberByTags(leaf, hash, ele, len, &s2, &p2);
-    int c = zbtScoreLeafFindMemberInline(leaf, hash, ele, len, &s3, &p3);
+    int c = len > ZBT_SHORT_MEMBER_MAX ?
+            zbtScoreLeafFindLong(leaf, hash, ele, len, &s3, &p3) :
+            zbtScoreLeafFindMemberInline(leaf, hash, ele, len, &s3, &p3);
     *found = b;
     if (c != b || s3 != s2 || p3 != p2) return 0;
     if (len > ZBT_TAG_SCAN_MEMBER_MAX || leaf->n.count < ZBT_TAG_SCAN_MIN_COUNT)
