@@ -959,6 +959,43 @@ struct lpFindArg {
     int64_t vll;
 };
 
+/* Equality test for two byte strings already known to have the same length.
+ *
+ * lpFind() calls this once per candidate entry, so for a miss on a large
+ * listpack it runs for every entry in the listpack. memcmp() is not inlined by
+ * gcc on either x86-64 or aarch64 -- it stays an out-of-line PLT call with a
+ * register spill/reload pair around it -- which for the short operands typical
+ * of hash field names costs more than the comparison itself.
+ *
+ * For 8 <= len <= LP_CMP_INLINE_MAX this compares 8 bytes at a time and finishes
+ * with a final 8-byte window ending at the last byte. That tail window overlaps
+ * the previous chunk rather than reading past the end, so every load lies
+ * entirely inside [0, len) and no out-of-bounds read is possible. Re-comparing
+ * the overlapped bytes is harmless: this is an equality test, not an ordering.
+ *
+ * Outside that range it defers to memcmp(): below 8 bytes the overlap trick has
+ * no room, and above the cap libc's vectorised memcmp beats a scalar loop. */
+#define LP_CMP_INLINE_MAX 32
+
+static inline int lpEqualShort(const unsigned char *a, const unsigned char *b, uint32_t len) {
+    if (len < 8 || len > LP_CMP_INLINE_MAX) return memcmp(a, b, len) == 0;
+
+    uint32_t i = 0;
+    uint64_t x, y;
+    while (i + 8 <= len) {
+        memcpy(&x, a + i, 8);
+        memcpy(&y, b + i, 8);
+        if (x != y) return 0;
+        i += 8;
+    }
+    if (i != len) { /* overlapping tail; len >= 8 guarantees this is in bounds */
+        memcpy(&x, a + len - 8, 8);
+        memcpy(&y, b + len - 8, 8);
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
 /* Comparator function to find item */
 static inline int lpFindCmp(const unsigned char *lp, unsigned char *p,
                             void *user, unsigned char *s, long long slen) {
@@ -967,7 +1004,7 @@ static inline int lpFindCmp(const unsigned char *lp, unsigned char *p,
     struct lpFindArg *arg = user;
 
     if (s) {
-        if (slen == arg->slen && memcmp(arg->s, s, slen) == 0) {
+        if (slen == arg->slen && lpEqualShort(arg->s, s, arg->slen)) {
             return 0;
         }
     } else {
