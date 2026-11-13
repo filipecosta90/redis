@@ -3435,17 +3435,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             /* Sharing the member hash pays off from three inputs. */
             int reuse_hash = setnum > 2;
             zuiInitIterator(&src[0]);
-            /* Read a B+ tree src[0] in batches, see zuiNextBatched(). */
-            zuiBatch batchbuf;
-            zuiBatch *batch = NULL;
-            if (src[0].type == OBJ_ZSET &&
-                src[0].encoding == OBJ_ENCODING_BTREE)
-            {
-                batch = &batchbuf;
-                batch->pos = batch->len = 0;
-            }
             memset(&zval, 0, sizeof(zval));
-            while (zuiInterNext(&src[0], &zval, batch, limit, cardinality)) {
+            while (zuiNext(&src[0], &zval)) {
                 double score, value;
 
                 score = zuiWeightedScore(zval.score, src[0].weight, aggregate);
