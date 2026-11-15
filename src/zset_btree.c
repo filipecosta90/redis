@@ -3298,16 +3298,17 @@ void zbtreePrefetchHash(zbtreeSet *zs, uint32_t hash) {
             hash & (zs->member_rehash->table.size - 1)));
 }
 
-/* Membership test for a batch of members. The lookups are independent, so
- * do them in two passes: first resolve every home bucket to its candidate
- * score leaf, then compare the members. Each pass is a short loop whose
- * iterations do not depend on each other, which lets the CPU overlap the
- * loads of different members instead of finishing one lookup at a time.
- * Anything unusual (resize in progress, a first candidate that is not the
- * member, a full home bucket) uses the normal lookup. */
-unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
-                                 const unsigned char **eles,
-                                 const size_t *lens, unsigned int count)
+/* Look up a batch of members. The lookups are independent, so do them in
+ * two passes: first resolve every home bucket to its candidate score leaf,
+ * then compare the members. Each pass is a short loop whose iterations do
+ * not depend on each other, which lets the CPU overlap the loads of
+ * different members instead of finishing one lookup at a time. Anything
+ * unusual (resize in progress, a first candidate that is not the member, a
+ * possible probe continuation) uses the normal lookup. */
+unsigned int zbtreeFindBatch(zbtreeSet *zs, const uint32_t *hashes,
+                             const unsigned char **eles, const size_t *lens,
+                             unsigned int count, unsigned int want,
+                             double *scores)
 {
     serverAssert(count <= ZBT_SCORE_BATCH_SIZE);
     unsigned int found = 0;
@@ -3315,7 +3316,9 @@ unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
 
     if (zs->member_rehash || table->size == 0) {
         for (unsigned int i = 0; i < count; i++) {
-            if (zbtIndexFind(zs, hashes[i], eles[i], lens[i], NULL,
+            if ((want & (1U << i)) &&
+                zbtIndexFind(zs, hashes[i], eles[i], lens[i],
+                             scores ? &scores[i] : NULL,
                              NULL, NULL, NULL, NULL))
                 found |= 1U << i;
         }
@@ -3329,11 +3332,12 @@ unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
     unsigned long mask = table->size - 1;
 
     for (unsigned int i = 0; i < count; i++) {
+        leaf[i] = NULL;
+        if (!(want & (1U << i))) continue;
         uint32_t hash = hashes[i];
         uint8_t tag = zbtIndexTag(hash);
         zbtIndexBucket *bucket = zbtIndexBucketAt(table, hash & mask);
         uint64_t matches = zbtIndexTagMask(zbtIndexTags(bucket), tag);
-        leaf[i] = NULL;
         if (matches) {
             unsigned int pos = zbtIndexFirstTag(matches);
             uint32_t id = zbtIndexGetId(table, bucket, pos);
@@ -3351,9 +3355,10 @@ unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
     }
 
     for (unsigned int i = 0; i < count; i++) {
+        double *score = scores ? &scores[i] : NULL;
         if (leaf[i]) {
             if (zbtScoreLeafFindMember(leaf[i], hashes[i], eles[i], lens[i],
-                                       NULL, NULL))
+                                       score, NULL))
             {
                 found |= 1U << i;
                 continue;
@@ -3361,7 +3366,7 @@ unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
             slow |= 1U << i;
         }
         if ((slow & (1U << i)) &&
-            zbtIndexFind(zs, hashes[i], eles[i], lens[i], NULL,
+            zbtIndexFind(zs, hashes[i], eles[i], lens[i], score,
                          NULL, NULL, NULL, NULL))
             found |= 1U << i;
     }
