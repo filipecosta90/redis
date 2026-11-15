@@ -3404,26 +3404,34 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             /* Two B+ tree inputs, membership only: probe a batch of members
              * so the independent index-bucket loads overlap. */
             zsetopval batch[ZINTER_BATCH];
+            uint32_t hashes[ZINTER_BATCH];
+            const unsigned char *eles[ZINTER_BATCH];
+            size_t lens[ZINTER_BATCH];
             src[0].noscore = 1;
             zuiInitIterator(&src[0]);
             memset(batch, 0, sizeof(batch));
             int done = 0;
             while (!done) {
-                int n = 0;
+                unsigned int n = 0;
                 while (n < ZINTER_BATCH && zuiNext(&src[0], &batch[n])) {
-                    zbtreePrefetchHash(src[1].subject->ptr,
-                                       zuiMemberHash(&batch[n]));
+                    hashes[n] = zuiMemberHash(&batch[n]);
+                    eles[n] = batch[n].estr;
+                    lens[n] = batch[n].elen;
                     n++;
                 }
                 if (n < ZINTER_BATCH) done = 1;
-                for (int k = 0; k < n; k++) {
-                    if (zuiFind(&src[1], &batch[k], NULL, 1)) {
-                        cardinality++;
-                        if (limit && cardinality >= (unsigned long)limit) {
+                unsigned int found = zbtreeContainsBatch(src[1].subject->ptr,
+                                                         hashes, eles, lens, n);
+                if (limit) {
+                    for (unsigned int k = 0; k < n; k++) {
+                        if (!(found & (1U << k))) continue;
+                        if (++cardinality >= (unsigned long)limit) {
                             done = 1;
                             break;
                         }
                     }
+                } else {
+                    cardinality += __builtin_popcount(found);
                 }
             }
             for (int k = 0; k < ZINTER_BATCH; k++) zuiDiscardDirtyValue(&batch[k]);

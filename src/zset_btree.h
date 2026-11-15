@@ -85,6 +85,12 @@ int zbtreeScoreRawWithHash(zbtreeSet *zs, uint32_t hash,
                            double *score);
 /* Prefetch the index bucket(s) a later lookup of 'hash' will read. */
 void zbtreePrefetchHash(zbtreeSet *zs, uint32_t hash);
+/* Membership test for up to ZBT_SCORE_BATCH_SIZE raw members whose hashes
+ * come from zbtreeMemberHash(). Bit i of the result is set when member i
+ * exists. */
+unsigned int zbtreeContainsBatch(zbtreeSet *zs, const uint32_t *hashes,
+                                 const unsigned char **eles,
+                                 const size_t *lens, unsigned int count);
 /* Look up up to 16 scores. Bit i of the result says whether scores[i] exists. */
 #define ZBT_SCORE_BATCH_SIZE 16
 unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,
