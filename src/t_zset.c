@@ -2999,7 +2999,9 @@ static int zuiCompareByRevCardinality(const void *s1, const void *s2) {
 }
 
 /* Members probed together by two-key ZINTERCARD on B+ tree inputs. */
+#ifndef ZINTER_BATCH
 #define ZINTER_BATCH 8
+#endif
 
 #define REDIS_AGGR_SUM 1
 #define REDIS_AGGR_MIN 2
