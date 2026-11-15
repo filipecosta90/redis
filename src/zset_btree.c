@@ -3289,6 +3289,15 @@ int zbtreeScore(zbtreeSet *zs, sds ele, double *score) {
     return zbtreeScoreRaw(zs, (unsigned char *)ele, sdslen(ele), score);
 }
 
+void zbtreePrefetchHash(zbtreeSet *zs, uint32_t hash) {
+    if (zs->member_index.size)
+        redis_prefetch_read(zbtIndexBucketAt(&zs->member_index,
+            hash & (zs->member_index.size - 1)));
+    if (zs->member_rehash)
+        redis_prefetch_read(zbtIndexBucketAt(&zs->member_rehash->table,
+            hash & (zs->member_rehash->table.size - 1)));
+}
+
 /* ZMSCORE can bring several independent index buckets into cache before it
  * reads any of their members. Hash once, then reuse the normal lookup. */
 unsigned int zbtreeScores(zbtreeSet *zs, const sds *members, unsigned int count,

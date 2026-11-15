@@ -2998,6 +2998,9 @@ static int zuiCompareByRevCardinality(const void *s1, const void *s2) {
     return zuiCompareByCardinality(s1, s2) * -1;
 }
 
+/* Members probed together by two-key ZINTERCARD on B+ tree inputs. */
+#define ZINTER_BATCH 8
+
 #define REDIS_AGGR_SUM 1
 #define REDIS_AGGR_MIN 2
 #define REDIS_AGGR_MAX 3
@@ -3392,6 +3395,39 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             cardinality = zuiLength(&src[0]);
             if (limit && cardinality > (unsigned long)limit)
                 cardinality = (unsigned long)limit;
+        } else if (cardinality_only && setnum == 2 &&
+                   src[0].type == OBJ_ZSET && src[1].type == OBJ_ZSET &&
+                   src[0].encoding == OBJ_ENCODING_BTREE &&
+                   src[1].encoding == OBJ_ENCODING_BTREE &&
+                   src[1].subject != src[0].subject &&
+                   zuiLength(&src[0]) > 0) {
+            /* Two B+ tree inputs, membership only: probe a batch of members
+             * so the independent index-bucket loads overlap. */
+            zsetopval batch[ZINTER_BATCH];
+            src[0].noscore = 1;
+            zuiInitIterator(&src[0]);
+            memset(batch, 0, sizeof(batch));
+            int done = 0;
+            while (!done) {
+                int n = 0;
+                while (n < ZINTER_BATCH && zuiNext(&src[0], &batch[n])) {
+                    zbtreePrefetchHash(src[1].subject->ptr,
+                                       zuiMemberHash(&batch[n]));
+                    n++;
+                }
+                if (n < ZINTER_BATCH) done = 1;
+                for (int k = 0; k < n; k++) {
+                    if (zuiFind(&src[1], &batch[k], NULL, 1)) {
+                        cardinality++;
+                        if (limit && cardinality >= (unsigned long)limit) {
+                            done = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            for (int k = 0; k < ZINTER_BATCH; k++) zuiDiscardDirtyValue(&batch[k]);
+            zuiClearIterator(&src[0]);
         } else if (zuiLength(&src[0]) > 0) {
             /* Skip everything if the smallest input is empty. Precondition:
              * as src[0] is non-empty and the inputs are ordered by size, all
