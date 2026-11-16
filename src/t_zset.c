@@ -2191,6 +2191,10 @@ static int zsetGetPositionOrReply(client *c, robj *arg, int *where) {
  * Sorted set commands
  *----------------------------------------------------------------------------*/
 
+/* Shortest ZADD whose member lookups are worth pre-resolving. Same gate as the
+ * batched variant, so the two differ only in how the lookup is issued. */
+#define ZADD_BATCH_MIN_PAIRS    ZBT_SCORE_BATCH_SIZE
+
 /* This generic command implements both ZADD and ZINCRBY. */
 void zaddGenericCommand(client *c, int flags) {
     static char *nanerr = "resulting score is not a number (NaN)";
@@ -2288,7 +2292,26 @@ void zaddGenericCommand(client *c, int flags) {
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
+
+    /* ABLATION ARM. Skips exactly the pairs the batched variant skips, with
+     * exactly the same gate and the same stop-at-the-first-unanswerable-pair
+     * latch, but resolves them one at a time instead of 16 at a time. The
+     * difference between this arm and the batched one is therefore the
+     * overlapping of the lookups and nothing else. */
+    int early_out = (zobj->encoding == OBJ_ENCODING_BTREE &&
+                     elements >= ZADD_BATCH_MIN_PAIRS && !incr);
+
     for (j = 0; j < elements; j++) {
+        if (early_out) {
+            double cur;
+            sds m = c->argv[scoreidx+1+j*2]->ptr;
+            if (zbtreeScore(zobj->ptr, m, &cur) && cur == scores[j]) {
+                if (!(nx || gt || lt)) processed++;
+                continue;
+            }
+            early_out = 0;
+        }
+
         double newscore;
         score = scores[j];
         int retflags = 0;
