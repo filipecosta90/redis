@@ -2981,14 +2981,18 @@ static inline void zinterAddResult(zset *dstzset, zsetopval *val, double score,
 #define ZINTER_BATCH 8
 static_assert(ZINTER_BATCH <= ZBT_SCORE_BATCH_SIZE, "Batch too large");
 
-/* Batch only when every input after the first is a B+ tree and not the input
- * being iterated. As in the member-by-member loop, the iterated sorted set is
- * never looked up, because a lookup can advance its index resize. */
+/* Batch only when every input after the first is a B+ tree or a set, and not
+ * the input being iterated. As in the member-by-member loop, the iterated
+ * sorted set is never looked up, because a lookup can advance its index
+ * resize. A set is probed one member at a time, but it does not stop the
+ * B+ tree inputs beside it from being looked up as a batch. */
 static int zinterCanBatch(zsetopsrc *src, long setnum) {
     for (long j = 1; j < setnum; j++) {
-        if (src[j].subject == NULL || src[j].type != OBJ_ZSET ||
-            src[j].encoding != OBJ_ENCODING_BTREE ||
-            src[j].subject == src[0].subject)
+        if (src[j].subject == NULL || src[j].subject == src[0].subject)
+            return 0;
+        if (src[j].type == OBJ_SET) continue;
+        if (src[j].type != OBJ_ZSET ||
+            src[j].encoding != OBJ_ENCODING_BTREE)
         {
             return 0;
         }
@@ -3457,7 +3461,19 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (n < room) done = 1;
                 unsigned int alive = n ? (1U << n) - 1 : 0;
                 for (j = 1; j < setnum && alive; j++) {
-                    if (alive & (alive - 1)) {
+                    if (src[j].type == OBJ_SET) {
+                        /* A set has no batched probe: test the members still
+                         * alive one at a time. Every member of a set scores
+                         * 1.0, as in zuiFind(). */
+                        for (unsigned int k = 0; k < n; k++) {
+                            if (!(alive & (1U << k))) continue;
+                            if (setTypeIsMemberAux(src[j].subject,
+                                    (char *)ptrs[k], lens[k], batch[k].ell, 0))
+                                values[k] = 1.0;
+                            else
+                                alive &= ~(1U << k);
+                        }
+                    } else if (alive & (alive - 1)) {
                         alive = zbtreeScoresRawWithHash(src[j].subject->ptr,
                                     hashes, ptrs, lens, n, alive,
                                     cardinality_only ? NULL : values);
