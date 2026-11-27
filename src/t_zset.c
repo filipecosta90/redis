@@ -2981,19 +2981,30 @@ static inline void zinterAddResult(zset *dstzset, zsetopval *val, double score,
 #define ZINTER_BATCH 8
 static_assert(ZINTER_BATCH <= ZBT_SCORE_BATCH_SIZE, "Batch too large");
 
-/* Batch only when every input after the first is a B+ tree and not the input
- * being iterated. As in the member-by-member loop, the iterated sorted set is
- * never looked up, because a lookup can advance its index resize. */
+/* Batch only when every input after the first is a B+ tree or a set, and not
+ * the input being iterated. The iterated input is never looked up: for a
+ * B+ tree a lookup can advance its index resize, and for a set dictFind() can
+ * rehash a bucket under the non-safe iterator zuiInitIterator() opens on it.
+ *
+ * A set is probed one member at a time, because there is no batched
+ * set-membership lookup, so a set on its own buys nothing: require at least
+ * one B+ tree, otherwise the per-member hash below would be computed and never
+ * read. What a set does gain is the right to stand next to B+ tree inputs
+ * without forcing the whole command back onto the member-by-member path. */
 static int zinterCanBatch(zsetopsrc *src, long setnum) {
+    long btrees = 0;
     for (long j = 1; j < setnum; j++) {
-        if (src[j].subject == NULL || src[j].type != OBJ_ZSET ||
-            src[j].encoding != OBJ_ENCODING_BTREE ||
-            src[j].subject == src[0].subject)
+        if (src[j].subject == NULL || src[j].subject == src[0].subject)
+            return 0;
+        if (src[j].type == OBJ_SET) continue;
+        if (src[j].type != OBJ_ZSET ||
+            src[j].encoding != OBJ_ENCODING_BTREE)
         {
             return 0;
         }
+        btrees++;
     }
-    return setnum > 1;
+    return btrees > 0;
 }
 
 int zuiCompareByCardinality(const void *s1, const void *s2) {
@@ -3457,7 +3468,33 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (n < room) done = 1;
                 unsigned int alive = n ? (1U << n) - 1 : 0;
                 for (j = 1; j < setnum && alive; j++) {
-                    if (alive & (alive - 1)) {
+                    if (src[j].type == OBJ_SET) {
+                        /* There is no batched set-membership lookup, so probe
+                         * the members still alive one at a time. Every member
+                         * of a set scores 1.0, as in zuiFind(). */
+                        int isi = src[j].subject->encoding ==
+                                  OBJ_ENCODING_INTSET;
+                        for (unsigned int rest = alive; rest; rest &= rest-1) {
+                            unsigned int k = __builtin_ctz(rest);
+                            /* zuiMemberHash() above ran every member through
+                             * zuiBufferFromValue(), so ptrs[k] is never NULL
+                             * and aliases the source sds exactly when the
+                             * source kept one. A member that came from an
+                             * integer was printed into _buf: hand an intset
+                             * the integer back instead of making it parse the
+                             * string we just printed. */
+                            int wasint = batch[k].estr == batch[k]._buf;
+                            if (setTypeIsMemberAux(src[j].subject,
+                                    isi && wasint ? NULL : (char *)ptrs[k],
+                                    lens[k], batch[k].ell,
+                                    batch[k].ele != NULL))
+                            {
+                                if (!cardinality_only) values[k] = 1.0;
+                            } else {
+                                alive &= ~(1U << k);
+                            }
+                        }
+                    } else if (alive & (alive - 1)) {
                         alive = zbtreeScoresRawWithHash(src[j].subject->ptr,
                                     hashes, ptrs, lens, n, alive,
                                     cardinality_only ? NULL : values);

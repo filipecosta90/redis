@@ -1178,7 +1178,10 @@ start_server {tags {"zset"}} {
             }
             assert_equal $card [r zintercard 3 sa{t} za{t} zb{t}]
             assert_equal $card [llength [r zinter 3 sa{t} za{t} zb{t}]]
-            # A set after the first input uses the member-by-member loop.
+            # A set after the first input rides along with the B+ trees
+            # instead of forcing the whole command onto the member-by-member
+            # loop. The member-by-member path is covered separately, by the
+            # listpack arm of "ZINTER/ZINTERCARD with a set input" below.
             r sadd sa{t} {*}[r zrange zc{t} 0 -1]
             assert_equal [r zcard zb{t}] [r zintercard 3 zb{t} sa{t} za{t}]
         }
@@ -3946,5 +3949,67 @@ start_server {tags {"zset"}} {
             assert_equal $digest [debug_digest]
             assert_equal OK [r save]
         }
+    }
+}
+
+start_server {tags {"zset"}} {
+    test "ZINTER/ZINTERCARD with a set input: batched and member-by-member agree" {
+        # zinterCanBatch() lets a set stand beside B+ tree inputs, so the set
+        # is probed one member at a time while the B+ trees keep their batched
+        # lookups. Run identical data and queries twice -- once with the
+        # sorted sets as B+ trees (batched) and once as listpacks (which the
+        # gate rejects, so the member-by-member loop runs) -- and require
+        # byte-identical replies. The set sits at j>=1 in every query, which
+        # is the position the gate newly admits.
+        set replies {}
+        foreach {enc maxlp} {btree 0 listpack 4096} {
+            r flushall
+            r config set zset-max-listpack-entries $maxlp
+
+            # z1 is the smallest input, so it is the one iterated.
+            for {set i 0} {$i < 50} {incr i} {r zadd z1{t} $i $i}
+            for {set i 0} {$i < 300} {incr i} {r zadd z2{t} [expr {300 - $i}] $i}
+            assert_encoding $enc z1{t}
+            assert_encoding $enc z2{t}
+
+            # One set per encoding, each larger than z1 so it is never src[0].
+            for {set i 0} {$i < 200} {incr i 2} {r sadd sint{t} $i}
+            assert_encoding intset sint{t}
+            for {set i 0} {$i < 100} {incr i} {r sadd slp{t} $i}
+            r sadd slp{t} notanumber
+            assert_encoding listpack slp{t}
+            for {set i 0} {$i < 200} {incr i} {r sadd sht{t} $i k$i}
+            assert_encoding hashtable sht{t}
+
+            set got {}
+            # Set at j=1, between two B+ trees -- the shape the gate admits.
+            lappend got [r zintercard 3 z1{t} sint{t} z2{t}]
+            lappend got [r zintercard 3 z1{t} slp{t} z2{t}]
+            # LIMIT truncating mid-batch (50 members span seven batches of 8).
+            foreach limit {1 7 8 9 17} {
+                lappend got [r zintercard 3 z1{t} sint{t} z2{t} limit $limit]
+            }
+            # sht is the largest, so here the set is probed last, after a
+            # B+ tree has already thinned the batch.
+            lappend got [r zintercard 3 z1{t} z2{t} sht{t}]
+            # Scores: a set member scores 1.0, then weights and aggregates
+            # apply exactly as on the member-by-member path.
+            lappend got [r zinter 3 z1{t} sint{t} z2{t} withscores]
+            foreach agg {sum min max} {
+                lappend got [r zinter 3 z1{t} sint{t} z2{t} \
+                    weights 2 3 4 aggregate $agg withscores]
+            }
+            lappend got [r zinter 3 z1{t} sht{t} z2{t} withscores]
+            lappend got [r zinterstore dst{t} 3 z1{t} sint{t} z2{t}]
+            lappend got [r zrange dst{t} 0 -1 withscores]
+            # A set-only intersection: nothing to batch, so the gate must
+            # reject it under both encodings and the replies must still match.
+            lappend got [r zintercard 2 z1{t} sint{t}]
+            lappend got [r zinter 2 z1{t} sint{t} withscores]
+            lappend replies $got
+        }
+        assert_equal [lindex $replies 0] [lindex $replies 1]
+        # The intersection must be non-trivial, or the test proves nothing.
+        assert {[lindex [lindex $replies 0] 0] > 8}
     }
 }
