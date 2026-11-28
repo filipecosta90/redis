@@ -58,12 +58,15 @@ geoArray *geoArrayCreate(void) {
     ga->array = NULL;
     ga->buckets = 0;
     ga->used = 0;
+    ga->owned = 1;
     return ga;
 }
 
-/* Add and populate with data a new entry to the geoArray. */
+/* Add and populate with data a new entry to the geoArray. 'member' is owned
+ * or borrowed according to ga->owned, which the collection code sets once
+ * before appending anything. */
 geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist,
-                         double score, char *member)
+                         double score, char *member, size_t memberlen)
 {
     if (ga->used == ga->buckets) {
         ga->buckets = (ga->buckets == 0) ? 8 : ga->buckets*2;
@@ -74,15 +77,19 @@ geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist,
     gp->latitude = xy[1];
     gp->dist = dist;
     gp->member = member;
+    gp->memberlen = memberlen;
     gp->score = score;
     ga->used++;
     return gp;
 }
 
-/* Destroy a geoArray created with geoArrayCreate(). */
+/* Destroy a geoArray created with geoArrayCreate(). Borrowed members belong
+ * to the sorted set they were collected from, so they are never freed here. */
 void geoArrayFree(geoArray *ga) {
-    size_t i;
-    for (i = 0; i < ga->used; i++) sdsfree(ga->array[i].member);
+    if (ga->owned) {
+        size_t i;
+        for (i = 0; i < ga->used; i++) sdsfree(ga->array[i].member);
+    }
     zfree(ga->array);
     zfree(ga);
 }
@@ -268,6 +275,12 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
     /* That's: min <= val < max */
     zrangespec range = { .min = min, .max = max, .minex = 0, .maxex = 1 };
     size_t origincount = ga->used;
+    /* Skiplist and B+ tree nodes hold the member inline and nothing mutates
+     * the sorted set between here and the reply, so the member is borrowed
+     * rather than copied. A listpack can hold an integer, which has to be
+     * rendered into an sds the array then owns. A single command reads a
+     * single key, so this is decided once and holds for the whole array. */
+    ga->owned = (zobj->encoding == OBJ_ENCODING_LISTPACK);
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
@@ -294,8 +307,8 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             vstr = lpGetValue(eptr, &vlen, &vlong);
             if (geoWithinShape(shape, score, xy, &distance) == C_OK) {
                 /* Append the new element. */
-                char *member = (vstr == NULL) ? sdsfromlonglong(vlong) : sdsnewlen(vstr, vlen);
-                geoArrayAppend(ga, xy, distance, score, member);
+                sds member = (vstr == NULL) ? sdsfromlonglong(vlong) : sdsnewlen(vstr, vlen);
+                geoArrayAppend(ga, xy, distance, score, member, sdslen(member));
             }
             if (ga->used && limit && ga->used >= limit) break;
             zzlNext(zl, &eptr, &sptr);
@@ -319,7 +332,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
                 /* Append the new element. */
                 sds ele = zslGetNodeElement(ln);
-                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ele));
+                geoArrayAppend(ga, xy, distance, ln->score, ele, sdslen(ele));
             }
             if (ga->used && limit && ga->used >= limit) break;
             ln = ln->level[0].forward;
@@ -336,7 +349,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             double distance = 0;
             if (!zslValueLteMax(score, &range)) break;
             if (geoWithinShape(shape, score, xy, &distance) == C_OK)
-                geoArrayAppend(ga, xy, distance, score, sdsnewlen(ele, len));
+                geoArrayAppend(ga, xy, distance, score, (char *)ele, len);
             if (ga->used && limit && ga->used >= limit) break;
         }
     }
@@ -806,8 +819,12 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             if (option_length)
                 addReplyArrayLen(c, option_length + 1);
 
-            addReplyBulkSds(c,gp->member);
-            gp->member = NULL;
+            if (ga->owned) {
+                addReplyBulkSds(c,gp->member);
+                gp->member = NULL;
+            } else {
+                addReplyBulkCBuffer(c,gp->member,gp->memberlen);
+            }
 
             if (withdist)
                 addReplyDoubleDistance(c, gp->dist);
@@ -834,13 +851,36 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
             int out_flags;
-            serverAssert(zsetAdd(zobj, score, gp->member, ZADD_IN_NONE, &out_flags, NULL));
+            /* zsetAdd() copies the member, so a borrowed one only has to be
+             * wrapped in an sds for the call. Keep that wrapper on the stack
+             * when it fits, which is the whole point of borrowing. */
+            char buf[128];
+            sds ele;
+            int heap = 0;
+            if (ga->owned) {
+                ele = gp->member;
+            } else if (sdsReqSize(gp->memberlen, SDS_TYPE_8) <= sizeof(buf)) {
+                ele = sdsnewplacement(buf, sizeof(buf), SDS_TYPE_8,
+                                      gp->member, gp->memberlen);
+            } else {
+                ele = sdsnewlen(gp->member, gp->memberlen);
+                heap = 1;
+            }
+            serverAssert(zsetAdd(zobj, score, ele, ZADD_IN_NONE, &out_flags, NULL));
             serverAssert(out_flags & ZADD_OUT_ADDED);
-            sdsfree(gp->member);
-            gp->member = NULL;
+            if (ga->owned) {
+                sdsfree(gp->member);
+                gp->member = NULL;
+            } else if (heap) {
+                sdsfree(ele);
+            }
         }
 
         if (returned_items) {
+            /* Every borrowed member has been copied into the destination by
+             * now, which is what makes GEOSEARCHSTORE onto its own source
+             * key safe: setKey() below frees the sorted set the members were
+             * borrowed from, and nothing reads them after this point. */
             setKey(c,c->db,storekey,&zobj,0);
             notifyKeyspaceEvent(NOTIFY_ZSET,flags & GEOSEARCH ? "geosearchstore" : "georadiusstore",storekey,
                                 c->db->id);

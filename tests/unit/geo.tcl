@@ -780,3 +780,84 @@ start_server {tags {"geo"}} {
         }
     }
 }
+
+start_server {tags {"geo"}} {
+    # The collection loop borrows the member from the sorted set for the
+    # B+ tree and skiplist encodings, and owns a freshly built sds for the
+    # listpack one, which can hold integers. Run identical data and queries
+    # through both reachable encodings and require identical replies, so the
+    # borrowed path is checked against the owned path rather than against an
+    # expectation written by hand.
+    proc geo_fill_points {key n} {
+        r del $key
+        set argv {}
+        for {set j 0} {$j < $n} {incr j} {
+            # A deterministic spread around Sicily, plus a purely numeric
+            # member so the listpack arm exercises its integer conversion.
+            set lon [expr {13.0 + ($j % 20) * 0.03}]
+            set lat [expr {38.0 + ($j / 20) * 0.03}]
+            lappend argv $lon $lat [expr {$j % 7 == 0 ? $j : "place:$j"}]
+        }
+        r geoadd $key {*}$argv
+    }
+
+    # 200 members: listpack when the limit is above it, B+ tree when it is 0.
+    set n 200
+    array set replies {}
+    foreach {enc limit} {listpack 1024 btree 0} {
+        r config set zset-max-listpack-entries $limit
+        geo_fill_points src{t} $n
+        assert_encoding $enc src{t}
+
+        test "GEOSEARCH on a $enc key: collection, COUNT and WITHCOORD" {
+            set out {}
+            # No COUNT: every collected member is returned.
+            lappend out [lsort [r geosearch src{t} fromlonlat 13.3 38.3 byradius 200 km]]
+            # COUNT below the match count: members are collected and then
+            # dropped, which is the shape the borrow is aimed at.
+            lappend out [r geosearch src{t} fromlonlat 13.3 38.3 byradius 200 km asc count 7]
+            lappend out [r geosearch src{t} fromlonlat 13.3 38.3 bybox 100 100 km asc count 5 withcoord withdist withhash]
+            lappend out [lsort [r georadius src{t} 13.3 38.3 50 km]]
+            lappend out [r georadiusbymember src{t} place:1 100 km asc count 3]
+            set replies($enc) $out
+            assert {[llength [lindex $out 0]] > 20}
+        }
+
+        test "GEOSEARCHSTORE from a $enc key, including onto its own source" {
+            set out {}
+            r geosearchstore dst{t} src{t} fromlonlat 13.3 38.3 byradius 200 km
+            lappend out [r zrange dst{t} 0 -1 withscores]
+            r geosearchstore dst{t} src{t} fromlonlat 13.3 38.3 byradius 200 km storedist asc count 9
+            lappend out [r zrange dst{t} 0 -1 withscores]
+
+            # STORE onto the source key itself. The members written into the
+            # destination are borrowed from the sorted set that setKey() is
+            # about to free, so this is the case that must not read freed
+            # memory. Run it twice: the second pass reads a key that the
+            # first pass replaced.
+            r copy src{t} self{t} replace
+            r geosearchstore self{t} self{t} fromlonlat 13.3 38.3 byradius 200 km
+            lappend out [r zrange self{t} 0 -1 withscores]
+            r geosearchstore self{t} self{t} fromlonlat 13.3 38.3 byradius 100 km asc count 4
+            lappend out [r zrange self{t} 0 -1 withscores]
+
+            # An empty result deletes the destination, which is also the
+            # source: geoArrayFree() runs after the key is gone.
+            r copy src{t} empty{t} replace
+            r geosearchstore empty{t} empty{t} fromlonlat 0 0 byradius 1 km
+            lappend out [r exists empty{t}]
+
+            set replies(store_$enc) $out
+        }
+    }
+
+    test {GEOSEARCH replies are identical across listpack and B+ tree} {
+        assert_equal $replies(listpack) $replies(btree)
+    }
+
+    test {GEOSEARCHSTORE results are identical across listpack and B+ tree} {
+        assert_equal $replies(store_listpack) $replies(store_btree)
+    }
+
+    r config set zset-max-listpack-entries 128
+}
